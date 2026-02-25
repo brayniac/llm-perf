@@ -13,8 +13,8 @@ jobs:
     runs-on: ubuntu-latest
     permissions:
       contents: write
-    # Only run if the commit message starts with "release: v" (matches merge commit titles)
-    if: "startsWith(github.event.head_commit.message, 'release: v')"
+    # Match squash merges ("release: v...") and merge commits ("Merge pull request...release/v...")
+    if: "startsWith(github.event.head_commit.message, 'release: v') || contains(github.event.head_commit.message, 'release/v')"
 
     steps:
       - uses: actions/checkout@v4
