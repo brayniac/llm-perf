@@ -4,6 +4,12 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+## [0.1.7] - 2026-03-01
+
+### Changes
+
+- Replace OpenSSL with rustls for TLS, eliminating the native OpenSSL/native-tls dependency chain
+
 ## [0.1.6] - 2026-03-01
 
 ### Features
