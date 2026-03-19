@@ -173,7 +173,7 @@ impl ReportBuilder {
         use crate::metrics::{
             ERRORS_CONNECTION, ERRORS_HTTP_4XX, ERRORS_HTTP_5XX, ERRORS_OTHER, REQUESTS_FAILED,
             REQUESTS_RETRIED, REQUESTS_SENT, REQUESTS_SUCCESS, REQUESTS_TIMEOUT, TOKENS_INPUT,
-            TOKENS_OUTPUT,
+            TOKENS_OUTPUT_CONTENT, TOKENS_OUTPUT_REASONING,
         };
 
         let requests_sent = REQUESTS_SENT.value();
@@ -182,7 +182,7 @@ impl ReportBuilder {
         let requests_timeout = REQUESTS_TIMEOUT.value();
 
         let input_tokens = TOKENS_INPUT.value();
-        let output_tokens = TOKENS_OUTPUT.value();
+        let output_tokens = TOKENS_OUTPUT_REASONING.value() + TOKENS_OUTPUT_CONTENT.value();
 
         let duration_secs = duration.as_secs_f64();
 
@@ -341,7 +341,7 @@ impl ReportBuilder {
     fn build_latency_stats(&self) -> Result<LatencyStats> {
         use crate::metrics::{ALL_ITL, ALL_TPOT, ALL_TTFT, REQUEST_LATENCY};
 
-        // Aggregate TTFT across all phases and context buckets
+        // Aggregate TTFT (prefill latency) across context buckets
         let (ttft_mean, ttft_p50, ttft_p90, ttft_p95, ttft_p99) =
             if let Some(ttft) = Self::merge_context_histograms(&ALL_TTFT) {
                 Self::extract_percentiles_ms(&ttft)
@@ -398,16 +398,12 @@ impl ReportBuilder {
     }
 
     fn build_context_latency_stats(&self) -> Option<ContextLatencyStats> {
-        use crate::metrics::{
-            TTFT_CONTENT_LARGE, TTFT_CONTENT_MEDIUM, TTFT_CONTENT_SMALL, TTFT_CONTENT_XLARGE,
-            TTFT_CONTENT_XXLARGE, TTFT_REASONING_LARGE, TTFT_REASONING_MEDIUM,
-            TTFT_REASONING_SMALL, TTFT_REASONING_XLARGE, TTFT_REASONING_XXLARGE,
-        };
+        use crate::metrics::{TTFT_LARGE, TTFT_MEDIUM, TTFT_SMALL, TTFT_XLARGE, TTFT_XXLARGE};
 
-        let extract_merged =
-            |histograms: &[&metriken::AtomicHistogram]| -> Option<LatencyPercentiles> {
-                let merged = Self::merge_context_histograms(histograms)?;
-                if let Ok(Some(percentiles)) = merged.percentiles(&[50.0, 90.0, 95.0, 99.0])
+        let extract_percentiles =
+            |histogram: &metriken::AtomicHistogram| -> Option<LatencyPercentiles> {
+                if let Some(loaded) = histogram.load()
+                    && let Ok(Some(percentiles)) = loaded.percentiles(&[50.0, 90.0, 95.0, 99.0])
                     && !percentiles.is_empty()
                 {
                     let mut p50 = 0.0;
@@ -434,12 +430,21 @@ impl ReportBuilder {
                 None
             };
 
-        // Merge both phases per context size
-        let small = extract_merged(&[&TTFT_REASONING_SMALL, &TTFT_CONTENT_SMALL])?;
-        let medium = extract_merged(&[&TTFT_REASONING_MEDIUM, &TTFT_CONTENT_MEDIUM])?;
-        let large = extract_merged(&[&TTFT_REASONING_LARGE, &TTFT_CONTENT_LARGE])?;
-        let xlarge = extract_merged(&[&TTFT_REASONING_XLARGE, &TTFT_CONTENT_XLARGE])?;
-        let xxlarge = extract_merged(&[&TTFT_REASONING_XXLARGE, &TTFT_CONTENT_XXLARGE]);
+        let has_data = TTFT_SMALL.load().is_some()
+            || TTFT_MEDIUM.load().is_some()
+            || TTFT_LARGE.load().is_some()
+            || TTFT_XLARGE.load().is_some()
+            || TTFT_XXLARGE.load().is_some();
+
+        if !has_data {
+            return None;
+        }
+
+        let small = extract_percentiles(&TTFT_SMALL)?;
+        let medium = extract_percentiles(&TTFT_MEDIUM)?;
+        let large = extract_percentiles(&TTFT_LARGE)?;
+        let xlarge = extract_percentiles(&TTFT_XLARGE)?;
+        let xxlarge = extract_percentiles(&TTFT_XXLARGE);
 
         Some(ContextLatencyStats {
             small,
@@ -486,7 +491,7 @@ impl ReportBuilder {
             None
         };
 
-        // Merge both phases per context size
+        // Merge both phases per context size (ITL merging IS meaningful — overall decode speed)
         let small = extract_merged(&[&ITL_REASONING_SMALL, &ITL_CONTENT_SMALL])?;
         let medium = extract_merged(&[&ITL_REASONING_MEDIUM, &ITL_CONTENT_MEDIUM])?;
         let large = extract_merged(&[&ITL_REASONING_LARGE, &ITL_CONTENT_LARGE])?;

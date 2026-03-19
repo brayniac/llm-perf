@@ -837,33 +837,31 @@ impl BenchmarkRunner {
 
                 // Use server-reported token counts when available (accurate for any model),
                 // fall back to tiktoken estimation (may be inaccurate for non-OpenAI models)
-                let (input_tokens, output_tokens) = if let Some(usage) = stream.server_usage() {
-                    (usage.prompt_tokens as u64, usage.completion_tokens as u64)
+                let input_tokens = if let Some(usage) = stream.server_usage() {
+                    usage.prompt_tokens as u64
                 } else {
-                    (
-                        tokenizer.count_tokens(&prompt.prompt) as u64,
-                        tokenizer.count_tokens(&total_content) as u64,
-                    )
+                    tokenizer.count_tokens(&prompt.prompt) as u64
                 };
 
                 // Only record metrics if not in warmup phase
                 if !is_warmup {
                     use crate::metrics::Phase;
 
-                    // Record phase-specific TTFT
-                    if let Some(ttft) = stream.time_to_first_reasoning_token() {
-                        Metrics::record_ttft(ttft, input_tokens, Phase::Reasoning);
+                    // TTFT — first token of any kind (prefill latency)
+                    if let Some(ttft) = stream.time_to_first_token() {
+                        Metrics::record_ttft(ttft, input_tokens);
                     }
+                    // TTFT content — first visible content token
                     if let Some(ttft) = stream.time_to_first_content_token() {
-                        Metrics::record_ttft(ttft, input_tokens, Phase::Content);
+                        Metrics::record_ttft_content(ttft, input_tokens);
                     }
 
-                    // Record think duration
+                    // Think duration
                     if let Some(think) = stream.think_duration() {
                         Metrics::record_think_duration(think);
                     }
 
-                    // Record phase-specific ITL
+                    // Phase-specific ITL
                     for itl in stream.reasoning_inter_token_latencies() {
                         Metrics::record_itl(*itl, input_tokens, Phase::Reasoning);
                     }
@@ -873,10 +871,13 @@ impl BenchmarkRunner {
 
                     let total_duration = request_start.elapsed();
                     Metrics::record_latency(total_duration);
-                    Metrics::record_tokens(input_tokens, output_tokens);
+                    Metrics::record_tokens(
+                        input_tokens,
+                        stream.reasoning_tokens() as u64,
+                        stream.content_tokens() as u64,
+                    );
 
                     // Phase-specific TPOT
-                    // Reasoning TPOT: reasoning duration / (reasoning_tokens - 1)
                     if let Some(reasoning_ttft) = stream.time_to_first_reasoning_token()
                         && stream.reasoning_tokens() > 1
                     {
@@ -888,7 +889,6 @@ impl BenchmarkRunner {
                             / (stream.reasoning_tokens() as u64 - 1);
                         Metrics::record_tpot(Duration::from_nanos(tpot_ns), Phase::Reasoning);
                     }
-                    // Content TPOT: content duration / (content_tokens - 1)
                     if let Some(content_ttft) = stream.time_to_first_content_token()
                         && stream.content_tokens() > 1
                     {

@@ -10,7 +10,7 @@ use crate::config::Config;
 use crate::metrics::{
     ALL_TPOT, ERRORS_CONNECTION, ERRORS_HTTP_4XX, ERRORS_HTTP_5XX, ERRORS_OTHER, ERRORS_PARSE,
     REQUEST_LATENCY, REQUESTS_FAILED, REQUESTS_INFLIGHT, REQUESTS_SENT, REQUESTS_SUCCESS,
-    REQUESTS_TIMEOUT, RUNNING, TOKENS_INPUT, TOKENS_OUTPUT,
+    REQUESTS_TIMEOUT, RUNNING, TOKENS_INPUT, TOKENS_OUTPUT_CONTENT, TOKENS_OUTPUT_REASONING,
 };
 
 /// Print with timestamp prefix
@@ -66,7 +66,7 @@ impl MetricsSnapshot {
             requests_failed: REQUESTS_FAILED.value(),
             requests_timeout: REQUESTS_TIMEOUT.value(),
             tokens_input: TOKENS_INPUT.value(),
-            tokens_output: TOKENS_OUTPUT.value(),
+            tokens_output: TOKENS_OUTPUT_REASONING.value() + TOKENS_OUTPUT_CONTENT.value(),
             errors_connection: ERRORS_CONNECTION.value(),
             errors_4xx: ERRORS_HTTP_4XX.value(),
             errors_5xx: ERRORS_HTTP_5XX.value(),
@@ -83,7 +83,7 @@ impl MetricsSnapshot {
         self.requests_failed = REQUESTS_FAILED.value();
         self.requests_timeout = REQUESTS_TIMEOUT.value();
         self.tokens_input = TOKENS_INPUT.value();
-        self.tokens_output = TOKENS_OUTPUT.value();
+        self.tokens_output = TOKENS_OUTPUT_REASONING.value() + TOKENS_OUTPUT_CONTENT.value();
         self.errors_connection = ERRORS_CONNECTION.value();
         self.errors_4xx = ERRORS_HTTP_4XX.value();
         self.errors_5xx = ERRORS_HTTP_5XX.value();
@@ -134,7 +134,7 @@ pub async fn periodic_stats(config: Config, warmup_complete: Arc<Notify>) {
         let current_requests_failed = REQUESTS_FAILED.value();
         let current_requests_timeout = REQUESTS_TIMEOUT.value();
         let current_tokens_input = TOKENS_INPUT.value();
-        let current_tokens_output = TOKENS_OUTPUT.value();
+        let current_tokens_output = TOKENS_OUTPUT_REASONING.value() + TOKENS_OUTPUT_CONTENT.value();
         let current_errors_connection = ERRORS_CONNECTION.value();
         let current_errors_4xx = ERRORS_HTTP_4XX.value();
         let current_errors_5xx = ERRORS_HTTP_5XX.value();

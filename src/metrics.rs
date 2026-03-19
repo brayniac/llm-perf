@@ -32,132 +32,70 @@ pub enum Phase {
 pub static RUNNING: AtomicBool = AtomicBool::new(false);
 
 // Request metrics
-#[metric(
-    name = "requests",
-    description = "Total number of requests",
-    metadata = { status = "sent" }
-)]
+#[metric(name = "requests", metadata = { status = "sent" })]
 pub static REQUESTS_SENT: LazyCounter = LazyCounter::new(Counter::default);
-
-#[metric(
-    name = "requests",
-    description = "Successful requests",
-    metadata = { status = "success" }
-)]
+#[metric(name = "requests", metadata = { status = "success" })]
 pub static REQUESTS_SUCCESS: LazyCounter = LazyCounter::new(Counter::default);
-
-#[metric(
-    name = "requests",
-    description = "Failed requests",
-    metadata = { status = "failed" }
-)]
+#[metric(name = "requests", metadata = { status = "failed" })]
 pub static REQUESTS_FAILED: LazyCounter = LazyCounter::new(Counter::default);
-
-#[metric(
-    name = "requests",
-    description = "Timed out requests",
-    metadata = { status = "timeout" }
-)]
+#[metric(name = "requests", metadata = { status = "timeout" })]
 pub static REQUESTS_TIMEOUT: LazyCounter = LazyCounter::new(Counter::default);
-
-#[metric(
-    name = "requests",
-    description = "Request retries",
-    metadata = { status = "retried" }
-)]
+#[metric(name = "requests", metadata = { status = "retried" })]
 pub static REQUESTS_RETRIED: LazyCounter = LazyCounter::new(Counter::default);
 
 // Error category metrics
-#[metric(
-    name = "errors",
-    description = "Connection errors",
-    metadata = { "type" = "connection" }
-)]
+#[metric(name = "errors", metadata = { "type" = "connection" })]
 pub static ERRORS_CONNECTION: LazyCounter = LazyCounter::new(Counter::default);
-
-#[metric(
-    name = "errors",
-    description = "HTTP 4xx errors",
-    metadata = { "type" = "http_4xx" }
-)]
+#[metric(name = "errors", metadata = { "type" = "http_4xx" })]
 pub static ERRORS_HTTP_4XX: LazyCounter = LazyCounter::new(Counter::default);
-
-#[metric(
-    name = "errors",
-    description = "HTTP 5xx errors",
-    metadata = { "type" = "http_5xx" }
-)]
+#[metric(name = "errors", metadata = { "type" = "http_5xx" })]
 pub static ERRORS_HTTP_5XX: LazyCounter = LazyCounter::new(Counter::default);
-
-#[metric(
-    name = "errors",
-    description = "Parse errors",
-    metadata = { "type" = "parse" }
-)]
+#[metric(name = "errors", metadata = { "type" = "parse" })]
 pub static ERRORS_PARSE: LazyCounter = LazyCounter::new(Counter::default);
-
-#[metric(
-    name = "errors",
-    description = "Other errors",
-    metadata = { "type" = "other" }
-)]
+#[metric(name = "errors", metadata = { "type" = "other" })]
 pub static ERRORS_OTHER: LazyCounter = LazyCounter::new(Counter::default);
 
-// Token metrics
-#[metric(
-    name = "tokens",
-    description = "Input tokens processed",
-    metadata = { direction = "input" }
-)]
+// Token metrics — input has no phase, output is split by phase
+#[metric(name = "tokens", metadata = { direction = "input" })]
 pub static TOKENS_INPUT: LazyCounter = LazyCounter::new(Counter::default);
-
-#[metric(
-    name = "tokens",
-    description = "Output tokens generated",
-    metadata = { direction = "output" }
-)]
-pub static TOKENS_OUTPUT: LazyCounter = LazyCounter::new(Counter::default);
+#[metric(name = "tokens", metadata = { direction = "output", phase = "reasoning" })]
+pub static TOKENS_OUTPUT_REASONING: LazyCounter = LazyCounter::new(Counter::default);
+#[metric(name = "tokens", metadata = { direction = "output", phase = "content" })]
+pub static TOKENS_OUTPUT_CONTENT: LazyCounter = LazyCounter::new(Counter::default);
 
 // Concurrency metrics
-#[metric(
-    name = "requests_inflight",
-    description = "Current number of requests in flight"
-)]
+#[metric(name = "requests_inflight")]
 pub static REQUESTS_INFLIGHT: LazyGauge = LazyGauge::new(Gauge::default);
 
 // Latency metrics (in nanoseconds)
 // Histogram parameters: (grouping_power=7, max_value_power=64)
-// This gives 128 buckets per power of 2 (~0.54% relative precision), covering the full 64-bit range
+// 128 buckets per power of 2 (~0.54% relative precision), covering the full 64-bit range
 
-// TTFT histograms — reasoning phase (context-size bucketed)
-#[metric(name = "ttft", metadata = { unit = "nanoseconds", context_size = "small", phase = "reasoning" })]
-pub static TTFT_REASONING_SMALL: AtomicHistogram = AtomicHistogram::new(7, 64);
-#[metric(name = "ttft", metadata = { unit = "nanoseconds", context_size = "medium", phase = "reasoning" })]
-pub static TTFT_REASONING_MEDIUM: AtomicHistogram = AtomicHistogram::new(7, 64);
-#[metric(name = "ttft", metadata = { unit = "nanoseconds", context_size = "large", phase = "reasoning" })]
-pub static TTFT_REASONING_LARGE: AtomicHistogram = AtomicHistogram::new(7, 64);
-#[metric(name = "ttft", metadata = { unit = "nanoseconds", context_size = "xlarge", phase = "reasoning" })]
-pub static TTFT_REASONING_XLARGE: AtomicHistogram = AtomicHistogram::new(7, 64);
-#[metric(name = "ttft", metadata = { unit = "nanoseconds", context_size = "xxlarge", phase = "reasoning" })]
-pub static TTFT_REASONING_XXLARGE: AtomicHistogram = AtomicHistogram::new(7, 64);
+// TTFT — first token of any kind (prefill latency), context-size bucketed
+#[metric(name = "ttft", metadata = { unit = "nanoseconds", context_size = "small" })]
+pub static TTFT_SMALL: AtomicHistogram = AtomicHistogram::new(7, 64);
+#[metric(name = "ttft", metadata = { unit = "nanoseconds", context_size = "medium" })]
+pub static TTFT_MEDIUM: AtomicHistogram = AtomicHistogram::new(7, 64);
+#[metric(name = "ttft", metadata = { unit = "nanoseconds", context_size = "large" })]
+pub static TTFT_LARGE: AtomicHistogram = AtomicHistogram::new(7, 64);
+#[metric(name = "ttft", metadata = { unit = "nanoseconds", context_size = "xlarge" })]
+pub static TTFT_XLARGE: AtomicHistogram = AtomicHistogram::new(7, 64);
+#[metric(name = "ttft", metadata = { unit = "nanoseconds", context_size = "xxlarge" })]
+pub static TTFT_XXLARGE: AtomicHistogram = AtomicHistogram::new(7, 64);
 
-// TTFT histograms — content phase (context-size bucketed)
-#[metric(name = "ttft", metadata = { unit = "nanoseconds", context_size = "small", phase = "content" })]
+// TTFT content — first visible content token (user-perceived latency), context-size bucketed
+#[metric(name = "ttft_content", metadata = { unit = "nanoseconds", context_size = "small" })]
 pub static TTFT_CONTENT_SMALL: AtomicHistogram = AtomicHistogram::new(7, 64);
-#[metric(name = "ttft", metadata = { unit = "nanoseconds", context_size = "medium", phase = "content" })]
+#[metric(name = "ttft_content", metadata = { unit = "nanoseconds", context_size = "medium" })]
 pub static TTFT_CONTENT_MEDIUM: AtomicHistogram = AtomicHistogram::new(7, 64);
-#[metric(name = "ttft", metadata = { unit = "nanoseconds", context_size = "large", phase = "content" })]
+#[metric(name = "ttft_content", metadata = { unit = "nanoseconds", context_size = "large" })]
 pub static TTFT_CONTENT_LARGE: AtomicHistogram = AtomicHistogram::new(7, 64);
-#[metric(name = "ttft", metadata = { unit = "nanoseconds", context_size = "xlarge", phase = "content" })]
+#[metric(name = "ttft_content", metadata = { unit = "nanoseconds", context_size = "xlarge" })]
 pub static TTFT_CONTENT_XLARGE: AtomicHistogram = AtomicHistogram::new(7, 64);
-#[metric(name = "ttft", metadata = { unit = "nanoseconds", context_size = "xxlarge", phase = "content" })]
+#[metric(name = "ttft_content", metadata = { unit = "nanoseconds", context_size = "xxlarge" })]
 pub static TTFT_CONTENT_XXLARGE: AtomicHistogram = AtomicHistogram::new(7, 64);
 
-#[metric(
-    name = "request_latency",
-    description = "Total request latency in nanoseconds",
-    metadata = { unit = "nanoseconds" }
-)]
+#[metric(name = "request_latency", metadata = { unit = "nanoseconds" })]
 pub static REQUEST_LATENCY: AtomicHistogram = AtomicHistogram::new(7, 64);
 
 // TPOT — per phase
@@ -167,14 +105,10 @@ pub static TPOT_REASONING: AtomicHistogram = AtomicHistogram::new(7, 64);
 pub static TPOT_CONTENT: AtomicHistogram = AtomicHistogram::new(7, 64);
 
 // Think duration — time from first reasoning token to first content token
-#[metric(
-    name = "think_duration",
-    description = "Reasoning duration in nanoseconds",
-    metadata = { unit = "nanoseconds" }
-)]
+#[metric(name = "think_duration", metadata = { unit = "nanoseconds" })]
 pub static THINK_DURATION: AtomicHistogram = AtomicHistogram::new(7, 64);
 
-// ITL histograms — reasoning phase (context-size bucketed)
+// ITL — per phase, context-size bucketed
 #[metric(name = "itl", metadata = { unit = "nanoseconds", context_size = "small", phase = "reasoning" })]
 pub static ITL_REASONING_SMALL: AtomicHistogram = AtomicHistogram::new(7, 64);
 #[metric(name = "itl", metadata = { unit = "nanoseconds", context_size = "medium", phase = "reasoning" })]
@@ -186,7 +120,6 @@ pub static ITL_REASONING_XLARGE: AtomicHistogram = AtomicHistogram::new(7, 64);
 #[metric(name = "itl", metadata = { unit = "nanoseconds", context_size = "xxlarge", phase = "reasoning" })]
 pub static ITL_REASONING_XXLARGE: AtomicHistogram = AtomicHistogram::new(7, 64);
 
-// ITL histograms — content phase (context-size bucketed)
 #[metric(name = "itl", metadata = { unit = "nanoseconds", context_size = "small", phase = "content" })]
 pub static ITL_CONTENT_SMALL: AtomicHistogram = AtomicHistogram::new(7, 64);
 #[metric(name = "itl", metadata = { unit = "nanoseconds", context_size = "medium", phase = "content" })]
@@ -198,13 +131,16 @@ pub static ITL_CONTENT_XLARGE: AtomicHistogram = AtomicHistogram::new(7, 64);
 #[metric(name = "itl", metadata = { unit = "nanoseconds", context_size = "xxlarge", phase = "content" })]
 pub static ITL_CONTENT_XXLARGE: AtomicHistogram = AtomicHistogram::new(7, 64);
 
-// All TTFT histograms for aggregation
-pub static ALL_TTFT: [&AtomicHistogram; 10] = [
-    &TTFT_REASONING_SMALL,
-    &TTFT_REASONING_MEDIUM,
-    &TTFT_REASONING_LARGE,
-    &TTFT_REASONING_XLARGE,
-    &TTFT_REASONING_XXLARGE,
+// Aggregation arrays
+pub static ALL_TTFT: [&AtomicHistogram; 5] = [
+    &TTFT_SMALL,
+    &TTFT_MEDIUM,
+    &TTFT_LARGE,
+    &TTFT_XLARGE,
+    &TTFT_XXLARGE,
+];
+
+pub static ALL_TTFT_CONTENT: [&AtomicHistogram; 5] = [
     &TTFT_CONTENT_SMALL,
     &TTFT_CONTENT_MEDIUM,
     &TTFT_CONTENT_LARGE,
@@ -212,7 +148,6 @@ pub static ALL_TTFT: [&AtomicHistogram; 10] = [
     &TTFT_CONTENT_XXLARGE,
 ];
 
-// All ITL histograms for aggregation
 pub static ALL_ITL: [&AtomicHistogram; 10] = [
     &ITL_REASONING_SMALL,
     &ITL_REASONING_MEDIUM,
@@ -226,7 +161,6 @@ pub static ALL_ITL: [&AtomicHistogram; 10] = [
     &ITL_CONTENT_XXLARGE,
 ];
 
-// All TPOT histograms for aggregation
 pub static ALL_TPOT: [&AtomicHistogram; 2] = [&TPOT_REASONING, &TPOT_CONTENT];
 
 pub struct Metrics;
@@ -265,24 +199,34 @@ impl Metrics {
         }
     }
 
-    pub fn record_tokens(input: u64, output: u64) {
+    pub fn record_tokens(input: u64, output_reasoning: u64, output_content: u64) {
         TOKENS_INPUT.add(input);
-        TOKENS_OUTPUT.add(output);
+        TOKENS_OUTPUT_REASONING.add(output_reasoning);
+        TOKENS_OUTPUT_CONTENT.add(output_content);
     }
 
-    pub fn record_ttft(duration: Duration, input_tokens: u64, phase: Phase) {
+    /// Record TTFT — first token of any kind (prefill latency).
+    pub fn record_ttft(duration: Duration, input_tokens: u64) {
         let nanos = duration.as_nanos() as u64;
-        let histogram = match (phase, input_tokens) {
-            (Phase::Reasoning, 0..=200) => &TTFT_REASONING_SMALL,
-            (Phase::Reasoning, 201..=500) => &TTFT_REASONING_MEDIUM,
-            (Phase::Reasoning, 501..=2000) => &TTFT_REASONING_LARGE,
-            (Phase::Reasoning, 2001..=8000) => &TTFT_REASONING_XLARGE,
-            (Phase::Reasoning, _) => &TTFT_REASONING_XXLARGE,
-            (Phase::Content, 0..=200) => &TTFT_CONTENT_SMALL,
-            (Phase::Content, 201..=500) => &TTFT_CONTENT_MEDIUM,
-            (Phase::Content, 501..=2000) => &TTFT_CONTENT_LARGE,
-            (Phase::Content, 2001..=8000) => &TTFT_CONTENT_XLARGE,
-            (Phase::Content, _) => &TTFT_CONTENT_XXLARGE,
+        let histogram = match input_tokens {
+            0..=200 => &TTFT_SMALL,
+            201..=500 => &TTFT_MEDIUM,
+            501..=2000 => &TTFT_LARGE,
+            2001..=8000 => &TTFT_XLARGE,
+            _ => &TTFT_XXLARGE,
+        };
+        let _ = histogram.increment(nanos);
+    }
+
+    /// Record TTFT content — first visible content token.
+    pub fn record_ttft_content(duration: Duration, input_tokens: u64) {
+        let nanos = duration.as_nanos() as u64;
+        let histogram = match input_tokens {
+            0..=200 => &TTFT_CONTENT_SMALL,
+            201..=500 => &TTFT_CONTENT_MEDIUM,
+            501..=2000 => &TTFT_CONTENT_LARGE,
+            2001..=8000 => &TTFT_CONTENT_XLARGE,
+            _ => &TTFT_CONTENT_XXLARGE,
         };
         let _ = histogram.increment(nanos);
     }
