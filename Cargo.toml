@@ -20,7 +20,7 @@ hf-hub = { version = "0.4", default-features = false, features = ["tokio", "rust
 humantime = "2.1"
 log = "0.4"
 metriken = "0.7"
-metriken-exposition = { version = "0.13.0", features = ["json", "msgpack"] }
+metriken-exposition = { version = "0.13.1", features = ["json", "msgpack"] }
 num_cpus = "1.16"
 parquet = { version = "56", default-features = false, features = ["arrow"] }
 rand = "0.8"
