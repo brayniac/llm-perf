@@ -7,9 +7,11 @@ use std::time::Duration;
 /// Canonical metric formatter that produces unique names from metadata labels.
 ///
 /// For `Format::Simple`, appends metadata label values (sorted by key) to the
-/// metric name with `/` separators, skipping structural metadata like `unit`.
+/// metric name with `_` separators, skipping structural metadata like `unit`.
 /// This ensures metrics with the same name but different labels get unique
-/// column names in parquet output (e.g., `tokens/output`, `requests/sent`).
+/// column names in parquet output (e.g., `tokens_output`, `requests_sent`).
+///
+/// Uses `_` rather than `/` so names remain valid PromQL identifiers.
 ///
 /// For `Format::Prometheus`, delegates to the default Prometheus format.
 fn canonical_formatter(metric: &MetricEntry, format: Format) -> String {
@@ -27,7 +29,7 @@ fn canonical_formatter(metric: &MetricEntry, format: Format) -> String {
                 name.to_string()
             } else {
                 let suffix: Vec<&str> = labels.iter().map(|(_, v)| *v).collect();
-                format!("{}/{}", name, suffix.join("/"))
+                format!("{}_{}", name, suffix.join("_"))
             }
         }
         Format::Prometheus => metriken::default_formatter(metric, format),

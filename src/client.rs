@@ -532,7 +532,11 @@ impl StreamResponse {
                             self.pending_chunks.push_back(chunk);
                         }
                         Err(e) => {
-                            log::debug!("Failed to parse SSE chunk: {} — data: {}", e, &json_str[..json_str.len().min(200)]);
+                            log::debug!(
+                                "Failed to parse SSE chunk: {} — data: {}",
+                                e,
+                                &json_str[..json_str.len().min(200)]
+                            );
                         }
                     }
                 }
