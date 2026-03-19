@@ -527,8 +527,13 @@ impl StreamResponse {
                         break;
                     }
 
-                    if let Ok(chunk) = serde_json::from_str::<ChatCompletionChunk>(json_str) {
-                        self.pending_chunks.push_back(chunk);
+                    match serde_json::from_str::<ChatCompletionChunk>(json_str) {
+                        Ok(chunk) => {
+                            self.pending_chunks.push_back(chunk);
+                        }
+                        Err(e) => {
+                            log::debug!("Failed to parse SSE chunk: {} — data: {}", e, &json_str[..json_str.len().min(200)]);
+                        }
                     }
                 }
             }
