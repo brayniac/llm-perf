@@ -61,7 +61,6 @@ pub async fn capture_snapshots(config: Config) -> Result<()> {
             continue;
         }
 
-        // Take snapshot
         let snapshot = snapshotter.snapshot();
 
         // Serialize to msgpack using the Snapshot::to_msgpack API
