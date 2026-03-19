@@ -1,4 +1,4 @@
-use llm_perf::client::Message;
+use crate::client::Message;
 
 use super::dataset::Question;
 

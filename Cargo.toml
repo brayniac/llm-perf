@@ -10,10 +10,6 @@ license = "MIT OR Apache-2.0"
 name = "llm-perf"
 path = "src/main.rs"
 
-[[bin]]
-name = "mmlu-pro"
-path = "src/mmlu_pro/main.rs"
-
 [dependencies]
 anyhow = "1.0"
 chrono = { version = "0.4", features = ["serde"] }
@@ -54,7 +50,6 @@ section = "net"
 priority = "optional"
 assets = [
     ["target/release/llm-perf", "usr/bin/", "755"],
-    ["target/release/mmlu-pro", "usr/bin/", "755"],
     ["examples/config.example.toml", "etc/llm-perf/config.toml.example", "644"],
 ]
 
@@ -62,6 +57,5 @@ assets = [
 name = "llm-perf"
 assets = [
     { source = "target/release/llm-perf", dest = "/usr/bin/llm-perf", mode = "0755" },
-    { source = "target/release/mmlu-pro", dest = "/usr/bin/mmlu-pro", mode = "0755" },
     { source = "examples/config.example.toml", dest = "/etc/llm-perf/config.toml.example", mode = "0644", config = true },
 ]

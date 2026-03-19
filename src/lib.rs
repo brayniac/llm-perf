@@ -7,6 +7,7 @@ pub mod distribution;
 pub mod kl_divergence;
 pub mod logprobs;
 pub mod metrics;
+pub mod mmlu_pro;
 pub mod report;
 pub mod snapshot;
 pub mod stats;

@@ -34,6 +34,41 @@ pub enum Command {
         #[arg(long)]
         output: Option<PathBuf>,
     },
+    /// Run the MMLU-Pro accuracy benchmark
+    MmluPro {
+        /// Path to the TOML configuration file
+        config: PathBuf,
+        /// Server URL (overrides config)
+        #[arg(short = 'u', long)]
+        url: Option<String>,
+        /// API key (overrides config)
+        #[arg(short = 'a', long = "api")]
+        api_key: Option<String>,
+        /// Model name (overrides config)
+        #[arg(short, long)]
+        model: Option<String>,
+        /// Request timeout in seconds (overrides config)
+        #[arg(long)]
+        timeout: Option<f64>,
+        /// Single category to test (overrides config)
+        #[arg(long)]
+        category: Option<String>,
+        /// Fraction of items to keep per category, 0.0-1.0 (overrides config)
+        #[arg(long)]
+        subset: Option<f64>,
+        /// Number of parallel requests (overrides config)
+        #[arg(short, long)]
+        parallel: Option<usize>,
+        /// Verbosity level 0-2 (overrides config)
+        #[arg(short, long)]
+        verbosity: Option<u8>,
+        /// Log exact prompts in result files
+        #[arg(long)]
+        log_prompt: bool,
+        /// Comment to include in the report
+        #[arg(long)]
+        comment: Option<String>,
+    },
 }
 
 impl Cli {
@@ -50,6 +85,7 @@ impl Cli {
                 "bench"
                     | "logprobs"
                     | "kl-divergence"
+                    | "mmlu-pro"
                     | "help"
                     | "--help"
                     | "-h"

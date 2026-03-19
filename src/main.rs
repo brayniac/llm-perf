@@ -91,6 +91,7 @@ fn main() -> Result<()> {
             format,
             output.as_deref(),
         ),
+        ref cmd @ Command::MmluPro { .. } => run_mmlu_pro_mode(cmd),
     }
 }
 
@@ -259,6 +260,114 @@ fn run_logprobs_mode(config_path: &std::path::Path) -> Result<()> {
         .build()?;
 
     runtime.block_on(run_logprobs_collection(config, lp_config))
+}
+
+fn run_mmlu_pro_mode(cmd: &Command) -> Result<()> {
+    use llm_perf::mmlu_pro::{config, dataset, evaluate, report};
+    use std::path::PathBuf;
+    use std::time::Instant;
+
+    let Command::MmluPro {
+        config: ref config_path,
+        ref url,
+        ref api_key,
+        ref model,
+        timeout,
+        ref category,
+        subset,
+        parallel,
+        verbosity,
+        log_prompt,
+        ref comment,
+    } = *cmd
+    else {
+        unreachable!()
+    };
+
+    let mut config = config::Config::load(config_path)?;
+
+    // Apply CLI overrides
+    if let Some(url) = url {
+        config.server.url = url.clone();
+    }
+    if let Some(api_key) = api_key {
+        config.server.api_key = api_key.clone();
+    }
+    if let Some(model) = model {
+        config.server.model = model.clone();
+    }
+    if let Some(timeout) = timeout {
+        config.server.timeout = timeout;
+    }
+    if let Some(category) = category {
+        config.test.categories = vec![category.clone()];
+    }
+    if let Some(subset) = subset {
+        config.test.subset = subset;
+    }
+    if let Some(parallel) = parallel {
+        config.test.parallel = parallel;
+    }
+    if let Some(verbosity) = verbosity {
+        config.log.verbosity = verbosity;
+    }
+    if log_prompt {
+        config.log.log_prompt = true;
+    }
+    if let Some(comment) = comment {
+        config.comment = comment.clone();
+    }
+
+    // Print startup info
+    eprintln!("MMLU-Pro Benchmark");
+    eprintln!("  Model: {}", config.server.model);
+    eprintln!("  URL: {}", config.server.url);
+    eprintln!("  Parallel: {}", config.test.parallel);
+    eprintln!("  Subset: {}", config.test.subset);
+    eprintln!("  Max Tokens: {}", config.inference.max_tokens);
+    eprintln!();
+
+    // Create output directory
+    let model_dir_name = regex::Regex::new(r"\W")
+        .unwrap()
+        .replace_all(&config.server.model, "-")
+        .to_string();
+    let output_dir = PathBuf::from("eval_results").join(&model_dir_name);
+    std::fs::create_dir_all(&output_dir)?;
+
+    // Build tokio runtime
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()?;
+
+    let start = Instant::now();
+
+    // Run evaluation
+    let result = runtime.block_on(async {
+        eprintln!("Loading MMLU-Pro dataset...");
+        let (test_data, val_data) = dataset::load_mmlu_pro(config.test.subset).await?;
+
+        eprintln!(
+            "Dataset loaded: {} categories, {} total test questions",
+            test_data.len(),
+            test_data.values().map(|v| v.len()).sum::<usize>()
+        );
+
+        evaluate::run_evaluation(&config, &test_data, &val_data, &output_dir).await
+    })?;
+
+    let elapsed = start.elapsed();
+
+    // Generate report
+    report::generate_report(
+        &config,
+        &result.category_stats,
+        &result.token_stats,
+        elapsed,
+        &output_dir,
+    );
+
+    Ok(())
 }
 
 async fn run_logprobs_collection(
