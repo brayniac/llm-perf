@@ -128,6 +128,9 @@ pub struct Delta {
     pub role: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub content: Option<String>,
+    /// Reasoning/thinking content from reasoning models (e.g., Qwen3, DeepSeek-R1)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reasoning_content: Option<String>,
 }
 
 /// Top log probability for a single token alternative
@@ -413,10 +416,14 @@ impl OpenAIClient {
         Ok(StreamResponse {
             response,
             start_time,
-            first_token_time: None,
-            last_token_time: None,
-            total_tokens: 0,
-            inter_token_latencies: Vec::new(),
+            first_reasoning_token_time: None,
+            first_content_token_time: None,
+            last_reasoning_token_time: None,
+            last_content_token_time: None,
+            reasoning_inter_token_latencies: Vec::new(),
+            content_inter_token_latencies: Vec::new(),
+            reasoning_tokens: 0,
+            content_tokens: 0,
             pending_chunks: std::collections::VecDeque::new(),
             partial_line: String::new(),
             done: false,
@@ -463,10 +470,18 @@ impl OpenAIClient {
 pub struct StreamResponse {
     response: reqwest::Response,
     start_time: Instant,
-    first_token_time: Option<Duration>,
-    last_token_time: Option<Instant>,
-    total_tokens: u32,
-    inter_token_latencies: Vec<Duration>,
+    // Phase-specific TTFT tracking
+    first_reasoning_token_time: Option<Duration>,
+    first_content_token_time: Option<Duration>,
+    // Phase-specific last-token tracking for ITL
+    last_reasoning_token_time: Option<Instant>,
+    last_content_token_time: Option<Instant>,
+    // Phase-specific ITL
+    reasoning_inter_token_latencies: Vec<Duration>,
+    content_inter_token_latencies: Vec<Duration>,
+    // Token counts per phase
+    reasoning_tokens: u32,
+    content_tokens: u32,
     /// Buffer for parsed chunks when a single HTTP chunk contains multiple SSE events
     pending_chunks: std::collections::VecDeque<ChatCompletionChunk>,
     /// Buffer for incomplete SSE lines split across HTTP chunks
@@ -563,41 +578,101 @@ impl StreamResponse {
             }
         }
 
-        let has_content = chunk.choices.iter().any(|c| c.delta.content.is_some());
+        let now = Instant::now();
 
-        if has_content {
-            let now = Instant::now();
-
-            // Record time to first token
-            if self.first_token_time.is_none() {
-                self.first_token_time = Some(self.start_time.elapsed());
-            } else if let Some(last_time) = self.last_token_time {
-                // Record inter-token latency
-                let itl = now.duration_since(last_time);
-                self.inter_token_latencies.push(itl);
+        // Track reasoning tokens
+        let has_reasoning = chunk
+            .choices
+            .iter()
+            .any(|c| c.delta.reasoning_content.is_some());
+        if has_reasoning {
+            if self.first_reasoning_token_time.is_none() {
+                self.first_reasoning_token_time = Some(self.start_time.elapsed());
+            } else if let Some(last) = self.last_reasoning_token_time {
+                self.reasoning_inter_token_latencies
+                    .push(now.duration_since(last));
             }
+            self.last_reasoning_token_time = Some(now);
+            for choice in &chunk.choices {
+                if choice.delta.reasoning_content.is_some() {
+                    self.reasoning_tokens += 1;
+                }
+            }
+        }
 
-            self.last_token_time = Some(now);
-
-            // Count tokens (approximate - just counting content chunks)
+        // Track content tokens
+        let has_content = chunk.choices.iter().any(|c| c.delta.content.is_some());
+        if has_content {
+            if self.first_content_token_time.is_none() {
+                self.first_content_token_time = Some(self.start_time.elapsed());
+            } else if let Some(last) = self.last_content_token_time {
+                self.content_inter_token_latencies
+                    .push(now.duration_since(last));
+            }
+            self.last_content_token_time = Some(now);
             for choice in &chunk.choices {
                 if choice.delta.content.is_some() {
-                    self.total_tokens += 1;
+                    self.content_tokens += 1;
                 }
             }
         }
     }
 
+    /// First token of any kind (reasoning or content) — prefill latency.
     pub fn time_to_first_token(&self) -> Option<Duration> {
-        self.first_token_time
+        match (
+            self.first_reasoning_token_time,
+            self.first_content_token_time,
+        ) {
+            (Some(r), Some(c)) => Some(r.min(c)),
+            (Some(r), None) => Some(r),
+            (None, Some(c)) => Some(c),
+            (None, None) => None,
+        }
+    }
+
+    pub fn time_to_first_reasoning_token(&self) -> Option<Duration> {
+        self.first_reasoning_token_time
+    }
+
+    pub fn time_to_first_content_token(&self) -> Option<Duration> {
+        self.first_content_token_time
+    }
+
+    /// Time spent in reasoning phase (first reasoning token to first content token).
+    pub fn think_duration(&self) -> Option<Duration> {
+        match (
+            self.first_reasoning_token_time,
+            self.first_content_token_time,
+        ) {
+            (Some(r), Some(c)) if c > r => Some(c - r),
+            _ => None,
+        }
     }
 
     pub fn total_duration(&self) -> Duration {
         self.start_time.elapsed()
     }
 
-    pub fn inter_token_latencies(&self) -> &[Duration] {
-        &self.inter_token_latencies
+    pub fn reasoning_inter_token_latencies(&self) -> &[Duration] {
+        &self.reasoning_inter_token_latencies
+    }
+
+    pub fn content_inter_token_latencies(&self) -> &[Duration] {
+        &self.content_inter_token_latencies
+    }
+
+    pub fn reasoning_tokens(&self) -> u32 {
+        self.reasoning_tokens
+    }
+
+    pub fn content_tokens(&self) -> u32 {
+        self.content_tokens
+    }
+
+    /// Whether this stream contained reasoning tokens.
+    pub fn has_reasoning(&self) -> bool {
+        self.first_reasoning_token_time.is_some()
     }
 
     /// Server-reported token usage, if the server supports stream_options.include_usage

@@ -829,6 +829,9 @@ impl BenchmarkRunner {
                         if let Some(content) = choice.delta.content {
                             total_content.push_str(&content);
                         }
+                        if let Some(reasoning) = choice.delta.reasoning_content {
+                            total_content.push_str(&reasoning);
+                        }
                     }
                 }
 
@@ -845,28 +848,54 @@ impl BenchmarkRunner {
 
                 // Only record metrics if not in warmup phase
                 if !is_warmup {
-                    // Record metrics
-                    if let Some(ttft) = stream.time_to_first_token() {
-                        Metrics::record_ttft_with_context(ttft, input_tokens);
+                    use crate::metrics::Phase;
+
+                    // Record phase-specific TTFT
+                    if let Some(ttft) = stream.time_to_first_reasoning_token() {
+                        Metrics::record_ttft(ttft, input_tokens, Phase::Reasoning);
+                    }
+                    if let Some(ttft) = stream.time_to_first_content_token() {
+                        Metrics::record_ttft(ttft, input_tokens, Phase::Content);
                     }
 
-                    // Record inter-token latencies with context awareness
-                    for itl in stream.inter_token_latencies() {
-                        Metrics::record_itl_with_context(*itl, input_tokens);
+                    // Record think duration
+                    if let Some(think) = stream.think_duration() {
+                        Metrics::record_think_duration(think);
+                    }
+
+                    // Record phase-specific ITL
+                    for itl in stream.reasoning_inter_token_latencies() {
+                        Metrics::record_itl(*itl, input_tokens, Phase::Reasoning);
+                    }
+                    for itl in stream.content_inter_token_latencies() {
+                        Metrics::record_itl(*itl, input_tokens, Phase::Content);
                     }
 
                     let total_duration = request_start.elapsed();
                     Metrics::record_latency(total_duration);
                     Metrics::record_tokens(input_tokens, output_tokens);
 
-                    // Calculate and record TPOT (Time per Output Token, excluding first token)
-                    // TPOT = (total_duration - TTFT) / (num_output_tokens - 1)
-                    if let Some(ttft) = stream.time_to_first_token()
-                        && output_tokens > 1
+                    // Phase-specific TPOT
+                    // Reasoning TPOT: reasoning duration / (reasoning_tokens - 1)
+                    if let Some(reasoning_ttft) = stream.time_to_first_reasoning_token()
+                        && stream.reasoning_tokens() > 1
                     {
-                        let generation_duration = total_duration.saturating_sub(ttft);
-                        let tpot = generation_duration.as_nanos() as u64 / (output_tokens - 1);
-                        Metrics::record_tpot(Duration::from_nanos(tpot));
+                        let reasoning_end = stream
+                            .time_to_first_content_token()
+                            .unwrap_or(total_duration);
+                        let reasoning_gen = reasoning_end.saturating_sub(reasoning_ttft);
+                        let tpot_ns = reasoning_gen.as_nanos() as u64
+                            / (stream.reasoning_tokens() as u64 - 1);
+                        Metrics::record_tpot(Duration::from_nanos(tpot_ns), Phase::Reasoning);
+                    }
+                    // Content TPOT: content duration / (content_tokens - 1)
+                    if let Some(content_ttft) = stream.time_to_first_content_token()
+                        && stream.content_tokens() > 1
+                    {
+                        let content_gen = total_duration.saturating_sub(content_ttft);
+                        let tpot_ns =
+                            content_gen.as_nanos() as u64 / (stream.content_tokens() as u64 - 1);
+                        Metrics::record_tpot(Duration::from_nanos(tpot_ns), Phase::Content);
                     }
 
                     Metrics::record_request_complete(RequestStatus::Success);

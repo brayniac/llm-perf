@@ -339,45 +339,31 @@ impl ReportBuilder {
     }
 
     fn build_latency_stats(&self) -> Result<LatencyStats> {
-        use crate::metrics::{
-            ITL_LARGE, ITL_MEDIUM, ITL_SMALL, ITL_XLARGE, ITL_XXLARGE, REQUEST_LATENCY, TPOT,
-            TTFT_LARGE, TTFT_MEDIUM, TTFT_SMALL, TTFT_XLARGE, TTFT_XXLARGE,
-        };
+        use crate::metrics::{ALL_ITL, ALL_TPOT, ALL_TTFT, REQUEST_LATENCY};
 
-        // Aggregate TTFT across all context buckets
-        let (ttft_mean, ttft_p50, ttft_p90, ttft_p95, ttft_p99) = if let Some(ttft) =
-            Self::merge_context_histograms(&[
-                &TTFT_SMALL,
-                &TTFT_MEDIUM,
-                &TTFT_LARGE,
-                &TTFT_XLARGE,
-                &TTFT_XXLARGE,
-            ]) {
-            Self::extract_percentiles_ms(&ttft)
-        } else {
-            (0.0, 0.0, 0.0, 0.0, 0.0)
-        };
+        // Aggregate TTFT across all phases and context buckets
+        let (ttft_mean, ttft_p50, ttft_p90, ttft_p95, ttft_p99) =
+            if let Some(ttft) = Self::merge_context_histograms(&ALL_TTFT) {
+                Self::extract_percentiles_ms(&ttft)
+            } else {
+                (0.0, 0.0, 0.0, 0.0, 0.0)
+            };
 
-        // Aggregate ITL across all context buckets
-        let (itl_mean, itl_p50, itl_p90, itl_p95, itl_p99) = if let Some(itl) =
-            Self::merge_context_histograms(&[
-                &ITL_SMALL,
-                &ITL_MEDIUM,
-                &ITL_LARGE,
-                &ITL_XLARGE,
-                &ITL_XXLARGE,
-            ]) {
-            Self::extract_percentiles_ms(&itl)
-        } else {
-            (0.0, 0.0, 0.0, 0.0, 0.0)
-        };
+        // Aggregate ITL across all phases and context buckets
+        let (itl_mean, itl_p50, itl_p90, itl_p95, itl_p99) =
+            if let Some(itl) = Self::merge_context_histograms(&ALL_ITL) {
+                Self::extract_percentiles_ms(&itl)
+            } else {
+                (0.0, 0.0, 0.0, 0.0, 0.0)
+            };
 
-        // Extract TPOT percentiles
-        let (tpot_mean, tpot_p50, tpot_p90, tpot_p95, tpot_p99) = if let Some(tpot) = TPOT.load() {
-            Self::extract_percentiles_ms(&tpot)
-        } else {
-            (0.0, 0.0, 0.0, 0.0, 0.0)
-        };
+        // Aggregate TPOT across all phases
+        let (tpot_mean, tpot_p50, tpot_p90, tpot_p95, tpot_p99) =
+            if let Some(tpot) = Self::merge_context_histograms(&ALL_TPOT) {
+                Self::extract_percentiles_ms(&tpot)
+            } else {
+                (0.0, 0.0, 0.0, 0.0, 0.0)
+            };
 
         // Extract request latency percentiles
         let (request_mean, request_p50, request_p90, request_p95, request_p99) =
@@ -412,19 +398,22 @@ impl ReportBuilder {
     }
 
     fn build_context_latency_stats(&self) -> Option<ContextLatencyStats> {
-        use crate::metrics::{TTFT_LARGE, TTFT_MEDIUM, TTFT_SMALL, TTFT_XLARGE, TTFT_XXLARGE};
+        use crate::metrics::{
+            TTFT_CONTENT_LARGE, TTFT_CONTENT_MEDIUM, TTFT_CONTENT_SMALL, TTFT_CONTENT_XLARGE,
+            TTFT_CONTENT_XXLARGE, TTFT_REASONING_LARGE, TTFT_REASONING_MEDIUM,
+            TTFT_REASONING_SMALL, TTFT_REASONING_XLARGE, TTFT_REASONING_XXLARGE,
+        };
 
-        let extract_percentiles =
-            |histogram: &metriken::AtomicHistogram| -> Option<LatencyPercentiles> {
-                if let Some(loaded) = histogram.load()
-                    && let Ok(Some(percentiles)) = loaded.percentiles(&[50.0, 90.0, 95.0, 99.0])
+        let extract_merged =
+            |histograms: &[&metriken::AtomicHistogram]| -> Option<LatencyPercentiles> {
+                let merged = Self::merge_context_histograms(histograms)?;
+                if let Ok(Some(percentiles)) = merged.percentiles(&[50.0, 90.0, 95.0, 99.0])
                     && !percentiles.is_empty()
                 {
                     let mut p50 = 0.0;
                     let mut p90 = 0.0;
                     let mut p95 = 0.0;
                     let mut p99 = 0.0;
-
                     for (percentile, bucket) in percentiles.iter() {
                         let value_ms = bucket.end() as f64 / 1_000_000.0;
                         match percentile.round() as u32 {
@@ -435,7 +424,6 @@ impl ReportBuilder {
                             _ => {}
                         }
                     }
-
                     return Some(LatencyPercentiles {
                         ttft_p50_ms: p50,
                         ttft_p90_ms: p90,
@@ -446,23 +434,12 @@ impl ReportBuilder {
                 None
             };
 
-        // Check if we have any context data
-        let has_data = TTFT_SMALL.load().is_some()
-            || TTFT_MEDIUM.load().is_some()
-            || TTFT_LARGE.load().is_some()
-            || TTFT_XLARGE.load().is_some()
-            || TTFT_XXLARGE.load().is_some();
-
-        if !has_data {
-            return None;
-        }
-
-        // Extract percentiles for each bucket
-        let small = extract_percentiles(&TTFT_SMALL)?;
-        let medium = extract_percentiles(&TTFT_MEDIUM)?;
-        let large = extract_percentiles(&TTFT_LARGE)?;
-        let xlarge = extract_percentiles(&TTFT_XLARGE)?;
-        let xxlarge = extract_percentiles(&TTFT_XXLARGE);
+        // Merge both phases per context size
+        let small = extract_merged(&[&TTFT_REASONING_SMALL, &TTFT_CONTENT_SMALL])?;
+        let medium = extract_merged(&[&TTFT_REASONING_MEDIUM, &TTFT_CONTENT_MEDIUM])?;
+        let large = extract_merged(&[&TTFT_REASONING_LARGE, &TTFT_CONTENT_LARGE])?;
+        let xlarge = extract_merged(&[&TTFT_REASONING_XLARGE, &TTFT_CONTENT_XLARGE])?;
+        let xxlarge = extract_merged(&[&TTFT_REASONING_XXLARGE, &TTFT_CONTENT_XXLARGE]);
 
         Some(ContextLatencyStats {
             small,
@@ -474,57 +451,47 @@ impl ReportBuilder {
     }
 
     fn build_context_itl_stats(&self) -> Option<ContextITLStats> {
-        use crate::metrics::{ITL_LARGE, ITL_MEDIUM, ITL_SMALL, ITL_XLARGE, ITL_XXLARGE};
+        use crate::metrics::{
+            ITL_CONTENT_LARGE, ITL_CONTENT_MEDIUM, ITL_CONTENT_SMALL, ITL_CONTENT_XLARGE,
+            ITL_CONTENT_XXLARGE, ITL_REASONING_LARGE, ITL_REASONING_MEDIUM, ITL_REASONING_SMALL,
+            ITL_REASONING_XLARGE, ITL_REASONING_XXLARGE,
+        };
 
-        let extract_percentiles =
-            |histogram: &metriken::AtomicHistogram| -> Option<ITLPercentiles> {
-                if let Some(loaded) = histogram.load()
-                    && let Ok(Some(percentiles)) = loaded.percentiles(&[50.0, 90.0, 95.0, 99.0])
-                    && !percentiles.is_empty()
-                {
-                    let mut p50 = 0.0;
-                    let mut p90 = 0.0;
-                    let mut p95 = 0.0;
-                    let mut p99 = 0.0;
-
-                    for (percentile, bucket) in percentiles.iter() {
-                        let value_ms = bucket.end() as f64 / 1_000_000.0;
-                        match percentile.round() as u32 {
-                            50 => p50 = value_ms,
-                            90 => p90 = value_ms,
-                            95 => p95 = value_ms,
-                            99 => p99 = value_ms,
-                            _ => {}
-                        }
+        let extract_merged = |histograms: &[&metriken::AtomicHistogram]| -> Option<ITLPercentiles> {
+            let merged = Self::merge_context_histograms(histograms)?;
+            if let Ok(Some(percentiles)) = merged.percentiles(&[50.0, 90.0, 95.0, 99.0])
+                && !percentiles.is_empty()
+            {
+                let mut p50 = 0.0;
+                let mut p90 = 0.0;
+                let mut p95 = 0.0;
+                let mut p99 = 0.0;
+                for (percentile, bucket) in percentiles.iter() {
+                    let value_ms = bucket.end() as f64 / 1_000_000.0;
+                    match percentile.round() as u32 {
+                        50 => p50 = value_ms,
+                        90 => p90 = value_ms,
+                        95 => p95 = value_ms,
+                        99 => p99 = value_ms,
+                        _ => {}
                     }
-
-                    return Some(ITLPercentiles {
-                        itl_p50_ms: p50,
-                        itl_p90_ms: p90,
-                        itl_p95_ms: p95,
-                        itl_p99_ms: p99,
-                    });
                 }
-                None
-            };
+                return Some(ITLPercentiles {
+                    itl_p50_ms: p50,
+                    itl_p90_ms: p90,
+                    itl_p95_ms: p95,
+                    itl_p99_ms: p99,
+                });
+            }
+            None
+        };
 
-        // Check if we have any context ITL data
-        let has_data = ITL_SMALL.load().is_some()
-            || ITL_MEDIUM.load().is_some()
-            || ITL_LARGE.load().is_some()
-            || ITL_XLARGE.load().is_some()
-            || ITL_XXLARGE.load().is_some();
-
-        if !has_data {
-            return None;
-        }
-
-        // Extract percentiles for each bucket
-        let small = extract_percentiles(&ITL_SMALL)?;
-        let medium = extract_percentiles(&ITL_MEDIUM)?;
-        let large = extract_percentiles(&ITL_LARGE)?;
-        let xlarge = extract_percentiles(&ITL_XLARGE)?;
-        let xxlarge = extract_percentiles(&ITL_XXLARGE);
+        // Merge both phases per context size
+        let small = extract_merged(&[&ITL_REASONING_SMALL, &ITL_CONTENT_SMALL])?;
+        let medium = extract_merged(&[&ITL_REASONING_MEDIUM, &ITL_CONTENT_MEDIUM])?;
+        let large = extract_merged(&[&ITL_REASONING_LARGE, &ITL_CONTENT_LARGE])?;
+        let xlarge = extract_merged(&[&ITL_REASONING_XLARGE, &ITL_CONTENT_XLARGE])?;
+        let xxlarge = extract_merged(&[&ITL_REASONING_XXLARGE, &ITL_CONTENT_XXLARGE]);
 
         Some(ContextITLStats {
             small,

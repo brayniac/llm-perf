@@ -8,9 +8,9 @@ use tokio::time::{Instant, interval_at, timeout};
 
 use crate::config::Config;
 use crate::metrics::{
-    ERRORS_CONNECTION, ERRORS_HTTP_4XX, ERRORS_HTTP_5XX, ERRORS_OTHER, ERRORS_PARSE,
+    ALL_TPOT, ERRORS_CONNECTION, ERRORS_HTTP_4XX, ERRORS_HTTP_5XX, ERRORS_OTHER, ERRORS_PARSE,
     REQUEST_LATENCY, REQUESTS_FAILED, REQUESTS_INFLIGHT, REQUESTS_SENT, REQUESTS_SUCCESS,
-    REQUESTS_TIMEOUT, RUNNING, TOKENS_INPUT, TOKENS_OUTPUT, TPOT,
+    REQUESTS_TIMEOUT, RUNNING, TOKENS_INPUT, TOKENS_OUTPUT,
 };
 
 /// Print with timestamp prefix
@@ -46,6 +46,19 @@ struct MetricsSnapshot {
 }
 
 impl MetricsSnapshot {
+    fn merge_tpot() -> Option<Histogram> {
+        let mut merged: Option<Histogram> = None;
+        for h in &ALL_TPOT {
+            if let Some(loaded) = h.load() {
+                merged = Some(match merged {
+                    Some(m) => m.wrapping_add(&loaded).ok()?,
+                    None => loaded,
+                });
+            }
+        }
+        merged
+    }
+
     fn new() -> Self {
         Self {
             requests_sent: REQUESTS_SENT.value(),
@@ -59,7 +72,7 @@ impl MetricsSnapshot {
             errors_5xx: ERRORS_HTTP_5XX.value(),
             errors_parse: ERRORS_PARSE.value(),
             errors_other: ERRORS_OTHER.value(),
-            tpot_histogram: TPOT.load(),
+            tpot_histogram: Self::merge_tpot(),
             request_histogram: REQUEST_LATENCY.load(),
         }
     }
@@ -76,7 +89,7 @@ impl MetricsSnapshot {
         self.errors_5xx = ERRORS_HTTP_5XX.value();
         self.errors_parse = ERRORS_PARSE.value();
         self.errors_other = ERRORS_OTHER.value();
-        self.tpot_histogram = TPOT.load();
+        self.tpot_histogram = Self::merge_tpot();
         self.request_histogram = REQUEST_LATENCY.load();
     }
 }
@@ -216,7 +229,7 @@ pub async fn periodic_stats(config: Config, warmup_complete: Arc<Notify>) {
         }
 
         // Get current histograms
-        let current_tpot = TPOT.load();
+        let current_tpot = MetricsSnapshot::merge_tpot();
         let current_request = REQUEST_LATENCY.load();
 
         // TPOT percentiles for this window (using delta)
