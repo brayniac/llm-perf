@@ -1,77 +1,10 @@
 use anyhow::Result;
 use llm_perf::cli::Command;
 use llm_perf::{Cli, Config};
-use log::{LevelFilter, Metadata, Record, debug, info, warn};
-use ringlog::{File, LogBuilder, MultiLogBuilder, Output, Stderr};
-use std::collections::HashMap;
-use std::io::Write;
-use std::sync::Mutex;
-
-/// Maximum log file size before rotation (10MB)
-const LOG_FILE_MAX_SIZE: u64 = 1024 * 1024 * 10;
-
-/// Parse log filter strings like "hyper=info" into a map of module prefix to level filter
-fn parse_log_filters(filters: &[String]) -> HashMap<String, LevelFilter> {
-    let mut map = HashMap::new();
-    for filter in filters {
-        if let Some((module, level)) = filter.split_once('=') {
-            let level_filter = match level.to_lowercase().as_str() {
-                "error" => LevelFilter::Error,
-                "warn" => LevelFilter::Warn,
-                "info" => LevelFilter::Info,
-                "debug" => LevelFilter::Debug,
-                "trace" => LevelFilter::Trace,
-                "off" => LevelFilter::Off,
-                _ => continue,
-            };
-            map.insert(module.to_string(), level_filter);
-        }
-    }
-    map
-}
-
-/// Check if a log record should be filtered based on per-module filters
-fn should_log(metadata: &Metadata, filters: &HashMap<String, LevelFilter>) -> bool {
-    let target = metadata.target();
-
-    // Check each filter to see if it matches this target
-    for (module_prefix, level_filter) in filters {
-        if target.starts_with(module_prefix) {
-            return metadata.level() <= *level_filter;
-        }
-    }
-
-    // If no filter matched, allow the log (will be caught by global level filter)
-    true
-}
-
-/// Custom logger with per-module filtering that wraps ringlog
-struct FilteredLogger {
-    output: Mutex<Box<dyn Output>>,
-    max_level: LevelFilter,
-    filters: HashMap<String, LevelFilter>,
-}
-
-impl log::Log for FilteredLogger {
-    fn enabled(&self, metadata: &Metadata) -> bool {
-        metadata.level() <= self.max_level && should_log(metadata, &self.filters)
-    }
-
-    fn log(&self, record: &Record) {
-        if self.enabled(record.metadata())
-            && let Ok(mut output) = self.output.lock()
-        {
-            let message = format!("{}\n", record.args());
-            let _ = output.write_all(message.as_bytes());
-        }
-    }
-
-    fn flush(&self) {
-        if let Ok(mut output) = self.output.lock() {
-            let _ = output.flush();
-        }
-    }
-}
+use log::{debug, info, warn};
+use tracing_appender::non_blocking::WorkerGuard;
+use tracing_subscriber::EnvFilter;
+use tracing_subscriber::prelude::*;
 
 fn main() -> Result<()> {
     // Parse CLI arguments
@@ -95,50 +28,37 @@ fn main() -> Result<()> {
     }
 }
 
+/// Set up non-blocking logging with tracing-subscriber and tracing-appender.
+/// Returns the WorkerGuard which must be held alive for the duration of the program.
+fn setup_logging(config: &Config) -> Result<WorkerGuard> {
+    // Build env filter from configured level and per-module overrides
+    let mut filter = EnvFilter::new(config.log.level.as_str());
+    for directive in &config.log.filter {
+        filter = filter.add_directive(directive.parse()?);
+    }
+
+    // Set up non-blocking writer to file or stderr
+    let (non_blocking, guard) = if let Some(ref log_file) = config.output.trace_log {
+        let file = std::fs::File::create(log_file)?;
+        tracing_appender::non_blocking(file)
+    } else {
+        tracing_appender::non_blocking(std::io::stderr())
+    };
+
+    tracing_subscriber::registry()
+        .with(filter)
+        .with(tracing_subscriber::fmt::layer().with_writer(non_blocking))
+        .init();
+
+    Ok(guard)
+}
+
 fn run_bench_mode(config_path: &std::path::Path) -> Result<()> {
     // Load configuration first to check verbosity setting
     let config = Config::load(&config_path.to_path_buf())?;
 
-    // Set up logging with ringlog and per-module filtering
-    let log_level = config.log.level.to_level_filter();
-
-    // Configure output destination
-    let output: Box<dyn Output> = if let Some(ref log_file) = config.output.trace_log {
-        // Log to file with rotation
-        let backup_file = log_file.with_extension("old");
-        Box::new(File::new(log_file.clone(), backup_file, LOG_FILE_MAX_SIZE)?)
-    } else {
-        // Log to stderr
-        Box::new(Stderr::new())
-    };
-
-    // Parse per-module filters from config
-    let filters = parse_log_filters(&config.log.filter);
-
-    // Create logger with per-module filtering if configured
-    if filters.is_empty() {
-        // No filters - use ringlog directly
-        let base_log = LogBuilder::new()
-            .output(output)
-            .build()
-            .expect("failed to initialize logger");
-
-        let _drain = MultiLogBuilder::new()
-            .level_filter(log_level)
-            .default(base_log)
-            .build()
-            .start();
-    } else {
-        // Use custom filtered logger
-        let logger = FilteredLogger {
-            output: Mutex::new(output),
-            max_level: log_level,
-            filters,
-        };
-
-        log::set_boxed_logger(Box::new(logger)).expect("failed to set logger");
-        log::set_max_level(log_level);
-    }
+    // Set up non-blocking logging
+    let _guard = setup_logging(&config)?;
 
     // Print clean startup message
     if !config.output.quiet {
@@ -212,39 +132,8 @@ fn run_logprobs_mode(config_path: &std::path::Path) -> Result<()> {
         })?
         .clone();
 
-    // Set up logging (reuse bench mode pattern)
-    let log_level = config.log.level.to_level_filter();
-
-    let output: Box<dyn Output> = if let Some(ref log_file) = config.output.trace_log {
-        let backup_file = log_file.with_extension("old");
-        Box::new(File::new(log_file.clone(), backup_file, LOG_FILE_MAX_SIZE)?)
-    } else {
-        Box::new(Stderr::new())
-    };
-
-    let filters = parse_log_filters(&config.log.filter);
-
-    if filters.is_empty() {
-        let base_log = LogBuilder::new()
-            .output(output)
-            .build()
-            .expect("failed to initialize logger");
-
-        let _drain = MultiLogBuilder::new()
-            .level_filter(log_level)
-            .default(base_log)
-            .build()
-            .start();
-    } else {
-        let logger = FilteredLogger {
-            output: Mutex::new(output),
-            max_level: log_level,
-            filters,
-        };
-
-        log::set_boxed_logger(Box::new(logger)).expect("failed to set logger");
-        log::set_max_level(log_level);
-    }
+    // Set up non-blocking logging
+    let _guard = setup_logging(&config)?;
 
     if !config.output.quiet {
         println!("LLM Logprobs Collection");

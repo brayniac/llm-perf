@@ -113,13 +113,13 @@ pub enum LogLevel {
 }
 
 impl LogLevel {
-    pub fn to_level_filter(&self) -> log::LevelFilter {
+    pub fn as_str(&self) -> &'static str {
         match self {
-            LogLevel::Error => log::LevelFilter::Error,
-            LogLevel::Warn => log::LevelFilter::Warn,
-            LogLevel::Info => log::LevelFilter::Info,
-            LogLevel::Debug => log::LevelFilter::Debug,
-            LogLevel::Trace => log::LevelFilter::Trace,
+            LogLevel::Error => "error",
+            LogLevel::Warn => "warn",
+            LogLevel::Info => "info",
+            LogLevel::Debug => "debug",
+            LogLevel::Trace => "trace",
         }
     }
 }
