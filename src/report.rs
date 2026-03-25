@@ -25,6 +25,10 @@ pub struct BenchmarkReport {
     pub context_latency: Option<ContextLatencyStats>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub context_itl: Option<ContextITLStats>,
+
+    // Multi-turn conversation metrics
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub conversation: Option<ConversationStats>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -39,7 +43,8 @@ pub struct TestConfiguration {
     pub warmup_requests: Option<usize>,
     pub warmup_duration: Option<u64>,
     pub prompt_file: String,
-    pub shuffle: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub seed: Option<u64>,
     pub sample_size: Option<usize>,
 }
 
@@ -130,6 +135,20 @@ pub struct ITLPercentiles {
     pub itl_p99_ms: f64,
 }
 
+#[derive(Debug, Clone, Serialize)]
+pub struct ConversationStats {
+    pub conversations_sent: u64,
+    pub conversations_success: u64,
+    pub conversations_failed: u64,
+    pub total_turns: u64,
+    pub avg_turns_per_conversation: f64,
+    pub conversation_latency_mean_ms: f64,
+    pub conversation_latency_p50_ms: f64,
+    pub conversation_latency_p90_ms: f64,
+    pub conversation_latency_p95_ms: f64,
+    pub conversation_latency_p99_ms: f64,
+}
+
 pub struct ReportBuilder {
     start_time: SystemTime,
     config: Option<crate::config::Config>,
@@ -207,7 +226,7 @@ impl ReportBuilder {
                 warmup_requests: config.load.warmup_requests,
                 warmup_duration: config.load.warmup_duration,
                 prompt_file: config.input.file.display().to_string(),
-                shuffle: config.input.shuffle,
+                seed: config.input.seed,
                 sample_size: config.input.sample_size,
             }
         } else {
@@ -223,7 +242,7 @@ impl ReportBuilder {
                 warmup_requests: None,
                 warmup_duration: None,
                 prompt_file: "unknown".to_string(),
-                shuffle: false,
+                seed: None,
                 sample_size: None,
             }
         };
@@ -266,6 +285,7 @@ impl ReportBuilder {
         let latency = self.build_latency_stats()?;
         let context_latency = self.build_context_latency_stats();
         let context_itl = self.build_context_itl_stats();
+        let conversation = self.build_conversation_stats();
 
         // Convert SystemTime to DateTime<Utc>
         let timestamp: DateTime<Utc> = self.start_time.into();
@@ -281,6 +301,7 @@ impl ReportBuilder {
             errors,
             context_latency,
             context_itl,
+            conversation,
         })
     }
 
@@ -507,6 +528,47 @@ impl ReportBuilder {
         })
     }
 
+    fn build_conversation_stats(&self) -> Option<ConversationStats> {
+        use crate::metrics::{
+            CONVERSATION_LATENCY, CONVERSATIONS_FAILED, CONVERSATIONS_SENT, CONVERSATIONS_SUCCESS,
+            TURNS_TOTAL,
+        };
+
+        let sent = CONVERSATIONS_SENT.value();
+        if sent == 0 {
+            return None;
+        }
+
+        let success = CONVERSATIONS_SUCCESS.value();
+        let failed = CONVERSATIONS_FAILED.value();
+        let turns = TURNS_TOTAL.value();
+        let completed = success + failed;
+        let avg_turns = if completed > 0 {
+            turns as f64 / completed as f64
+        } else {
+            0.0
+        };
+
+        let (mean, p50, p90, p95, p99) = if let Some(hist) = CONVERSATION_LATENCY.load() {
+            Self::extract_percentiles_ms(&hist)
+        } else {
+            (0.0, 0.0, 0.0, 0.0, 0.0)
+        };
+
+        Some(ConversationStats {
+            conversations_sent: sent,
+            conversations_success: success,
+            conversations_failed: failed,
+            total_turns: turns,
+            avg_turns_per_conversation: avg_turns,
+            conversation_latency_mean_ms: mean,
+            conversation_latency_p50_ms: p50,
+            conversation_latency_p90_ms: p90,
+            conversation_latency_p95_ms: p95,
+            conversation_latency_p99_ms: p99,
+        })
+    }
+
     pub fn print_console_report(&self) -> Result<()> {
         let report = self.build()?;
 
@@ -615,6 +677,28 @@ impl ReportBuilder {
             report.latency.request_p95_ms,
             report.latency.request_p99_ms
         );
+
+        // Multi-turn conversation stats
+        if let Some(ref conv) = report.conversation {
+            println!(
+                "{} Conversations: Sent: {} Ok: {} Err: {} Turns: {} Avg turns: {:.1}",
+                timestamp,
+                conv.conversations_sent,
+                conv.conversations_success,
+                conv.conversations_failed,
+                conv.total_turns,
+                conv.avg_turns_per_conversation
+            );
+            println!(
+                "{} Conversation Latency (ms): mean: {:.1} p50: {:.0} p90: {:.0} p95: {:.0} p99: {:.0}",
+                timestamp,
+                conv.conversation_latency_mean_ms,
+                conv.conversation_latency_p50_ms,
+                conv.conversation_latency_p90_ms,
+                conv.conversation_latency_p95_ms,
+                conv.conversation_latency_p99_ms
+            );
+        }
 
         println!("\n");
 

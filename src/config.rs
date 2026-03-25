@@ -69,8 +69,10 @@ pub struct LoadConfig {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct InputConfig {
     pub file: PathBuf,
-    #[serde(default)]
-    pub shuffle: bool,
+    /// Seed for deterministic shuffling. If set, prompts are shuffled using this seed
+    /// for reproducible ordering across runs. If not set, prompts are used in file order.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub seed: Option<u64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub sample_size: Option<usize>,
 }

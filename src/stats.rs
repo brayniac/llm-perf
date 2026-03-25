@@ -8,9 +8,10 @@ use tokio::time::{Instant, interval_at, timeout};
 
 use crate::config::Config;
 use crate::metrics::{
-    ALL_TPOT, ERRORS_CONNECTION, ERRORS_HTTP_4XX, ERRORS_HTTP_5XX, ERRORS_OTHER, ERRORS_PARSE,
-    REQUEST_LATENCY, REQUESTS_FAILED, REQUESTS_INFLIGHT, REQUESTS_SENT, REQUESTS_SUCCESS,
-    REQUESTS_TIMEOUT, RUNNING, TOKENS_INPUT, TOKENS_OUTPUT_CONTENT, TOKENS_OUTPUT_REASONING,
+    ALL_TPOT, CONVERSATIONS_SENT, CONVERSATIONS_SUCCESS, ERRORS_CONNECTION, ERRORS_HTTP_4XX,
+    ERRORS_HTTP_5XX, ERRORS_OTHER, ERRORS_PARSE, REQUEST_LATENCY, REQUESTS_FAILED,
+    REQUESTS_INFLIGHT, REQUESTS_SENT, REQUESTS_SUCCESS, REQUESTS_TIMEOUT, RUNNING, TOKENS_INPUT,
+    TOKENS_OUTPUT_CONTENT, TOKENS_OUTPUT_REASONING, TURNS_TOTAL,
 };
 
 /// Print with timestamp prefix
@@ -177,6 +178,19 @@ pub async fn periodic_stats(config: Config, warmup_complete: Arc<Notify>) {
             sent_rate,
             requests_inflight
         );
+
+        // Conversation progress (cumulative, not windowed)
+        let conversations_sent = CONVERSATIONS_SENT.value();
+        if conversations_sent > 0 {
+            let conversations_success = CONVERSATIONS_SUCCESS.value();
+            let turns = TURNS_TOTAL.value();
+            output!(
+                "Conversations: {} sent, {} complete, {} turns",
+                conversations_sent,
+                conversations_success,
+                turns
+            );
+        }
 
         // Response statistics for this window (as rates)
         let window_responses =

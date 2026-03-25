@@ -67,6 +67,18 @@ pub static TOKENS_OUTPUT_CONTENT: LazyCounter = LazyCounter::new(Counter::defaul
 #[metric(name = "requests_inflight")]
 pub static REQUESTS_INFLIGHT: LazyGauge = LazyGauge::new(Gauge::default);
 
+// Conversation metrics (multi-turn)
+#[metric(name = "conversations", metadata = { status = "sent" })]
+pub static CONVERSATIONS_SENT: LazyCounter = LazyCounter::new(Counter::default);
+#[metric(name = "conversations", metadata = { status = "success" })]
+pub static CONVERSATIONS_SUCCESS: LazyCounter = LazyCounter::new(Counter::default);
+#[metric(name = "conversations", metadata = { status = "failed" })]
+pub static CONVERSATIONS_FAILED: LazyCounter = LazyCounter::new(Counter::default);
+#[metric(name = "turns")]
+pub static TURNS_TOTAL: LazyCounter = LazyCounter::new(Counter::default);
+#[metric(name = "conversation_latency", metadata = { unit = "nanoseconds" })]
+pub static CONVERSATION_LATENCY: AtomicHistogram = AtomicHistogram::new(7, 64);
+
 // Latency metrics (in nanoseconds)
 // Histogram parameters: (grouping_power=7, max_value_power=64)
 // 128 buckets per power of 2 (~0.54% relative precision), covering the full 64-bit range
@@ -266,5 +278,25 @@ impl Metrics {
 
     pub fn record_retry() {
         REQUESTS_RETRIED.increment();
+    }
+
+    pub fn record_conversation_sent() {
+        CONVERSATIONS_SENT.increment();
+    }
+
+    pub fn record_conversation_complete(success: bool) {
+        if success {
+            CONVERSATIONS_SUCCESS.increment();
+        } else {
+            CONVERSATIONS_FAILED.increment();
+        }
+    }
+
+    pub fn record_turn() {
+        TURNS_TOTAL.increment();
+    }
+
+    pub fn record_conversation_latency(duration: Duration) {
+        let _ = CONVERSATION_LATENCY.increment(duration.as_nanos() as u64);
     }
 }
