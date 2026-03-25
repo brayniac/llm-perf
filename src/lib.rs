@@ -3,6 +3,7 @@ pub mod benchmark;
 pub mod cli;
 pub mod client;
 pub mod config;
+pub mod dataset;
 pub mod distribution;
 pub mod kl_divergence;
 pub mod logprobs;

@@ -102,16 +102,30 @@ total_requests = 100
 # Input Configuration
 # =============================================================================
 [input]
-# Path to JSONL file containing prompts
-# Each line should be: {"prompt": "your prompt here", "max_tokens": 100}
-# max_tokens is optional per prompt
+# Path to JSONL file, or a known dataset name for auto-download from HuggingFace.
+#
+# Known dataset names (downloaded and cached on first use):
+#   "openorca"  — Open-Orca/OpenOrca GPT-4 subset (~1 GB download, 1M single-turn prompts)
+#   "sharegpt"  — ShareGPT Vicuna conversations (~670 MB download, ~90K multi-turn conversations)
+#
+# Custom JSONL formats:
+#   Single-turn: {"prompt": "your prompt here", "max_tokens": 100}
+#   Multi-turn (ShareGPT): {"conversations": [{"from": "human", "value": "Hello"}, {"from": "gpt", "value": "Hi!"}, ...]}
+#
+# ShareGPT format notes:
+#   - Roles: "human"/"user" for user turns, "gpt"/"assistant" for model turns, "system" for system prompt
+#   - Model responses in the dataset are ignored — the actual model generates responses
+#   - Each conversation occupies one worker slot for all its turns (tests KV cache / prefix caching)
+#   - Both formats can be mixed in the same file
+#   - max_tokens is optional per prompt/conversation
 file = "examples/prompts/openorca-10000.jsonl"
 
-# Shuffle prompts before running (recommended for realistic testing)
-# Default: false
-shuffle = true
+# Seed for deterministic shuffling (recommended for realistic but reproducible testing)
+# Same seed always produces the same prompt ordering across runs.
+# If not set, prompts are used in file order.
+# seed = 42
 
-# Limit to first N prompts from file (useful for quick tests)
+# Limit to first N prompts from file (applied before shuffling, useful for quick tests)
 # sample_size = 50
 
 # =============================================================================
@@ -221,6 +235,17 @@ level = "info"
 # concurrent_requests = 10
 # duration_seconds = 300  # 5 minutes
 # warmup_duration = 10
+
+# Pattern 5: Multi-Turn Conversations (Agentic Workload)
+# Use a ShareGPT-format JSONL file to test realistic multi-turn chat performance.
+# Each conversation runs its turns sequentially through one worker, measuring
+# TTFT growth with conversation depth and prefix caching effectiveness.
+# [input]
+# file = "conversations.jsonl"  # ShareGPT format
+# shuffle = true
+# [load]
+# concurrent_requests = 20  # 20 concurrent conversations
+# duration_seconds = 120
 
 # Feature Examples
 # ----------------
