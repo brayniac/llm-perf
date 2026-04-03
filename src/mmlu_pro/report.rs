@@ -95,30 +95,36 @@ fn generate_text_report(
     let mut total_corr = 0u32;
     let mut total_wrong = 0u32;
     let mut total_extraction_failures = 0u32;
+    let mut total_errors = 0u32;
     let categories = order_categories(stats);
 
     for category in &categories {
         if let Some(s) = stats.get(category) {
-            let total = s.correct + s.wrong;
+            let total = s.correct + s.wrong + s.errors;
             let acc = if total > 0 {
                 s.correct as f64 / total as f64 * 100.0
             } else {
                 0.0
             };
-            lines.push(format!(
+            let mut detail = format!(
                 "{}: {}/{} ({:.2}%), {} extraction failures",
                 category, s.correct, total, acc, s.extraction_failures
-            ));
+            );
+            if s.errors > 0 {
+                detail.push_str(&format!(", {} errors", s.errors));
+            }
+            lines.push(detail);
             total_corr += s.correct;
             total_wrong += s.wrong;
             total_extraction_failures += s.extraction_failures;
+            total_errors += s.errors;
         }
     }
 
     lines.push(String::new());
 
     // Total
-    let total = total_corr + total_wrong;
+    let total = total_corr + total_wrong + total_errors;
     let acc = if total > 0 {
         total_corr as f64 / total as f64 * 100.0
     } else {
@@ -129,6 +135,9 @@ fn generate_text_report(
         "Extraction failures: {} (counted as wrong)",
         total_extraction_failures
     ));
+    if total_errors > 0 {
+        lines.push(format!("Request errors: {}", total_errors));
+    }
     lines.push(String::new());
 
     // Markdown table
@@ -149,7 +158,7 @@ fn generate_text_report(
     scores.push(format!("{:.2}", acc));
     for category in &categories {
         if let Some(s) = stats.get(category) {
-            let cat_total = s.correct + s.wrong;
+            let cat_total = s.correct + s.wrong + s.errors;
             let cat_acc = if cat_total > 0 {
                 s.correct as f64 / cat_total as f64 * 100.0
             } else {
@@ -245,11 +254,12 @@ fn generate_json_report(
     let mut total_correct = 0u32;
     let mut total_wrong = 0u32;
     let mut total_extraction_failures = 0u32;
+    let mut total_errors = 0u32;
 
     let mut category_results = serde_json::Map::new();
     for category in &categories {
         if let Some(s) = stats.get(category) {
-            let total = s.correct + s.wrong;
+            let total = s.correct + s.wrong + s.errors;
             let acc = if total > 0 {
                 s.correct as f64 / total as f64 * 100.0
             } else {
@@ -260,6 +270,7 @@ fn generate_json_report(
                 serde_json::json!({
                     "correct": s.correct,
                     "wrong": s.wrong,
+                    "errors": s.errors,
                     "total": total,
                     "accuracy": round2(acc),
                     "extraction_failures": s.extraction_failures,
@@ -268,10 +279,11 @@ fn generate_json_report(
             total_correct += s.correct;
             total_wrong += s.wrong;
             total_extraction_failures += s.extraction_failures;
+            total_errors += s.errors;
         }
     }
 
-    let total = total_correct + total_wrong;
+    let total = total_correct + total_wrong + total_errors;
     let overall_acc = if total > 0 {
         total_correct as f64 / total as f64 * 100.0
     } else {
@@ -292,6 +304,7 @@ fn generate_json_report(
         "overall": {
             "correct": total_correct,
             "wrong": total_wrong,
+            "errors": total_errors,
             "total": total,
             "accuracy": round2(overall_acc),
             "extraction_failures": total_extraction_failures,

@@ -246,6 +246,44 @@ impl OpenAIClient {
         &self,
         request: ChatCompletionRequest,
     ) -> Result<ChatCompletionResponse> {
+        let mut attempt = 0;
+
+        loop {
+            match self.chat_completion_internal(request.clone()).await {
+                Ok(resp) => {
+                    if attempt > 0 {
+                        log::debug!("Request succeeded after {} retries", attempt);
+                    }
+                    return Ok(resp);
+                }
+                Err(e) => {
+                    if attempt < self.max_retries && Self::is_retriable_error(&e) {
+                        let delay = self.calculate_backoff_delay(attempt);
+                        log::debug!(
+                            "Request failed (attempt {}/{}): {}. Retrying in {:?}",
+                            attempt + 1,
+                            self.max_retries + 1,
+                            e,
+                            delay
+                        );
+                        tokio::time::sleep(delay).await;
+                        attempt += 1;
+                    } else {
+                        if attempt > 0 {
+                            log::debug!("Request failed after {} retries: {}", attempt, e);
+                        }
+                        return Err(e);
+                    }
+                }
+            }
+        }
+    }
+
+    /// Internal implementation of non-streaming request (without retry logic)
+    async fn chat_completion_internal(
+        &self,
+        request: ChatCompletionRequest,
+    ) -> Result<ChatCompletionResponse> {
         let url = format!("{}/chat/completions", self.base_url);
 
         let mut req = self.client.post(&url).json(&request);
@@ -254,12 +292,52 @@ impl OpenAIClient {
             req = req.header("Authorization", format!("Bearer {}", api_key));
         }
 
-        let response = req.send().await?;
+        let response = match req.send().await {
+            Ok(resp) => resp,
+            Err(e) => {
+                if e.is_connect() {
+                    return Err(ClientError::Connection(e.to_string()).into());
+                } else if e.is_timeout() {
+                    return Err(ClientError::Timeout(Duration::from_secs(60)).into());
+                } else if e.is_request() {
+                    let err_msg = e.to_string();
+                    if err_msg.contains("connection closed")
+                        || err_msg.contains("connection reset")
+                        || err_msg.contains("broken pipe")
+                        || err_msg.contains("connection refused")
+                    {
+                        return Err(ClientError::Connection(format!("Request error: {}", e)).into());
+                    } else {
+                        return Err(ClientError::Other(format!("Request error: {}", e)).into());
+                    }
+                } else {
+                    return Err(ClientError::Other(e.to_string()).into());
+                }
+            }
+        };
 
         if !response.status().is_success() {
-            let status = response.status();
-            let text = response.text().await?;
-            anyhow::bail!("API request failed with status {}: {}", status, text);
+            let status_code = response.status().as_u16();
+            let text = response
+                .text()
+                .await
+                .unwrap_or_else(|_| "Unable to read response body".to_string());
+
+            if (400..500).contains(&status_code) {
+                return Err(ClientError::Http4xx {
+                    status: status_code,
+                    message: text,
+                }
+                .into());
+            } else if (500..600).contains(&status_code) {
+                return Err(ClientError::Http5xx {
+                    status: status_code,
+                    message: text,
+                }
+                .into());
+            } else {
+                return Err(ClientError::Other(format!("HTTP {}: {}", status_code, text)).into());
+            }
         }
 
         let completion: ChatCompletionResponse = response.json().await?;

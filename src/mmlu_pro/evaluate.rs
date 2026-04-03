@@ -7,7 +7,7 @@ use std::sync::atomic::{AtomicU32, Ordering};
 use std::time::Instant;
 use tokio::sync::Semaphore;
 
-use crate::client::{ChatCompletionRequest, ClientConfig, OpenAIClient};
+use crate::client::{ChatCompletionRequest, ClientConfig, ClientError, OpenAIClient};
 
 use super::config::Config;
 use super::dataset::Question;
@@ -39,6 +39,7 @@ pub struct CategoryStats {
     pub correct: u32,
     pub wrong: u32,
     pub extraction_failures: u32,
+    pub errors: u32,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -58,6 +59,9 @@ struct ProgressCounters {
     correct: AtomicU32,
     wrong: AtomicU32,
     extraction_failures: AtomicU32,
+    errors: AtomicU32,
+    prompt_tokens: AtomicU32,
+    completion_tokens: AtomicU32,
     total: u32,
 }
 
@@ -84,9 +88,10 @@ fn save_summary(stats: &HashMap<String, CategoryStats>, path: &Path) -> Result<(
     let mut summary: HashMap<String, serde_json::Value> = HashMap::new();
     let mut total_corr = 0u32;
     let mut total_wrong = 0u32;
+    let mut total_errors = 0u32;
 
     for (category, s) in stats {
-        let total = s.correct + s.wrong;
+        let total = s.correct + s.wrong + s.errors;
         let acc = if total > 0 {
             s.correct as f64 / total as f64
         } else {
@@ -97,15 +102,17 @@ fn save_summary(stats: &HashMap<String, CategoryStats>, path: &Path) -> Result<(
             serde_json::json!({
                 "corr": s.correct,
                 "wrong": s.wrong,
+                "errors": s.errors,
                 "extraction_failures": s.extraction_failures,
                 "acc": acc,
             }),
         );
         total_corr += s.correct;
         total_wrong += s.wrong;
+        total_errors += s.errors;
     }
 
-    let total = total_corr + total_wrong;
+    let total = total_corr + total_wrong + total_errors;
     let acc = if total > 0 {
         total_corr as f64 / total as f64
     } else {
@@ -116,6 +123,7 @@ fn save_summary(stats: &HashMap<String, CategoryStats>, path: &Path) -> Result<(
         serde_json::json!({
             "corr": total_corr,
             "wrong": total_wrong,
+            "errors": total_errors,
             "acc": acc,
         }),
     );
@@ -130,20 +138,47 @@ fn print_status(category: &str, counters: &ProgressCounters, start: Instant) {
     let correct = counters.correct.load(Ordering::Relaxed);
     let wrong = counters.wrong.load(Ordering::Relaxed);
     let failures = counters.extraction_failures.load(Ordering::Relaxed);
-    let answered = correct + wrong;
-    let acc = if answered > 0 {
-        correct as f64 / answered as f64 * 100.0
+    let errors = counters.errors.load(Ordering::Relaxed);
+    let prompt_tokens = counters.prompt_tokens.load(Ordering::Relaxed);
+    let completion_tokens = counters.completion_tokens.load(Ordering::Relaxed);
+    let total = correct + wrong + errors;
+    let acc = if total > 0 {
+        correct as f64 / total as f64 * 100.0
     } else {
         0.0
     };
-    let elapsed = start.elapsed().as_secs();
+    let elapsed_secs = start.elapsed().as_secs_f64();
+    let elapsed = elapsed_secs as u64;
+
     let mut msg = format!(
         "  {}: {}/{} completed, {}/{} correct ({:.2}%)",
-        category, completed, counters.total, correct, answered, acc
+        category, completed, counters.total, correct, total, acc
     );
     if failures > 0 {
         msg.push_str(&format!(", {} failed extractions", failures));
     }
+    if errors > 0 {
+        msg.push_str(&format!(", {} errors", errors));
+    }
+
+    // Token throughput
+    if elapsed_secs > 0.0 && completion_tokens > 0 {
+        let prompt_tps = prompt_tokens as f64 / elapsed_secs;
+        let completion_tps = completion_tokens as f64 / elapsed_secs;
+        msg.push_str(&format!(
+            ", {:.0} prompt tk/s, {:.0} completion tk/s",
+            prompt_tps, completion_tps
+        ));
+    }
+
+    // ETA
+    if completed > 0 && completed < counters.total {
+        let remaining = counters.total - completed;
+        let secs_per_item = elapsed_secs / completed as f64;
+        let eta_secs = (remaining as f64 * secs_per_item) as u64;
+        msg.push_str(&format!(", ETA {}m{}s", eta_secs / 60, eta_secs % 60));
+    }
+
     msg.push_str(&format!(", {}m{}s elapsed", elapsed / 60, elapsed % 60));
     eprintln!("{}", msg);
 }
@@ -261,6 +296,9 @@ pub async fn run_evaluation(
             correct: AtomicU32::new(cat_stats.correct),
             wrong: AtomicU32::new(cat_stats.wrong),
             extraction_failures: AtomicU32::new(cat_stats.extraction_failures),
+            errors: AtomicU32::new(cat_stats.errors),
+            prompt_tokens: AtomicU32::new(0),
+            completion_tokens: AtomicU32::new(0),
             total: total as u32,
         });
 
@@ -330,7 +368,28 @@ pub async fn run_evaluation(
                 let response = match client.chat_completion(request).await {
                     Ok(resp) => resp,
                     Err(e) => {
-                        eprintln!("Error for question {}: {}", question.question_id, e);
+                        let error_kind = match e.downcast_ref::<ClientError>() {
+                            Some(ClientError::Connection(_)) => "connection",
+                            Some(ClientError::Timeout(_)) => "timeout",
+                            Some(ClientError::Http4xx { status, .. }) => {
+                                // Leak a short label; there are only a few distinct status codes
+                                Box::leak(format!("http {status}").into_boxed_str())
+                            }
+                            Some(ClientError::Http5xx { status, .. }) => {
+                                Box::leak(format!("http {status}").into_boxed_str())
+                            }
+                            Some(ClientError::Parse(_)) => "parse",
+                            Some(ClientError::Other(_)) | None => "unknown",
+                        };
+                        eprintln!(
+                            "Error for question {} ({}): {}",
+                            question.question_id, error_kind, e
+                        );
+                        {
+                            let mut s = stats.lock().await;
+                            s.errors += 1;
+                        }
+                        counters.errors.fetch_add(1, Ordering::Relaxed);
                         counters.completed.fetch_add(1, Ordering::Relaxed);
                         return;
                     }
@@ -342,6 +401,12 @@ pub async fn run_evaluation(
                     ts.prompt_tokens.push(response.usage.prompt_tokens);
                     ts.completion_tokens.push(response.usage.completion_tokens);
                 }
+                counters
+                    .prompt_tokens
+                    .fetch_add(response.usage.prompt_tokens, Ordering::Relaxed);
+                counters
+                    .completion_tokens
+                    .fetch_add(response.usage.completion_tokens, Ordering::Relaxed);
 
                 let response_text = response
                     .choices
