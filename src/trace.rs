@@ -24,9 +24,12 @@
 //!   is used instead.
 //! - Across turns, 59% of calls after an idle gap of 300 s or more report
 //!   `cached == 0`, against 10% after shorter gaps. After shorter gaps the
-//!   median of `cached / min(previous prompt, prompt)` is 0.977. A call with
-//!   `cached == 0` after a gap of at least [`ConvertOptions::cache_ttl_ms`]
-//!   gets an estimated `reuse`.
+//!   median of `cached / min(previous prompt, prompt)` is 0.977. After a gap
+//!   of 300 s or more, 41% of calls report a nonzero `cached` whose median
+//!   ratio is 0.34 across turns and 0.38 within a turn. A call after a gap of
+//!   at least [`ConvertOptions::cache_ttl_ms`] whose `cached` is below the
+//!   estimate from [`ConvertOptions::evicted_reuse_ratio`] gets the estimate
+//!   as its `reuse`.
 
 use anyhow::{Context, Result, bail};
 use chrono::{DateTime, Utc};
@@ -61,6 +64,9 @@ pub struct TraceCall {
     /// of turn-opening calls are "user".
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub initiator: Option<String>,
+    /// The source's anonymized model label, omitted when absent.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model: Option<String>,
     /// Time from the end of the previous kept call to the start of this one.
     /// It is 0 for the first call and when the two overlap. It includes the
     /// duration of any dropped call between them (see
@@ -76,8 +82,9 @@ pub struct TraceCall {
     /// previous prompt plus the response it actually received. 0 for the
     /// first call; a prefix shared across sessions shows only in `cached`.
     pub reuse: u64,
-    /// `reuse` was estimated because the source reported no cache hit after
-    /// an idle gap of at least [`ConvertOptions::cache_ttl_ms`].
+    /// `reuse` was estimated because, after an idle gap of at least
+    /// [`ConvertOptions::cache_ttl_ms`], the source's `cached` was below the
+    /// estimate.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub reuse_inferred: bool,
     /// The source's `duration_ms`, rounded to milliseconds.
@@ -91,8 +98,9 @@ pub struct ConvertOptions {
     pub models: Vec<String>,
     /// Drop sessions with any call whose prompt + completion exceeds this.
     pub max_context: Option<u64>,
-    /// A zero cache hit after an idle gap at least this long is treated as
-    /// eviction, and `reuse` is estimated with `evicted_reuse_ratio`.
+    /// After an idle gap at least this long, a `cached` below the estimate
+    /// from `evicted_reuse_ratio` is treated as eviction and the estimate is
+    /// used as `reuse`.
     pub cache_ttl_ms: u64,
     /// Fraction of `min(previous prompt, prompt)` used as the estimated
     /// reuse. The default, 0.98, is the median of
@@ -165,7 +173,6 @@ impl ConvertStats {
 #[derive(Debug, Deserialize)]
 struct RawSession {
     session_id: String,
-    #[serde(default)]
     turns: Vec<RawTurn>,
 }
 
@@ -258,9 +265,9 @@ fn derive_calls(
             Some(prev) => {
                 let gap_ms = ((c.start_us - prev.end_us()).max(0) as f64 / 1000.0).round() as u64;
                 let bound = (prev.prompt + prev.completion).min(c.prompt);
-                if c.cached == 0 && gap_ms >= opts.cache_ttl_ms {
-                    let base = prev.prompt.min(c.prompt);
-                    let est = (base as f64 * opts.evicted_reuse_ratio).round() as u64;
+                let base = prev.prompt.min(c.prompt);
+                let est = (base as f64 * opts.evicted_reuse_ratio).round() as u64;
+                if gap_ms >= opts.cache_ttl_ms && c.cached < est {
                     (gap_ms, est.min(bound), true)
                 } else {
                     if c.cached > bound {
@@ -274,6 +281,7 @@ fn derive_calls(
         out.push(TraceCall {
             turn: c.turn,
             initiator: c.initiator.clone(),
+            model: c.model.clone(),
             gap_ms,
             prompt: c.prompt,
             completion: c.completion,
@@ -413,10 +421,13 @@ fn read_shards(paths: &[PathBuf], mut send: impl FnMut(Shard) -> Result<()>) -> 
     Ok(())
 }
 
+/// Converts every record in `shard`, appending kept sessions to `out` and
+/// `(session_id, shard name)` for every record read to `seen`.
 fn convert_shard(
     shard: &Shard,
     opts: &ConvertOptions,
     out: &mut Vec<TraceSession>,
+    seen: &mut Vec<(String, String)>,
     stats: &mut ConvertStats,
 ) -> Result<()> {
     let reader: Box<dyn BufRead> = if shard.gzipped {
@@ -431,6 +442,7 @@ fn convert_shard(
         }
         let raw: RawSession = serde_json::from_str(&line)
             .with_context(|| format!("{}: line {}", shard.name, n + 1))?;
+        seen.push((raw.session_id.clone(), shard.name.clone()));
         if let Some(s) = convert_session(raw, opts, stats) {
             out.push(s);
         }
@@ -454,17 +466,18 @@ pub fn convert(
         let workers: Vec<_> = (0..threads)
             .map(|_| {
                 let rx = Arc::clone(&rx);
-                s.spawn(move || -> Result<(Vec<TraceSession>, ConvertStats)> {
+                s.spawn(move || -> Result<_> {
                     let mut out = Vec::new();
+                    let mut seen = Vec::new();
                     let mut stats = ConvertStats::default();
                     loop {
                         let shard = match rx.lock().unwrap().recv() {
                             Ok(shard) => shard,
                             Err(_) => break,
                         };
-                        convert_shard(&shard, opts, &mut out, &mut stats)?;
+                        convert_shard(&shard, opts, &mut out, &mut seen, &mut stats)?;
                     }
-                    Ok((out, stats))
+                    Ok((out, seen, stats))
                 })
             })
             .collect();
@@ -481,13 +494,28 @@ pub fn convert(
         drop(tx);
 
         let mut sessions = Vec::new();
+        let mut seen = Vec::new();
         let mut stats = ConvertStats::default();
         for w in workers {
-            let (out, st) = w.join().expect("convert worker panicked")?;
+            let (out, sn, st) = w.join().expect("convert worker panicked")?;
             sessions.extend(out);
+            seen.extend(sn);
             stats.add(&st);
         }
         read?;
+
+        // A repeated id means an input was given twice (for example a
+        // tarball and its extracted directory) or a session is split across
+        // shards; either would replay it twice.
+        seen.sort_unstable();
+        if let Some(w) = seen.windows(2).find(|w| w[0].0 == w[1].0) {
+            bail!(
+                "session_id {} appears in both {} and {}",
+                w[0].0,
+                w[0].1,
+                w[1].1
+            );
+        }
         Ok((sessions, stats))
     })?;
 
@@ -630,6 +658,28 @@ mod tests {
     }
 
     #[test]
+    fn partial_hit_after_ttl_below_estimate_is_inferred() {
+        // 0.98 * 5000 = 4900; the reported 1700 is treated as eviction.
+        let calls = [call(0, 1000, 5000, 0), call(400_000, 1000, 6000, 1700)];
+        let mut stats = ConvertStats::default();
+        let out = derive_calls(&calls, &ConvertOptions::default(), &mut stats);
+        assert_eq!(out[1].reuse, 4900);
+        assert!(out[1].reuse_inferred);
+
+        // A hit at or above the estimate is used as reported.
+        let calls = [call(0, 1000, 5000, 0), call(400_000, 1000, 6000, 5050)];
+        let out = derive_calls(&calls, &ConvertOptions::default(), &mut stats);
+        assert_eq!(out[1].reuse, 5050);
+        assert!(!out[1].reuse_inferred);
+
+        // The same partial hit inside the TTL is used as reported.
+        let calls = [call(0, 1000, 5000, 0), call(2000, 1000, 6000, 1700)];
+        let out = derive_calls(&calls, &ConvertOptions::default(), &mut stats);
+        assert_eq!(out[1].reuse, 1700);
+        assert!(!out[1].reuse_inferred);
+    }
+
+    #[test]
     fn overlapping_calls_get_zero_gap() {
         let calls = [call(0, 3000, 5000, 0), call(2000, 1000, 6000, 4000)];
         let mut stats = ConvertStats::default();
@@ -746,34 +796,41 @@ mod tests {
     #[test]
     fn convert_reads_shards_and_tarballs() {
         let dir = tempfile::tempdir().unwrap();
-        let line = FIXTURE.replace('\n', "");
-        let mut gz = Vec::new();
-        {
+        // Each file gets one session at the fixture's time and one with its
+        // first turn moved an hour later, under ids distinct across files.
+        let gz = |ids: [&str; 2]| {
+            let line = FIXTURE.replace('\n', "");
+            let mut gz = Vec::new();
             let mut e = flate2::write::GzEncoder::new(&mut gz, flate2::Compression::fast());
-            writeln!(e, "{line}").unwrap();
-            // Second session: the first turn moved one hour later.
+            writeln!(e, "{}", line.replace("439cf5fc", ids[0])).unwrap();
             writeln!(
                 e,
                 "{}",
-                line.replace("439cf5fc", "00000000")
+                line.replace("439cf5fc", ids[1])
                     .replace("2026-06-03T06:", "2026-06-03T07:")
             )
             .unwrap();
-        }
-        let shard = dir.path().join("shard-0000.jsonl.gz");
-        std::fs::write(&shard, &gz).unwrap();
+            e.finish().unwrap();
+            gz
+        };
+        std::fs::write(
+            dir.path().join("shard-0000.jsonl.gz"),
+            gz(["439cf5fc", "00000000"]),
+        )
+        .unwrap();
 
         let tarball = dir.path().join("day.tar.gz");
         {
+            let inner = gz(["11111111", "22222222"]);
             let f = File::create(&tarball).unwrap();
             let mut b = tar::Builder::new(flate2::write::GzEncoder::new(
                 f,
                 flate2::Compression::fast(),
             ));
             let mut h = tar::Header::new_gnu();
-            h.set_size(gz.len() as u64);
+            h.set_size(inner.len() as u64);
             h.set_cksum();
-            b.append_data(&mut h, "date=2026-06-03/shard-0001.jsonl.gz", &gz[..])
+            b.append_data(&mut h, "date=2026-06-03/shard-0001.jsonl.gz", &inner[..])
                 .unwrap();
             b.into_inner().unwrap().finish().unwrap();
         }
@@ -781,10 +838,20 @@ mod tests {
         let (sessions, stats) =
             convert(&[dir.path().to_path_buf()], &ConvertOptions::default(), 2).unwrap();
         assert_eq!(stats.sessions_read, 4);
-        assert_eq!(sessions.len(), 4);
-        let starts: Vec<u64> = sessions.iter().map(|s| s.start_ms).collect();
-        assert_eq!(starts, vec![0, 0, 3_600_000, 3_600_000]);
-        assert!(sessions[2].session_id.starts_with("00000000"));
+        let order: Vec<(u64, &str)> = sessions
+            .iter()
+            .map(|s| (s.start_ms, &s.session_id[..8]))
+            .collect();
+        assert_eq!(
+            order,
+            vec![
+                (0, "11111111"),
+                (0, "439cf5fc"),
+                (3_600_000, "00000000"),
+                (3_600_000, "22222222"),
+            ]
+        );
+        assert_eq!(sessions[0].calls[0].model.as_deref(), Some("Model E"));
 
         let out = dir.path().join("trace.jsonl");
         write_trace(&sessions, Some(&out)).unwrap();
@@ -805,7 +872,7 @@ mod tests {
         for i in 1..=6 {
             std::fs::write(
                 dir.path().join(format!("a{i}.jsonl")),
-                "{\"session_id\":\"x\",\"turns\":[]}\n",
+                format!("{{\"session_id\":\"x{i}\",\"turns\":[]}}\n"),
             )
             .unwrap();
         }
@@ -818,6 +885,35 @@ mod tests {
             rx.recv_timeout(std::time::Duration::from_secs(10)),
             Ok(true),
             "convert hung or succeeded"
+        );
+    }
+
+    #[test]
+    fn repeated_session_id_names_both_inputs() {
+        let dir = tempfile::tempdir().unwrap();
+        let line = format!("{}\n", FIXTURE.replace('\n', ""));
+        std::fs::write(dir.path().join("a.jsonl"), &line).unwrap();
+        std::fs::write(dir.path().join("b.jsonl"), &line).unwrap();
+        let err = convert(&[dir.path().to_path_buf()], &ConvertOptions::default(), 2).unwrap_err();
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("439cf5fc") && msg.contains("a.jsonl") && msg.contains("b.jsonl"),
+            "{msg}"
+        );
+    }
+
+    #[test]
+    fn own_output_is_rejected_as_input() {
+        let dir = tempfile::tempdir().unwrap();
+        let src = dir.path().join("src.jsonl");
+        std::fs::write(&src, format!("{}\n", FIXTURE.replace('\n', ""))).unwrap();
+        let (sessions, _) = convert(&[src], &ConvertOptions::default(), 1).unwrap();
+        let out = dir.path().join("trace.jsonl");
+        write_trace(&sessions, Some(&out)).unwrap();
+        let err = convert(&[out], &ConvertOptions::default(), 1).unwrap_err();
+        assert!(
+            format!("{err:#}").contains("missing field `turns`"),
+            "{err:#}"
         );
     }
 

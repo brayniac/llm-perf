@@ -114,8 +114,9 @@ pub enum Command {
         /// Drop sessions with any call whose prompt + completion tokens exceed this
         #[arg(long)]
         max_context: Option<u64>,
-        /// Idle gap in seconds at or above which a call reporting zero cached
-        /// tokens gets an estimated reuse
+        /// Idle gap in seconds at or above which a call whose cached tokens
+        /// fall below the --evicted-reuse-ratio estimate gets the estimate as
+        /// its reuse
         #[arg(long, default_value_t = 300)]
         cache_ttl_secs: u64,
         /// Fraction of min(previous prompt, prompt) used as the estimated reuse
