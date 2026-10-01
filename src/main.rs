@@ -175,6 +175,8 @@ fn run_mmlu_pro_mode(cmd: &Command) -> Result<()> {
         subset,
         concurrent_requests,
         num_shots,
+        mode,
+        max_context_tokens,
         verbosity,
         log_prompt,
         ref comment,
@@ -209,6 +211,12 @@ fn run_mmlu_pro_mode(cmd: &Command) -> Result<()> {
     }
     if let Some(num_shots) = num_shots {
         config.inference.num_shots = num_shots;
+    }
+    if let Some(mode) = mode {
+        config.inference.mode = mode;
+    }
+    if let Some(max_context_tokens) = max_context_tokens {
+        config.inference.max_context_tokens = Some(max_context_tokens);
     }
     if let Some(verbosity) = verbosity {
         config.log.verbosity = verbosity;
@@ -252,8 +260,12 @@ fn run_mmlu_pro_mode(cmd: &Command) -> Result<()> {
         eprintln!("  URL: {}", config.endpoint.base_url);
         eprintln!("  Concurrent Requests: {}", config.load.concurrent_requests);
         eprintln!("  Subset: {}", config.load.subset);
+        eprintln!("  Mode: {}", config.inference.mode);
         eprintln!("  Shots: {}", config.inference.num_shots);
         eprintln!("  Max Tokens: {}", config.inference.max_tokens);
+        if let Some(ctx) = config.inference.max_context_tokens {
+            eprintln!("  Max Context Tokens: {}", ctx);
+        }
         eprintln!("  Temperature: {}", config.inference.temperature);
         eprintln!("  Presence Penalty: {}", config.inference.presence_penalty);
         eprintln!(

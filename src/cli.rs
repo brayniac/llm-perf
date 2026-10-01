@@ -1,6 +1,8 @@
 use clap::{Parser, Subcommand};
 use std::path::PathBuf;
 
+use crate::mmlu_pro::config::PromptMode;
+
 #[derive(Parser, Debug)]
 #[command(name = "llm-perf")]
 #[command(author, version, about = "Benchmark OpenAI-compatible LLM servers", long_about = None)]
@@ -62,6 +64,22 @@ pub enum Command {
         /// Number of few-shot examples, 0 for zero-shot (overrides config)
         #[arg(long)]
         num_shots: Option<usize>,
+        /// Prompt mode (overrides config inference.mode)
+        #[arg(long, value_enum)]
+        mode: Option<PromptMode>,
+        /// Context length available to one request, in tokens (overrides config
+        /// inference.max_context_tokens)
+        ///
+        /// For llama-server this is `default_generation_settings.n_ctx` from
+        /// `GET /props`. This can be less than `-c`. With `-np` greater than 1
+        /// and without `--kv-unified`, it is `-c` divided by `-np`, rounded up
+        /// to a multiple of 256. `--kv-unified-per-slot` and the model's
+        /// training context also cap it.
+        ///
+        /// Drops shots per question until the prompt plus max_tokens fits;
+        /// needs llama-server's /tokenize (and /apply-template in chat mode).
+        #[arg(long)]
+        max_context_tokens: Option<u32>,
         /// Verbosity level 0-2 (overrides config)
         #[arg(short, long)]
         verbosity: Option<u8>,
@@ -110,5 +128,57 @@ impl Cli {
         }
 
         Cli::parse()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn mmlu_mode(args: &[&str]) -> Result<Option<PromptMode>, clap::Error> {
+        let mut argv = vec!["llm-perf", "mmlu-pro", "config.toml"];
+        argv.extend_from_slice(args);
+        match Cli::try_parse_from(argv)?.command {
+            Command::MmluPro { mode, .. } => Ok(mode),
+            other => panic!("parsed as {other:?}"),
+        }
+    }
+
+    #[test]
+    fn mmlu_pro_mode_flag_is_optional() {
+        assert_eq!(mmlu_mode(&[]).unwrap(), None);
+    }
+
+    #[test]
+    fn mmlu_pro_mode_flag_parses_both_modes() {
+        assert_eq!(
+            mmlu_mode(&["--mode", "completion"]).unwrap(),
+            Some(PromptMode::Completion)
+        );
+        assert_eq!(
+            mmlu_mode(&["--mode", "chat"]).unwrap(),
+            Some(PromptMode::Chat)
+        );
+    }
+
+    #[test]
+    fn mmlu_pro_max_context_tokens_flag() {
+        let parse = |args: &[&str]| {
+            let mut argv = vec!["llm-perf", "mmlu-pro", "config.toml"];
+            argv.extend_from_slice(args);
+            match Cli::try_parse_from(argv).unwrap().command {
+                Command::MmluPro {
+                    max_context_tokens, ..
+                } => max_context_tokens,
+                other => panic!("parsed as {other:?}"),
+            }
+        };
+        assert_eq!(parse(&[]), None);
+        assert_eq!(parse(&["--max-context-tokens", "2048"]), Some(2048));
+    }
+
+    #[test]
+    fn mmlu_pro_mode_flag_rejects_unknown_values() {
+        assert!(mmlu_mode(&["--mode", "raw"]).is_err());
     }
 }

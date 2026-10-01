@@ -8,8 +8,27 @@ base_url = "http://localhost:8080/v1"
 timeout = 600
 
 [inference]
+# "chat": system prompt plus one user/assistant turn pair per shot, sent to
+#   /chat/completions. The server applies the model's chat template.
+# "completion": one plain-text prompt in the layout of TIGER-Lab's
+#   evaluate_from_local.py, sent to /completions. Use this for base models,
+#   which have no chat template. The header is system_prompt below.
+# Overridden by --mode.
+mode = "chat"
 # 5-shot Chain-of-Thought (uses validation split examples)
 num_shots = 5
+# Context length available to one request, in tokens. For llama-server this is
+# `default_generation_settings.n_ctx` from `GET /props`. This can be less than
+# `-c`. With `-np` greater than 1 and without `--kv-unified`, it is `-c`
+# divided by `-np`, rounded up to a multiple of 256. `--kv-unified-per-slot`
+# and the model's training context also cap it. When set, each question drops
+# shots (last
+# first) until prompt tokens + max_tokens fits, counting tokens exactly with
+# llama-server's POST /tokenize (and POST /apply-template in chat mode). A
+# question that does not fit at 0 shots is skipped and counted as wrong.
+# Unset: always use num_shots.
+# Overridden by --max-context-tokens.
+# max_context_tokens = 2048
 temperature = 0.0
 top_p = 1.0
 max_tokens = 4096
