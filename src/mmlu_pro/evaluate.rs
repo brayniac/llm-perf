@@ -369,48 +369,63 @@ async fn check_token_counting_available(
 /// mixed in one score.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 struct RunConfig {
+    model: String,
     mode: String,
     num_shots: usize,
     max_context_tokens: Option<u32>,
     max_tokens: u32,
+    temperature: f32,
+    top_p: f32,
+    frequency_penalty: f32,
+    presence_penalty: f32,
     system_prompt: String,
 }
 
 impl RunConfig {
-    fn from_config(config: &Config) -> Self {
+    fn from_config(config: &Config, model: &str) -> Self {
+        let inf = &config.inference;
         Self {
-            mode: config.inference.mode.as_str().to_string(),
-            num_shots: config.inference.num_shots,
-            max_context_tokens: config.inference.max_context_tokens,
-            max_tokens: config.inference.max_tokens,
-            system_prompt: config.inference.system_prompt.clone(),
+            model: model.to_string(),
+            mode: inf.mode.as_str().to_string(),
+            num_shots: inf.num_shots,
+            max_context_tokens: inf.max_context_tokens,
+            max_tokens: inf.max_tokens,
+            temperature: inf.temperature,
+            top_p: inf.top_p,
+            frequency_penalty: inf.frequency_penalty,
+            presence_penalty: inf.presence_penalty,
+            system_prompt: inf.system_prompt.clone(),
         }
     }
 
-    /// Names of the fields that differ between `self` (saved) and `current`.
+    /// Every field except `system_prompt`, as (name, displayed value).
+    fn displayed_fields(&self) -> Vec<(&'static str, String)> {
+        vec![
+            ("model", self.model.clone()),
+            ("mode", self.mode.clone()),
+            ("num_shots", self.num_shots.to_string()),
+            (
+                "max_context_tokens",
+                self.max_context_tokens
+                    .map_or_else(|| "unset".to_string(), |c| c.to_string()),
+            ),
+            ("max_tokens", self.max_tokens.to_string()),
+            ("temperature", self.temperature.to_string()),
+            ("top_p", self.top_p.to_string()),
+            ("frequency_penalty", self.frequency_penalty.to_string()),
+            ("presence_penalty", self.presence_penalty.to_string()),
+        ]
+    }
+
+    /// One line per field that differs between `self` (saved) and `current`.
     fn differing_fields(&self, current: &RunConfig) -> Vec<String> {
-        let mut out = Vec::new();
-        let mut cmp = |name: &str, saved: String, now: String| {
-            if saved != now {
-                out.push(format!("{name}: saved {saved}, now {now}"));
-            }
-        };
-        cmp("mode", self.mode.clone(), current.mode.clone());
-        cmp(
-            "num_shots",
-            self.num_shots.to_string(),
-            current.num_shots.to_string(),
-        );
-        cmp(
-            "max_context_tokens",
-            format!("{:?}", self.max_context_tokens),
-            format!("{:?}", current.max_context_tokens),
-        );
-        cmp(
-            "max_tokens",
-            self.max_tokens.to_string(),
-            current.max_tokens.to_string(),
-        );
+        let mut out: Vec<String> = self
+            .displayed_fields()
+            .into_iter()
+            .zip(current.displayed_fields())
+            .filter(|((_, saved), (_, now))| saved != now)
+            .map(|((name, saved), (_, now))| format!("{name}: saved {saved}, now {now}"))
+            .collect();
         if self.system_prompt != current.system_prompt {
             out.push("system_prompt: text differs".to_string());
         }
@@ -421,28 +436,16 @@ impl RunConfig {
 const RUN_CONFIG_FILE: &str = "run_config.json";
 
 /// Check `output_dir/run_config.json` against this run's settings, then write
-/// it. Refuses to resume into a directory written with different settings.
-/// Results without a `run_config.json` (written by an older llm-perf) cannot
-/// be checked; that is warned about and the run proceeds.
-fn check_and_write_run_config(config: &Config, output_dir: &Path) -> Result<()> {
+/// it.
+///
+/// - Saved results and a `run_config.json` that differs: refuse to resume.
+/// - Saved results and no `run_config.json` (written by an older llm-perf):
+///   they cannot be checked; warn and proceed.
+/// - No saved results: write this run's settings, replacing any
+///   `run_config.json` left by a run that failed before saving a result.
+fn check_and_write_run_config(config: &Config, model: &str, output_dir: &Path) -> Result<()> {
     let path = output_dir.join(RUN_CONFIG_FILE);
-    let current = RunConfig::from_config(config);
-    if path.exists() {
-        let saved: RunConfig = serde_json::from_str(&std::fs::read_to_string(&path)?)
-            .map_err(|e| anyhow::anyhow!("failed to parse {}: {e}", path.display()))?;
-        let diffs = saved.differing_fields(&current);
-        if !diffs.is_empty() {
-            anyhow::bail!(
-                "{} holds results from a run with different settings, and resuming \
-                 would mix them into one score:\n  {}\nUse a fresh output directory \
-                 (move or delete {}).",
-                output_dir.display(),
-                diffs.join("\n  "),
-                output_dir.display()
-            );
-        }
-        return Ok(());
-    }
+    let current = RunConfig::from_config(config, model);
     let has_results = std::fs::read_dir(output_dir)
         .map(|entries| {
             entries
@@ -450,6 +453,29 @@ fn check_and_write_run_config(config: &Config, output_dir: &Path) -> Result<()> 
                 .any(|e| e.file_name().to_string_lossy().ends_with("_result.json"))
         })
         .unwrap_or(false);
+    if has_results && path.exists() {
+        let saved: RunConfig =
+            serde_json::from_str(&std::fs::read_to_string(&path)?).map_err(|e| {
+                anyhow::anyhow!(
+                    "failed to parse {}: {e}. Use a fresh output directory (move or \
+                     delete {}).",
+                    path.display(),
+                    output_dir.display()
+                )
+            })?;
+        let diffs = saved.differing_fields(&current);
+        if !diffs.is_empty() {
+            anyhow::bail!(
+                "{} holds saved results from a run with different settings, and \
+                 resuming would mix them into one score:\n  {}\nUse a fresh output \
+                 directory (move or delete {}).",
+                output_dir.display(),
+                diffs.join("\n  "),
+                output_dir.display()
+            );
+        }
+        return Ok(());
+    }
     if has_results {
         eprintln!(
             "Warning: {} has results but no {RUN_CONFIG_FILE} (written by an older \
@@ -514,7 +540,7 @@ pub async fn run_evaluation(
         )
         .await?;
     }
-    check_and_write_run_config(config, output_dir)?;
+    check_and_write_run_config(config, model, output_dir)?;
 
     // The first skip of a run is always printed; later ones at verbosity >= 1.
     let skip_reported = Arc::new(std::sync::atomic::AtomicBool::new(false));
@@ -764,7 +790,7 @@ pub async fn run_evaluation(
                             }
                             Err(e) => {
                                 eprintln!(
-                                    "Error for question {} (tokenize): {}",
+                                    "Error for question {} (token count): {}",
                                     question.question_id, e
                                 );
                                 stats.lock().await.errors += 1;
@@ -1096,26 +1122,27 @@ mod tests {
 
     #[test]
     fn run_config_reports_each_differing_field() {
-        let saved = RunConfig {
-            mode: "chat".to_string(),
-            num_shots: 5,
-            max_context_tokens: None,
-            max_tokens: 4096,
-            system_prompt: "a".to_string(),
-        };
+        let toml = "[endpoint]\nbase_url = \"x\"\n[inference]\n[load]\n";
+        let config: Config = toml::from_str(toml).unwrap();
+        let saved = RunConfig::from_config(&config, "model-a");
         assert!(saved.differing_fields(&saved.clone()).is_empty());
-        let now = RunConfig {
-            mode: "completion".to_string(),
-            num_shots: 5,
-            max_context_tokens: Some(2048),
-            max_tokens: 4096,
-            system_prompt: "b".to_string(),
-        };
-        let diffs = saved.differing_fields(&now);
-        assert_eq!(diffs.len(), 3, "{diffs:?}");
-        assert!(diffs[0].starts_with("mode: saved chat, now completion"));
-        assert!(diffs[1].starts_with("max_context_tokens:"));
-        assert!(diffs[2].starts_with("system_prompt:"));
+
+        let mut changed = config.clone();
+        changed.inference.mode = PromptMode::Completion;
+        changed.inference.max_context_tokens = Some(2048);
+        changed.inference.temperature = 0.5;
+        changed.inference.system_prompt = "other".to_string();
+        let now = RunConfig::from_config(&changed, "model-b");
+        assert_eq!(
+            saved.differing_fields(&now),
+            vec![
+                "model: saved model-a, now model-b",
+                "mode: saved chat, now completion",
+                "max_context_tokens: saved unset, now 2048",
+                "temperature: saved 0, now 0.5",
+                "system_prompt: text differs",
+            ]
+        );
     }
 
     #[test]
@@ -1362,8 +1389,9 @@ mod tests {
 
         #[tokio::test(flavor = "multi_thread")]
         async fn chat_mode_counts_the_rendered_template() {
-            // /apply-template returns the contents joined, so the fake
-            // tokenizer sees one "Question:" per user turn, as in completion.
+            // `/apply-template` adds one 'Question:' block, standing in for
+            // template overhead, so the fit is k=1 here and k=2 without the
+            // template (1 + 400 * (k + 2) + 100 <= 1500).
             let mut server = Server::new_async().await;
             let dir = tempfile::tempdir().unwrap();
             let (test, _) = dataset();
@@ -1380,14 +1408,16 @@ mod tests {
                         .map(|m| m["content"].as_str().unwrap().to_string())
                         .collect::<Vec<_>>()
                         .join("\n");
-                    json!({ "prompt": joined }).to_string().into_bytes()
+                    json!({ "prompt": format!("Question: (template)\n{joined}") })
+                        .to_string()
+                        .into_bytes()
                 })
                 .expect_at_least(1)
                 .create_async()
                 .await;
             let mut chats = Vec::new();
             for q in &test[CATEGORY] {
-                let messages = build_messages(&header(), &shots(2), &q.question, &q.options);
+                let messages = build_messages(&header(), &shots(1), &q.question, &q.options);
                 chats.push(
                     server
                         .mock("POST", "/v1/chat/completions")
@@ -1408,7 +1438,7 @@ mod tests {
             for m in &chats {
                 m.assert_async().await;
             }
-            assert!(saved(dir.path()).iter().all(|r| r.shots_used == Some(2)));
+            assert!(saved(dir.path()).iter().all(|r| r.shots_used == Some(1)));
         }
 
         #[tokio::test(flavor = "multi_thread")]
@@ -1470,6 +1500,27 @@ mod tests {
             assert!(msg.contains("mode: saved completion, now chat"), "{msg}");
             assert!(msg.contains("fresh output directory"), "{msg}");
             chat.assert_async().await;
+        }
+
+        #[tokio::test(flavor = "multi_thread")]
+        async fn run_config_without_results_is_replaced() {
+            // A run that stopped before saving any result must not lock the
+            // directory to its settings.
+            let mut server = Server::new_async().await;
+            let dir = tempfile::tempdir().unwrap();
+            let chat = config(&server, "chat", None);
+            check_and_write_run_config(&chat, "m", dir.path()).unwrap();
+            let gen_calls = mock_any(&mut server, "/v1/completions", 2).await;
+
+            let completion = config(&server, "completion", None);
+            run(&completion, dir.path()).await.unwrap();
+
+            gen_calls.assert_async().await;
+            let saved: RunConfig = serde_json::from_str(
+                &std::fs::read_to_string(dir.path().join(RUN_CONFIG_FILE)).unwrap(),
+            )
+            .unwrap();
+            assert_eq!(saved, RunConfig::from_config(&completion, "m"));
         }
 
         #[tokio::test(flavor = "multi_thread")]

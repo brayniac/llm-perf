@@ -68,11 +68,15 @@ pub enum Command {
         #[arg(long, value_enum)]
         mode: Option<PromptMode>,
         /// Context length available to one request, in tokens (overrides config
-        /// inference.max_context_tokens). For llama-server this is
-        /// `default_generation_settings.n_ctx` from `GET /props`, which is less
-        /// than `-c` when `-np` is greater than 1. Drops shots per question
-        /// until the prompt plus max_tokens fits; needs llama-server's
-        /// /tokenize (and /apply-template in chat mode).
+        /// inference.max_context_tokens)
+        ///
+        /// For llama-server this is `default_generation_settings.n_ctx` from
+        /// `GET /props`. This can be less than `-c`: with `-np` greater than 1
+        /// and no `--kv-unified`, it is `-c` divided by `-np`, rounded up to a
+        /// multiple of 256, and `--kv-unified-per-slot` also caps it.
+        ///
+        /// Drops shots per question until the prompt plus max_tokens fits;
+        /// needs llama-server's /tokenize (and /apply-template in chat mode).
         #[arg(long)]
         max_context_tokens: Option<u32>,
         /// Verbosity level 0-2 (overrides config)

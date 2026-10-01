@@ -17,8 +17,8 @@
 //!   `val_df[:-1]`. Here the search stops at 0 shots and reports
 //!   [`ShotFit::TooLong`] if even that does not fit.
 //! - Upstream counts with the Hugging Face tokenizer in-process; here the
-//!   server under test does the counting, so a GGUF tokenizer that differs
-//!   from the Hugging Face one is what gets measured.
+//!   server under test does the counting, so the count uses the model's GGUF
+//!   tokenizer, which can differ from the Hugging Face one.
 
 use anyhow::Result;
 use std::future::Future;
