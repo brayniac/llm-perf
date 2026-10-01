@@ -17,6 +17,12 @@ timeout = 600
 mode = "chat"
 # 5-shot Chain-of-Thought (uses validation split examples)
 num_shots = 5
+# Server context window in tokens. When set, each question drops shots (last
+# first) until prompt tokens + max_tokens fits, counting tokens with the
+# server's POST /tokenize (llama-server). A question that does not fit at 0
+# shots is skipped and counted as wrong. Unset: always use num_shots.
+# Overridden by --max-context-tokens.
+# max_context_tokens = 2048
 temperature = 0.0
 top_p = 1.0
 max_tokens = 4096

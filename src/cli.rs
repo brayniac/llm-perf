@@ -69,6 +69,11 @@ pub enum Command {
         /// prompt to /completions, for base models without a chat template.
         #[arg(long, value_enum)]
         mode: Option<PromptMode>,
+        /// Server context window in tokens (overrides config
+        /// inference.max_context_tokens). Drops shots per question until the
+        /// prompt plus max_tokens fits; needs the server's /tokenize endpoint.
+        #[arg(long)]
+        max_context_tokens: Option<u32>,
         /// Verbosity level 0-2 (overrides config)
         #[arg(short, long)]
         verbosity: Option<u8>,
@@ -148,6 +153,22 @@ mod tests {
             mmlu_mode(&["--mode", "chat"]).unwrap(),
             Some(PromptMode::Chat)
         );
+    }
+
+    #[test]
+    fn mmlu_pro_max_context_tokens_flag() {
+        let parse = |args: &[&str]| {
+            let mut argv = vec!["llm-perf", "mmlu-pro", "config.toml"];
+            argv.extend_from_slice(args);
+            match Cli::try_parse_from(argv).unwrap().command {
+                Command::MmluPro {
+                    max_context_tokens, ..
+                } => max_context_tokens,
+                other => panic!("parsed as {other:?}"),
+            }
+        };
+        assert_eq!(parse(&[]), None);
+        assert_eq!(parse(&["--max-context-tokens", "2048"]), Some(2048));
     }
 
     #[test]

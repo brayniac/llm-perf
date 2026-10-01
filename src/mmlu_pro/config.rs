@@ -47,6 +47,12 @@ pub struct InferenceConfig {
     /// How the prompt is sent to the server. See [`PromptMode`].
     #[serde(default)]
     pub mode: PromptMode,
+    /// Context window of the server, in tokens. When set, each question's
+    /// prompt drops shots (last first) until `prompt_tokens + max_tokens` fits,
+    /// counting tokens with the server's `/tokenize` endpoint. A question that
+    /// does not fit at 0 shots is skipped. Unset: always use `num_shots`.
+    #[serde(default)]
+    pub max_context_tokens: Option<u32>,
 }
 
 /// How the few-shot prompt is sent to the server.
@@ -163,6 +169,16 @@ base_url = "http://localhost:8080/v1"
         let toml = MINIMAL.replace("[inference]", "[inference]\nmode = \"chat\"");
         let config: Config = toml::from_str(&toml).unwrap();
         assert_eq!(config.inference.mode, PromptMode::Chat);
+    }
+
+    #[test]
+    fn max_context_tokens_is_optional() {
+        let config: Config = toml::from_str(MINIMAL).unwrap();
+        assert_eq!(config.inference.max_context_tokens, None);
+
+        let toml = MINIMAL.replace("[inference]", "[inference]\nmax_context_tokens = 2048");
+        let config: Config = toml::from_str(&toml).unwrap();
+        assert_eq!(config.inference.max_context_tokens, Some(2048));
     }
 
     #[test]

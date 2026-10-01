@@ -1,6 +1,6 @@
 use anyhow::Result;
 use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::path::Path;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU32, Ordering};
@@ -14,6 +14,7 @@ use crate::client::{
 use super::config::{Config, PromptMode};
 use super::dataset::Question;
 use super::extract::extract_answer;
+use super::fit::{ShotFit, fit_shots};
 use super::prompt::{build_completion_prompt, build_messages};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -31,6 +32,14 @@ pub struct QuestionResult {
     /// role `"prompt"` holding the whole prompt string.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub prompt: Option<Vec<PromptMessage>>,
+    /// Number of few-shot examples in the prompt that was sent. `None` for a
+    /// skipped question and in result files written before this field existed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub shots_used: Option<usize>,
+    /// The prompt did not fit `max_context_tokens` even with 0 shots, so no
+    /// request was sent. Counted in the accuracy denominator.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub skipped: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -45,6 +54,37 @@ pub struct CategoryStats {
     pub wrong: u32,
     pub extraction_failures: u32,
     pub errors: u32,
+    /// Questions not sent because they did not fit `max_context_tokens`.
+    pub skipped: u32,
+    /// Number of answered questions at each shot count.
+    pub shots_used: BTreeMap<usize, u32>,
+}
+
+impl CategoryStats {
+    /// Accuracy denominator: every question attempted, including request
+    /// errors and questions skipped for length.
+    pub fn total(&self) -> u32 {
+        self.correct + self.wrong + self.errors + self.skipped
+    }
+
+    /// Count a saved result (used when resuming from a result file).
+    fn record_saved(&mut self, r: &QuestionResult) {
+        if r.skipped {
+            self.skipped += 1;
+            return;
+        }
+        match &r.pred {
+            Some(pred) if pred == &r.answer => self.correct += 1,
+            Some(_) => self.wrong += 1,
+            None => {
+                self.wrong += 1;
+                self.extraction_failures += 1;
+            }
+        }
+        if let Some(k) = r.shots_used {
+            *self.shots_used.entry(k).or_default() += 1;
+        }
+    }
 }
 
 #[derive(Debug, Clone, Default)]
@@ -65,6 +105,7 @@ struct ProgressCounters {
     wrong: AtomicU32,
     extraction_failures: AtomicU32,
     errors: AtomicU32,
+    skipped: AtomicU32,
     prompt_tokens: AtomicU32,
     completion_tokens: AtomicU32,
     total: u32,
@@ -104,9 +145,10 @@ fn save_summary(stats: &HashMap<String, CategoryStats>, path: &Path) -> Result<(
     let mut total_corr = 0u32;
     let mut total_wrong = 0u32;
     let mut total_errors = 0u32;
+    let mut total_skipped = 0u32;
 
     for (category, s) in stats {
-        let total = s.correct + s.wrong + s.errors;
+        let total = s.total();
         let acc = if total > 0 {
             s.correct as f64 / total as f64
         } else {
@@ -118,6 +160,7 @@ fn save_summary(stats: &HashMap<String, CategoryStats>, path: &Path) -> Result<(
                 "corr": s.correct,
                 "wrong": s.wrong,
                 "errors": s.errors,
+                "skipped": s.skipped,
                 "extraction_failures": s.extraction_failures,
                 "acc": acc,
             }),
@@ -125,9 +168,10 @@ fn save_summary(stats: &HashMap<String, CategoryStats>, path: &Path) -> Result<(
         total_corr += s.correct;
         total_wrong += s.wrong;
         total_errors += s.errors;
+        total_skipped += s.skipped;
     }
 
-    let total = total_corr + total_wrong + total_errors;
+    let total = total_corr + total_wrong + total_errors + total_skipped;
     let acc = if total > 0 {
         total_corr as f64 / total as f64
     } else {
@@ -139,6 +183,7 @@ fn save_summary(stats: &HashMap<String, CategoryStats>, path: &Path) -> Result<(
             "corr": total_corr,
             "wrong": total_wrong,
             "errors": total_errors,
+            "skipped": total_skipped,
             "acc": acc,
         }),
     );
@@ -167,9 +212,10 @@ fn print_status(
     let wrong = counters.wrong.load(Ordering::Relaxed);
     let failures = counters.extraction_failures.load(Ordering::Relaxed);
     let errors = counters.errors.load(Ordering::Relaxed);
+    let skipped = counters.skipped.load(Ordering::Relaxed);
     let prompt_tokens = overall.prompt_tokens.load(Ordering::Relaxed);
     let completion_tokens = overall.completion_tokens.load(Ordering::Relaxed);
-    let total = correct + wrong + errors;
+    let total = correct + wrong + errors + skipped;
     let acc = if total > 0 {
         correct as f64 / total as f64 * 100.0
     } else {
@@ -187,6 +233,9 @@ fn print_status(
     }
     if errors > 0 {
         msg.push_str(&format!(", {} errors", errors));
+    }
+    if skipped > 0 {
+        msg.push_str(&format!(", {} skipped (too long)", skipped));
     }
 
     // Token throughput (use overall elapsed for accurate rates)
@@ -211,6 +260,89 @@ fn print_status(
 
     msg.push_str(&format!(", {} elapsed", format_eta(elapsed)));
     eprintln!("{}", msg);
+}
+
+/// Append `result` to the category's result file and rewrite its summary.
+async fn persist(
+    results: &tokio::sync::Mutex<Vec<QuestionResult>>,
+    stats: &tokio::sync::Mutex<CategoryStats>,
+    result: QuestionResult,
+    category: &str,
+    result_path: &Path,
+    summary_path: &Path,
+) {
+    {
+        let mut res = results.lock().await;
+        res.push(result);
+
+        // Deduplicate by question_id
+        let mut seen = std::collections::HashSet::new();
+        res.retain(|r| seen.insert(r.question_id));
+
+        let _ = save_results(&res, result_path);
+    }
+    let s = stats.lock().await;
+    let mut summary_stats: HashMap<String, CategoryStats> = HashMap::new();
+    summary_stats.insert(category.to_string(), s.clone());
+    let _ = save_summary(&summary_stats, summary_path);
+}
+
+/// The text whose token count stands for the prompt's length when fitting
+/// shots into `max_context_tokens`.
+///
+/// Completion mode: the exact prompt. Chat mode: the message contents joined
+/// by blank lines. That omits the chat template's role markers and special
+/// tokens, so in chat mode the count is low by a few tokens per message.
+/// In both modes llama-server's `/tokenize` does not add BOS by default, so
+/// the count is also one token below what generation sees.
+fn prompt_text_for_counting(
+    mode: PromptMode,
+    system_prompt: &str,
+    shots: &[Question],
+    question: &Question,
+) -> String {
+    match mode {
+        PromptMode::Chat => {
+            build_messages(system_prompt, shots, &question.question, &question.options)
+                .into_iter()
+                .map(|m| m.content)
+                .collect::<Vec<_>>()
+                .join("\n\n")
+        }
+        PromptMode::Completion => {
+            build_completion_prompt(system_prompt, shots, &question.question, &question.options)
+        }
+    }
+}
+
+/// Fail early when `max_context_tokens` is set but cannot be applied: the
+/// generation budget alone fills the window, or the server has no usable
+/// `/tokenize` endpoint (it is a llama.cpp server extension).
+async fn check_tokenize_available(
+    client: &OpenAIClient,
+    max_context_tokens: u32,
+    max_tokens: u32,
+) -> Result<()> {
+    if max_tokens >= max_context_tokens {
+        anyhow::bail!(
+            "max_tokens ({max_tokens}) must be less than max_context_tokens \
+             ({max_context_tokens}); otherwise no prompt fits"
+        );
+    }
+    match client.tokenize("The answer is (A).").await {
+        Ok(n) if n > 0 => Ok(()),
+        Ok(_) => anyhow::bail!(
+            "max_context_tokens is set, but the server's /tokenize endpoint returned \
+             no tokens for a non-empty string. It needs llama-server's \
+             POST /tokenize ({{\"content\": ...}} -> {{\"tokens\": [...]}})."
+        ),
+        Err(e) => anyhow::bail!(
+            "max_context_tokens is set, which counts prompt tokens with the server's \
+             POST /tokenize endpoint (served by llama-server at the server root, not \
+             under /v1), but that request failed: {e}. Unset max_context_tokens for \
+             servers without /tokenize."
+        ),
+    }
 }
 
 /// Run evaluation across all specified categories.
@@ -255,6 +387,11 @@ pub async fn run_evaluation(
     };
 
     let system_prompt_template = &config.inference.system_prompt;
+    let max_context_tokens = config.inference.max_context_tokens;
+
+    if let Some(ctx) = max_context_tokens {
+        check_tokenize_available(&client, ctx, config.inference.max_tokens).await?;
+    }
 
     // Compute overall question count for ETA across all categories
     let overall_total: u32 = categories
@@ -270,6 +407,7 @@ pub async fn run_evaluation(
         wrong: AtomicU32::new(0),
         extraction_failures: AtomicU32::new(0),
         errors: AtomicU32::new(0),
+        skipped: AtomicU32::new(0),
         prompt_tokens: AtomicU32::new(0),
         completion_tokens: AtomicU32::new(0),
         total: overall_total,
@@ -308,14 +446,7 @@ pub async fn run_evaluation(
         // Count stats from existing results
         let mut cat_stats = CategoryStats::default();
         for r in &existing_results {
-            match &r.pred {
-                Some(pred) if pred == &r.answer => cat_stats.correct += 1,
-                Some(_) => cat_stats.wrong += 1,
-                None => {
-                    cat_stats.wrong += 1;
-                    cat_stats.extraction_failures += 1;
-                }
-            }
+            cat_stats.record_saved(r);
         }
 
         // Filter to only new questions
@@ -340,6 +471,9 @@ pub async fn run_evaluation(
         overall_counters
             .extraction_failures
             .fetch_add(cat_stats.extraction_failures, Ordering::Relaxed);
+        overall_counters
+            .skipped
+            .fetch_add(cat_stats.skipped, Ordering::Relaxed);
 
         if new_questions.is_empty() {
             eprintln!(
@@ -367,6 +501,7 @@ pub async fn run_evaluation(
             wrong: AtomicU32::new(cat_stats.wrong),
             extraction_failures: AtomicU32::new(cat_stats.extraction_failures),
             errors: AtomicU32::new(cat_stats.errors),
+            skipped: AtomicU32::new(cat_stats.skipped),
             prompt_tokens: AtomicU32::new(0),
             completion_tokens: AtomicU32::new(0),
             total: total as u32,
@@ -418,9 +553,83 @@ pub async fn run_evaluation(
             let model = model.to_string();
             let verbosity = config.log.verbosity;
             let mode = config.inference.mode;
+            let category = category.clone();
 
             let handle = tokio::spawn(async move {
                 let _permit = semaphore.acquire().await.unwrap();
+
+                // Choose how many shots to send. Without max_context_tokens this
+                // is always every available shot (num_shots, or fewer if the
+                // validation split has fewer for this category).
+                let shots = match max_context_tokens {
+                    None => cot_examples.len(),
+                    Some(ctx) => {
+                        let fit = fit_shots(cot_examples.len(), max_tokens, ctx, |k| {
+                            let text = prompt_text_for_counting(
+                                mode,
+                                &system_prompt,
+                                &cot_examples[..k],
+                                &question,
+                            );
+                            let client = Arc::clone(&client);
+                            async move { client.tokenize(&text).await }
+                        })
+                        .await;
+                        match fit {
+                            Ok(ShotFit::Fits { shots, .. }) => shots,
+                            Ok(ShotFit::TooLong { zero_shot_tokens }) => {
+                                if verbosity >= 1 {
+                                    eprintln!(
+                                        "Skipping question {}: {} prompt tokens at 0 shots + \
+                                         {} max_tokens exceeds max_context_tokens {}",
+                                        question.question_id, zero_shot_tokens, max_tokens, ctx
+                                    );
+                                }
+                                stats.lock().await.skipped += 1;
+                                counters.skipped.fetch_add(1, Ordering::Relaxed);
+                                overall_counters.skipped.fetch_add(1, Ordering::Relaxed);
+                                let result = QuestionResult {
+                                    question_id: question.question_id,
+                                    question: question.question.clone(),
+                                    category: question.category.clone(),
+                                    options: question.options.clone(),
+                                    answer: question.answer.clone(),
+                                    answer_index: question.answer_index,
+                                    response: String::new(),
+                                    pred: None,
+                                    prompt: None,
+                                    shots_used: None,
+                                    skipped: true,
+                                };
+                                persist(
+                                    &results,
+                                    &stats,
+                                    result,
+                                    &category,
+                                    &result_path,
+                                    &summary_path,
+                                )
+                                .await;
+                                counters.completed.fetch_add(1, Ordering::Relaxed);
+                                overall_counters.completed.fetch_add(1, Ordering::Relaxed);
+                                return;
+                            }
+                            Err(e) => {
+                                eprintln!(
+                                    "Error for question {} (tokenize): {}",
+                                    question.question_id, e
+                                );
+                                stats.lock().await.errors += 1;
+                                counters.errors.fetch_add(1, Ordering::Relaxed);
+                                counters.completed.fetch_add(1, Ordering::Relaxed);
+                                overall_counters.errors.fetch_add(1, Ordering::Relaxed);
+                                overall_counters.completed.fetch_add(1, Ordering::Relaxed);
+                                return;
+                            }
+                        }
+                    }
+                };
+                let cot_examples = &cot_examples[..shots];
 
                 let stop = Some(vec!["Question:".to_string()]);
 
@@ -431,7 +640,7 @@ pub async fn run_evaluation(
                     PromptMode::Chat => {
                         let messages = build_messages(
                             &system_prompt,
-                            &cot_examples,
+                            cot_examples,
                             &question.question,
                             &question.options,
                         );
@@ -471,7 +680,7 @@ pub async fn run_evaluation(
                     PromptMode::Completion => {
                         let prompt = build_completion_prompt(
                             &system_prompt,
-                            &cot_examples,
+                            cot_examples,
                             &question.question,
                             &question.options,
                         );
@@ -575,11 +784,14 @@ pub async fn run_evaluation(
                     response: response_text,
                     pred: pred_str.clone(),
                     prompt: prompt_log,
+                    shots_used: Some(shots),
+                    skipped: false,
                 };
 
                 // Update stats
                 {
                     let mut s = stats.lock().await;
+                    *s.shots_used.entry(shots).or_default() += 1;
                     match &pred_str {
                         Some(p) if p == &question.answer => {
                             s.correct += 1;
@@ -619,25 +831,15 @@ pub async fn run_evaluation(
                     }
                 }
 
-                // Save result
-                {
-                    let mut res = results.lock().await;
-                    res.push(result);
-
-                    // Deduplicate by question_id
-                    let mut seen = std::collections::HashSet::new();
-                    res.retain(|r| seen.insert(r.question_id));
-
-                    let _ = save_results(&res, &result_path);
-                }
-
-                // Save summary
-                {
-                    let s = stats.lock().await;
-                    let mut summary_stats: HashMap<String, CategoryStats> = HashMap::new();
-                    summary_stats.insert(question.category.clone(), s.clone());
-                    let _ = save_summary(&summary_stats, &summary_path);
-                }
+                persist(
+                    &results,
+                    &stats,
+                    result,
+                    &category,
+                    &result_path,
+                    &summary_path,
+                )
+                .await;
 
                 counters.completed.fetch_add(1, Ordering::Relaxed);
                 overall_counters.completed.fetch_add(1, Ordering::Relaxed);
@@ -710,7 +912,62 @@ mod tests {
             response: "the answer is (A)".to_string(),
             pred: Some("A".to_string()),
             prompt: None,
+            shots_used: Some(5),
+            skipped: false,
         }
+    }
+
+    #[test]
+    fn resume_counts_skipped_and_shots_used() {
+        let mut stats = CategoryStats::default();
+        let mut wrong = sample_result(2);
+        wrong.pred = Some("B".to_string());
+        wrong.shots_used = Some(3);
+        let mut skipped = sample_result(3);
+        skipped.pred = None;
+        skipped.shots_used = None;
+        skipped.skipped = true;
+        let mut legacy = sample_result(4);
+        legacy.shots_used = None;
+
+        for r in [sample_result(1), wrong, skipped, legacy] {
+            stats.record_saved(&r);
+        }
+        assert_eq!(stats.correct, 2);
+        assert_eq!(stats.wrong, 1);
+        assert_eq!(stats.skipped, 1);
+        assert_eq!(stats.extraction_failures, 0);
+        assert_eq!(stats.total(), 4);
+        assert_eq!(stats.shots_used, BTreeMap::from([(3, 1), (5, 1)]));
+    }
+
+    #[test]
+    fn result_without_new_fields_still_loads() {
+        let json = r#"[{"question_id": 1, "question": "q", "category": "c",
+            "options": ["a"], "answer": "A", "answer_index": 0,
+            "response": "the answer is (A)", "pred": "A"}]"#;
+        let r: Vec<QuestionResult> = serde_json::from_str(json).unwrap();
+        assert_eq!(r[0].shots_used, None);
+        assert!(!r[0].skipped);
+    }
+
+    #[test]
+    fn completion_counting_text_is_the_exact_prompt() {
+        let q = Question {
+            question_id: 1,
+            question: "Q?".to_string(),
+            options: vec!["a".to_string()],
+            answer: "A".to_string(),
+            answer_index: 0,
+            cot_content: String::new(),
+            category: "math".to_string(),
+        };
+        assert_eq!(
+            prompt_text_for_counting(PromptMode::Completion, "H", &[], &q),
+            build_completion_prompt("H", &[], "Q?", &q.options)
+        );
+        let chat = prompt_text_for_counting(PromptMode::Chat, "H", &[], &q);
+        assert!(chat.starts_with("H\n\nQuestion: Q?"));
     }
 
     #[test]

@@ -336,6 +336,8 @@ This is a separate binary for measuring model quality (accuracy) rather than per
 
 By default the few-shot prompt is sent as chat turns to `/chat/completions`. For base models without a chat template, set `[inference] mode = "completion"` (or pass `--mode completion`) to send a single plain-text prompt to `/completions` in the layout of TIGER-Lab's `evaluate_from_local.py`, which is the layout used for published base-model MMLU-Pro scores.
 
+For models with a short context window, set `[inference] max_context_tokens` (or `--max-context-tokens`). Each question then drops few-shot examples, last first, until the prompt plus `max_tokens` fits, as TIGER-Lab's script does. Prompt tokens are counted with the server's `POST /tokenize` endpoint (llama-server). Questions that do not fit even at 0 shots are not sent; they are reported as skipped and counted as wrong. The reports record how many questions ran at each shot count.
+
 ## Development
 
 ### Building and Testing
