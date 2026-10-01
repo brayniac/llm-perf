@@ -4,32 +4,33 @@
 //! Azure/AzurePublicDataset (`GitHubCopilotCodingAgentDataset2026.md`): one
 //! JSON object per session, gzipped JSONL shards, optionally bundled in a
 //! per-day `.tar.gz`. It carries token counts, cache hits and timings but no
-//! text, so the output describes the shape of each request and how much of
-//! the previous request's prompt it reuses; a replayer supplies filler text.
+//! text, so the output describes the shape of each request and how many
+//! leading tokens of each prompt repeat the previous call's prompt and
+//! completion; a replayer supplies filler text.
 //!
 //! Facts about the source that the conversion depends on, measured on the
 //! 2026-06-03 partition:
 //!
-//! - An LLM call's `timestamp` is when the call finished. Start is
+//! - An LLM call's `timestamp` is when the call finished; start is
 //!   `timestamp - duration_ms`. Read as start times, 34% of consecutive calls
-//!   within a turn overlap; read as end times, 0.1% do.
-//! - In 99.9% of consecutive call pairs the next call starts after the
-//!   previous one ends, so a session's calls are treated as one sequence.
-//!   Overlapping pairs get `gap_ms` 0.
-//! - Timestamps have millisecond resolution, except that 25% of turn-opening
-//!   calls carry a whole-second timestamp. Their start and the adjacent
-//!   `gap_ms` values may be off by up to 1 s.
-//! - `message_metadata` segment lengths change on every call, including the
-//!   system prompt, so they cannot locate the shared prefix. `tokens.cached`
-//!   is used instead.
+//!   within a turn overlap. Read as end times, 222 of 1.71M consecutive kept
+//!   calls in a session overlap (0.01%), so a session's calls are treated as
+//!   one sequence and an overlapping pair gets `gap_ms` 0.
+//! - Timestamps have millisecond resolution, except that 25% of the first
+//!   source calls of a turn carry a whole-second timestamp. Their start and
+//!   the adjacent `gap_ms` values may be off by up to 1 s.
+//! - `message_metadata` segment lengths change between 99.4% of consecutive
+//!   calls, including the system prompt, so they cannot locate the shared
+//!   prefix. `tokens.cached` is used instead.
 //! - Across turns, 59% of calls after an idle gap of 300 s or more report
 //!   `cached == 0`, against 10% after shorter gaps. After shorter gaps the
 //!   median of `cached / min(previous prompt, prompt)` is 0.977. After a gap
-//!   of 300 s or more, 41% of calls report a nonzero `cached` whose median
-//!   ratio is 0.34 across turns and 0.38 within a turn. A call after a gap of
-//!   at least [`ConvertOptions::cache_ttl_ms`] whose `cached` is below the
-//!   estimate from [`ConvertOptions::evicted_reuse_ratio`] gets the estimate
-//!   as its `reuse`.
+//!   of 300 s or more, 41% of calls across turns and 43% within a turn report
+//!   a nonzero `cached`, with median ratios 0.34 and 0.38.
+//!
+//! A call after a gap of at least [`ConvertOptions::cache_ttl_ms`] whose
+//! `cached` is below the estimate from [`ConvertOptions::evicted_reuse_ratio`]
+//! gets the estimate as its `reuse`.
 
 use anyhow::{Context, Result, bail};
 use chrono::{DateTime, Utc};
@@ -60,8 +61,8 @@ pub struct TraceSession {
 pub struct TraceCall {
     /// Index of the user turn in the source record.
     pub turn: u32,
-    /// The source's `initiator_type`, omitted when empty. On 2026-06-03, 93%
-    /// of turn-opening calls are "user".
+    /// The source's `initiator_type`, omitted when absent or empty. In the
+    /// 2026-06-03 output, 95% of calls that open a turn are "user".
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub initiator: Option<String>,
     /// The source's anonymized model label, omitted when absent.
@@ -100,12 +101,11 @@ pub struct ConvertOptions {
     pub max_context: Option<u64>,
     /// After an idle gap at least this long, a `cached` below the estimate
     /// from `evicted_reuse_ratio` is treated as eviction and the estimate is
-    /// used as `reuse`.
+    /// used as `reuse`. 0 applies this to every call after the first.
     pub cache_ttl_ms: u64,
     /// Fraction of `min(previous prompt, prompt)` used as the estimated
-    /// reuse. The default, 0.98, is the median of
-    /// `cached / min(previous prompt, prompt)` across turns after idle gaps
-    /// under 300 s on the 2026-06-03 partition (0.977).
+    /// reuse; must be in [0, 1], and 0 disables the estimate. The default,
+    /// 0.98, rounds the 0.977 median in the module docs.
     pub evicted_reuse_ratio: f64,
     /// Keep only sessions whose first call starts at or after this time.
     pub from: Option<DateTime<Utc>>,
@@ -145,7 +145,8 @@ pub struct ConvertStats {
     pub calls_dropped_no_prompt: u64,
     pub calls_reuse_inferred: u64,
     /// Calls whose `cached` exceeded `min(previous prompt + previous
-    /// completion, prompt)` and was clamped to it.
+    /// completion, prompt)` and was clamped to it. Inferred calls are not
+    /// counted.
     pub calls_reuse_clamped: u64,
 }
 
@@ -167,8 +168,9 @@ impl ConvertStats {
 }
 
 // Source records. Only the fields the conversion reads are declared; serde
-// skips the rest (`message_metadata`, `tool_batches`, ids, and
-// `result`/`status_code`, which no filter uses).
+// skips the rest, including `date`, `message_metadata`, `tool_batches`,
+// `tokens.total`, `tokens.cached_pct`, ids, and `result`/`status_code`,
+// which no filter uses.
 
 #[derive(Debug, Deserialize)]
 struct RawSession {
@@ -264,7 +266,7 @@ fn derive_calls(
             None => (0, 0, false),
             Some(prev) => {
                 let gap_ms = ((c.start_us - prev.end_us()).max(0) as f64 / 1000.0).round() as u64;
-                let bound = (prev.prompt + prev.completion).min(c.prompt);
+                let bound = prev.prompt.saturating_add(prev.completion).min(c.prompt);
                 let base = prev.prompt.min(c.prompt);
                 let est = (base as f64 * opts.evicted_reuse_ratio).round() as u64;
                 if gap_ms >= opts.cache_ttl_ms && c.cached < est {
@@ -325,7 +327,9 @@ fn convert_session(
         return None;
     }
     if let Some(max) = opts.max_context
-        && calls.iter().any(|c| c.prompt + c.completion > max)
+        && calls
+            .iter()
+            .any(|c| c.prompt.saturating_add(c.completion) > max)
     {
         stats.sessions_dropped_context += 1;
         return None;
@@ -395,14 +399,21 @@ fn read_shards(paths: &[PathBuf], mut send: impl FnMut(Shard) -> Result<()>) -> 
         if is_tarball(p) {
             let f = File::open(p).with_context(|| format!("opening {}", p.display()))?;
             let mut ar = tar::Archive::new(GzDecoder::new(BufReader::new(f)));
-            for entry in ar.entries()? {
-                let mut entry = entry?;
-                let name = entry.path()?.to_string_lossy().into_owned();
+            let ctx = || format!("reading {}", p.display());
+            for entry in ar.entries().with_context(ctx)? {
+                let mut entry = entry.with_context(ctx)?;
+                let name = entry
+                    .path()
+                    .with_context(ctx)?
+                    .to_string_lossy()
+                    .into_owned();
                 if !is_shard_name(&name) {
                     continue;
                 }
                 let mut bytes = Vec::new();
-                entry.read_to_end(&mut bytes)?;
+                entry
+                    .read_to_end(&mut bytes)
+                    .with_context(|| format!("reading {}:{}", p.display(), name))?;
                 send(Shard {
                     gzipped: name.ends_with(".gz"),
                     name: format!("{}:{}", p.display(), name),
@@ -451,12 +462,20 @@ fn convert_shard(
 }
 
 /// Read every input, convert in parallel, and return the kept sessions
-/// sorted by start with `start_ms` filled in.
+/// sorted by start with `start_ms` filled in. Fails if a `session_id` appears
+/// in more than one record across the inputs, or if
+/// `opts.evicted_reuse_ratio` is outside [0, 1].
 pub fn convert(
     inputs: &[PathBuf],
     opts: &ConvertOptions,
     threads: usize,
 ) -> Result<(Vec<TraceSession>, ConvertStats)> {
+    if !(0.0..=1.0).contains(&opts.evicted_reuse_ratio) {
+        bail!(
+            "evicted_reuse_ratio must be in [0, 1], got {}",
+            opts.evicted_reuse_ratio
+        );
+    }
     let paths = expand_inputs(inputs)?;
     let threads = threads.max(1);
     let (tx, rx) = sync_channel::<Shard>(threads * 2);
@@ -497,18 +516,22 @@ pub fn convert(
         let mut seen = Vec::new();
         let mut stats = ConvertStats::default();
         for w in workers {
-            let (out, sn, st) = w.join().expect("convert worker panicked")?;
+            let (out, sn, st) = w
+                .join()
+                .map_err(|_| anyhow::anyhow!("convert worker panicked"))??;
             sessions.extend(out);
             seen.extend(sn);
             stats.add(&st);
         }
         read?;
 
-        // A repeated id means an input was given twice (for example a
-        // tarball and its extracted directory) or a session is split across
-        // shards; either would replay it twice.
+        // A repeated id means an input was given twice, for example a
+        // tarball and its extracted directory.
         seen.sort_unstable();
         if let Some(w) = seen.windows(2).find(|w| w[0].0 == w[1].0) {
+            if w[0].1 == w[1].1 {
+                bail!("session_id {} appears twice in {}", w[0].0, w[0].1);
+            }
             bail!(
                 "session_id {} appears in both {} and {}",
                 w[0].0,
@@ -627,8 +650,9 @@ mod tests {
         let mut stats = ConvertStats::default();
         let s = convert_session(fixture(), &ConvertOptions::default(), &mut stats).unwrap();
         let reuse: Vec<u64> = s.calls.iter().map(|c| c.reuse).collect();
-        // Call 4 opens turn 2 almost five hours later with cached = 0, so its
-        // reuse is 0.98 * min(20480, 39312) and marked inferred. Call 3
+        // Call 4 opens turn 2 almost five hours later with cached = 0, below
+        // the 0.98 estimate, so its reuse is 0.98 * min(20480, 39312) and
+        // marked inferred. Call 3
         // reports 18816 cached, more than call 2's 18324 + 120, and is clamped.
         assert_eq!(reuse, vec![0, 14779, 18444, 20070, 14209, 40744]);
         assert_eq!(stats.calls_reuse_clamped, 1);
@@ -667,9 +691,27 @@ mod tests {
         assert!(out[1].reuse_inferred);
 
         // A hit at or above the estimate is used as reported.
-        let calls = [call(0, 1000, 5000, 0), call(400_000, 1000, 6000, 5050)];
+        for cached in [4900, 5050] {
+            let calls = [call(0, 1000, 5000, 0), call(400_000, 1000, 6000, cached)];
+            let out = derive_calls(&calls, &ConvertOptions::default(), &mut stats);
+            assert_eq!(out[1].reuse, cached);
+            assert!(!out[1].reuse_inferred);
+        }
+
+        // The estimate uses the smaller prompt: 0.98 * min(8000, 5000).
+        let calls = [call(0, 1000, 8000, 0), call(400_000, 1000, 5000, 100)];
         let out = derive_calls(&calls, &ConvertOptions::default(), &mut stats);
-        assert_eq!(out[1].reuse, 5050);
+        assert_eq!(out[1].reuse, 4900);
+        assert!(out[1].reuse_inferred);
+
+        // A ratio of 0 disables the estimate.
+        let opts = ConvertOptions {
+            evicted_reuse_ratio: 0.0,
+            ..Default::default()
+        };
+        let calls = [call(0, 1000, 5000, 0), call(400_000, 1000, 6000, 0)];
+        let out = derive_calls(&calls, &opts, &mut stats);
+        assert_eq!(out[1].reuse, 0);
         assert!(!out[1].reuse_inferred);
 
         // The same partial hit inside the TTL is used as reported.
@@ -879,13 +921,16 @@ mod tests {
         let (tx, rx) = std::sync::mpsc::channel();
         let p = dir.path().to_path_buf();
         std::thread::spawn(move || {
-            let _ = tx.send(convert(&[p], &ConvertOptions::default(), 1).is_err());
+            let r = convert(&[p], &ConvertOptions::default(), 1);
+            let _ = tx.send(r.map(|_| ()).map_err(|e| format!("{e:#}")));
         });
-        assert_eq!(
-            rx.recv_timeout(std::time::Duration::from_secs(10)),
-            Ok(true),
-            "convert hung or succeeded"
-        );
+        let err = rx
+            .recv_timeout(std::time::Duration::from_secs(10))
+            .expect("convert hung")
+            .expect_err("convert succeeded");
+        // The worker's error is reported ahead of the reader's "all workers
+        // exited".
+        assert!(err.contains("a0.jsonl: line 1"), "{err}");
     }
 
     #[test]
@@ -899,6 +944,58 @@ mod tests {
         assert!(
             msg.contains("439cf5fc") && msg.contains("a.jsonl") && msg.contains("b.jsonl"),
             "{msg}"
+        );
+
+        // Records dropped by a filter still count.
+        let opts = ConvertOptions {
+            from: Some("2030-01-01T00:00:00Z".parse().unwrap()),
+            ..Default::default()
+        };
+        assert!(convert(&[dir.path().to_path_buf()], &opts, 2).is_err());
+
+        // The same file given twice.
+        let a = dir.path().join("a.jsonl");
+        let err = convert(&[a.clone(), a], &ConvertOptions::default(), 1).unwrap_err();
+        assert!(format!("{err:#}").contains("appears twice in"), "{err:#}");
+    }
+
+    #[test]
+    fn start_ms_is_rounded() {
+        // Two sessions whose first calls start 1.6 ms apart.
+        let dir = tempfile::tempdir().unwrap();
+        let line = FIXTURE.replace('\n', "");
+        let later = line
+            .replace("439cf5fc", "00000000")
+            .replace("06:23:30.000000000Z", "06:23:30.001600000Z");
+        std::fs::write(dir.path().join("a.jsonl"), format!("{line}\n{later}\n")).unwrap();
+        let (sessions, _) =
+            convert(&[dir.path().to_path_buf()], &ConvertOptions::default(), 1).unwrap();
+        assert_eq!(sessions[1].start_ms, 2);
+    }
+
+    #[test]
+    fn unrepresentable_start_is_counted() {
+        let mut raw: serde_json::Value = serde_json::from_str(FIXTURE).unwrap();
+        for c in raw["turns"][0]["llm_calls"].as_array_mut().unwrap() {
+            c["duration_ms"] = serde_json::json!(1e19);
+        }
+        let raw: RawSession = serde_json::from_value(raw).unwrap();
+        let mut stats = ConvertStats::default();
+        assert!(convert_session(raw, &ConvertOptions::default(), &mut stats).is_none());
+        assert_eq!(stats.sessions_dropped_bad_time, 1);
+        assert_eq!(stats.sessions_dropped_empty, 0);
+    }
+
+    #[test]
+    fn ratio_outside_unit_interval_is_rejected() {
+        let opts = ConvertOptions {
+            evicted_reuse_ratio: 1.5,
+            ..Default::default()
+        };
+        let err = convert(&[PathBuf::from("unused")], &opts, 1).unwrap_err();
+        assert!(
+            format!("{err:#}").contains("evicted_reuse_ratio"),
+            "{err:#}"
         );
     }
 

@@ -6,7 +6,7 @@ All notable changes to this project will be documented in this file.
 
 ### Features
 
-- `convert-trace` subcommand — converts the metadata-only coding-agent session dataset in Azure/AzurePublicDataset into a per-session JSONL replay trace: per-call prompt, completion and cached token counts, the prefix reused from the previous call, and the idle gap before each call. Reads the per-day `.tar.gz` directly; filters by model label, maximum context and session start window.
+- `convert-trace` subcommand — converts the metadata-only coding-agent session dataset in Azure/AzurePublicDataset into a per-session JSONL replay trace: per-call prompt, completion and cached token counts, the prefix reused from the previous call, and the idle gap before each call. Reads the per-day `.tar.gz` directly; filters by model label, maximum context and session start window. Estimates `reuse` after an idle gap when the reported cache hit is below the estimate (`--cache-ttl-secs`, `--evicted-reuse-ratio`), records each call's model label, and fails when a `session_id` appears twice across the inputs.
 
 ## [0.1.18] - 2026-09-10
 

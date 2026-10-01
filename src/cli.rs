@@ -116,10 +116,11 @@ pub enum Command {
         max_context: Option<u64>,
         /// Idle gap in seconds at or above which a call whose cached tokens
         /// fall below the --evicted-reuse-ratio estimate gets the estimate as
-        /// its reuse
+        /// its reuse. 0 applies this to every call after the first
         #[arg(long, default_value_t = 300)]
         cache_ttl_secs: u64,
-        /// Fraction of min(previous prompt, prompt) used as the estimated reuse
+        /// Fraction of min(previous prompt, prompt) used as the estimated
+        /// reuse. Must be in [0, 1]; 0 disables the estimate
         #[arg(long, default_value_t = 0.98)]
         evicted_reuse_ratio: f64,
         /// Keep only sessions starting at or after this RFC 3339 time
