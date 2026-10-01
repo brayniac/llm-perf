@@ -94,8 +94,7 @@ fn format_completion_question(question: &str, options: &[String]) -> String {
 /// Build the single plain-text prompt used in completion mode.
 ///
 /// This reproduces `generate_cot_prompt` / `format_cot_example` from
-/// TIGER-Lab's `evaluate_from_local.py`, which is the script used for
-/// published base-model MMLU-Pro numbers:
+/// TIGER-Lab's script for evaluating local models (`evaluate_from_local.py`):
 ///
 /// - `header` (the system prompt with `{subject}` already substituted),
 ///   followed by four newlines

@@ -405,7 +405,8 @@ fn generate_json_report(
     }
 }
 
-/// Number of answered questions at each shot count, summed over categories.
+/// Number of questions that received a response, by shot count, summed over
+/// categories.
 /// Skipped questions and request errors are not included.
 fn shots_distribution(stats: &HashMap<String, CategoryStats>) -> BTreeMap<usize, u32> {
     let mut dist = BTreeMap::new();

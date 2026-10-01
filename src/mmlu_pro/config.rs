@@ -47,10 +47,14 @@ pub struct InferenceConfig {
     /// How the prompt is sent to the server. See [`PromptMode`].
     #[serde(default)]
     pub mode: PromptMode,
-    /// Context window of the server, in tokens. When set, each question's
-    /// prompt drops shots (last first) until `prompt_tokens + max_tokens` fits,
-    /// counting tokens with the server's `/tokenize` endpoint. A question that
-    /// does not fit at 0 shots is skipped. Unset: always use `num_shots`.
+    /// Context length available to one request, in tokens. For llama-server
+    /// this is `default_generation_settings.n_ctx` from `GET /props`, which is
+    /// less than `-c` when `-np` is greater than 1.
+    ///
+    /// When set, each question's prompt drops shots (last first) until
+    /// `prompt_tokens + max_tokens` fits, counting tokens with llama-server's
+    /// `/tokenize` (and `/apply-template` in chat mode). A question that does
+    /// not fit at 0 shots is skipped. Unset: always use `num_shots`.
     #[serde(default)]
     pub max_context_tokens: Option<u32>,
 }

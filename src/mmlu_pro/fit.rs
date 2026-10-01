@@ -5,13 +5,20 @@
 //! drop one shot and rebuild. Shots are the first `k` validation examples for
 //! the category, so lowering `k` drops the last shot first.
 //!
-//! Two differences from upstream:
+//! The caller's token count is exact: it is llama-server's own tokenization of
+//! the prompt the generation request will carry, including BOS and, in chat
+//! mode, the rendered chat template. That is why a prompt that fills the
+//! window exactly (`<=`) is accepted.
+//!
+//! Differences from upstream:
 //! - Upstream keeps a prompt when `prompt_tokens < context - max_tokens`
-//!   (strict). Here it is kept when `prompt_tokens + max_tokens <= context`,
-//!   so a prompt that fills the window exactly is accepted.
+//!   (strict). Here it is kept when `prompt_tokens + max_tokens <= context`.
 //! - Upstream has no lower bound on `k`; once it reaches 0 the next step slices
 //!   `val_df[:-1]`. Here the search stops at 0 shots and reports
 //!   [`ShotFit::TooLong`] if even that does not fit.
+//! - Upstream counts with the Hugging Face tokenizer in-process; here the
+//!   server under test does the counting, so a GGUF tokenizer that differs
+//!   from the Hugging Face one is what gets measured.
 
 use anyhow::Result;
 use std::future::Future;

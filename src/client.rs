@@ -105,8 +105,7 @@ pub struct CompletionRequest {
     pub stream: Option<bool>,
 }
 
-/// Response body from `/completions`. Only the fields the callers read are
-/// declared; others are ignored.
+/// Response body from `/completions`. Fields not declared here are ignored.
 #[derive(Debug, Clone, Deserialize)]
 pub struct CompletionResponse {
     pub choices: Vec<CompletionChoice>,
@@ -120,6 +119,18 @@ pub struct CompletionChoice {
     pub text: String,
     #[serde(default)]
     pub finish_reason: Option<String>,
+}
+
+/// llama-server `POST /tokenize` response (without `with_pieces`).
+#[derive(Debug, Clone, Deserialize)]
+struct TokenizeResponse {
+    tokens: Vec<serde_json::Value>,
+}
+
+/// llama-server `POST /apply-template` response.
+#[derive(Debug, Clone, Deserialize)]
+struct ApplyTemplateResponse {
+    prompt: String,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -351,19 +362,64 @@ impl OpenAIClient {
         &self,
         request: ChatCompletionRequest,
     ) -> Result<ChatCompletionResponse> {
-        self.post_with_retry("chat/completions", &request).await
+        let url = format!("{}/chat/completions", self.base_url);
+        self.post_with_retry(&url, &request).await
     }
 
     /// Non-streaming request to the legacy `/completions` endpoint, which takes
     /// a raw prompt string and applies no chat template. Uses the same retry,
     /// timeout and error classification as [`Self::chat_completion`].
     pub async fn completion(&self, request: CompletionRequest) -> Result<CompletionResponse> {
-        self.post_with_retry("completions", &request).await
+        let url = format!("{}/completions", self.base_url);
+        self.post_with_retry(&url, &request).await
     }
 
-    /// POST `request` as JSON to `{base_url}/{path}` and decode the response,
-    /// retrying retriable errors with backoff.
-    async fn post_with_retry<Req, Resp>(&self, path: &str, request: &Req) -> Result<Resp>
+    /// The server root: `base_url` without a trailing `/v1`. llama-server serves
+    /// `/tokenize` and `/apply-template` here, not under `/v1`.
+    fn server_root(&self) -> &str {
+        let root = self.base_url.trim_end_matches('/');
+        root.strip_suffix("/v1").unwrap_or(root)
+    }
+
+    /// Number of tokens llama-server's generation endpoints would produce for
+    /// `text` as a prompt: `POST /tokenize` with `add_special: true` (so BOS is
+    /// counted when the model adds one) and `parse_special: true` (so special
+    /// tokens written in a rendered chat template count as single tokens).
+    /// This is the same tokenization `/completions` and `/chat/completions`
+    /// apply to their prompt. llama-server only; `Self::tokenize` is the looser
+    /// variant used for benchmark calibration.
+    pub async fn count_prompt_tokens(&self, text: &str) -> Result<usize> {
+        let url = format!("{}/tokenize", self.server_root());
+        let body = serde_json::json!({
+            "content": text,
+            "add_special": true,
+            "parse_special": true,
+        });
+        let resp: TokenizeResponse = self.post_with_retry(&url, &body).await?;
+        Ok(resp.tokens.len())
+    }
+
+    /// Render chat `messages` to the prompt string llama-server would generate
+    /// from, via `POST /apply-template`. That endpoint runs the same request
+    /// parsing as `/chat/completions`, so `chat_template_kwargs` must be the
+    /// value the generation request carries for the two prompts to match.
+    pub async fn apply_template(
+        &self,
+        messages: &[Message],
+        chat_template_kwargs: Option<&serde_json::Value>,
+    ) -> Result<String> {
+        let url = format!("{}/apply-template", self.server_root());
+        let mut body = serde_json::json!({ "messages": messages });
+        if let Some(kwargs) = chat_template_kwargs {
+            body["chat_template_kwargs"] = kwargs.clone();
+        }
+        let resp: ApplyTemplateResponse = self.post_with_retry(&url, &body).await?;
+        Ok(resp.prompt)
+    }
+
+    /// POST `request` as JSON to `url` and decode the response, retrying
+    /// retriable errors with backoff.
+    async fn post_with_retry<Req, Resp>(&self, url: &str, request: &Req) -> Result<Resp>
     where
         Req: Serialize,
         Resp: DeserializeOwned,
@@ -377,7 +433,7 @@ impl OpenAIClient {
         let deadline = Instant::now() + self.timeout.saturating_mul(self.max_retries + 1);
 
         loop {
-            match self.post_json(path, request).await {
+            match self.post_json(url, request).await {
                 Ok(resp) => {
                     if attempt > 0 {
                         log::debug!("Request succeeded after {} retries", attempt);
@@ -412,14 +468,12 @@ impl OpenAIClient {
     }
 
     /// Single non-streaming POST (without retry logic).
-    async fn post_json<Req, Resp>(&self, path: &str, request: &Req) -> Result<Resp>
+    async fn post_json<Req, Resp>(&self, url: &str, request: &Req) -> Result<Resp>
     where
         Req: Serialize,
         Resp: DeserializeOwned,
     {
-        let url = format!("{}/{}", self.base_url, path);
-
-        let mut req = self.client.post(&url).json(request);
+        let mut req = self.client.post(url).json(request);
 
         if let Some(api_key) = &self.api_key {
             req = req.header("Authorization", format!("Bearer {}", api_key));

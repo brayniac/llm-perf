@@ -64,14 +64,15 @@ pub enum Command {
         /// Number of few-shot examples, 0 for zero-shot (overrides config)
         #[arg(long)]
         num_shots: Option<usize>,
-        /// Prompt mode (overrides config inference.mode). "chat" sends chat
-        /// turns to /chat/completions; "completion" sends one plain-text
-        /// prompt to /completions, for base models without a chat template.
+        /// Prompt mode (overrides config inference.mode)
         #[arg(long, value_enum)]
         mode: Option<PromptMode>,
-        /// Server context window in tokens (overrides config
-        /// inference.max_context_tokens). Drops shots per question until the
-        /// prompt plus max_tokens fits; needs the server's /tokenize endpoint.
+        /// Context length available to one request, in tokens (overrides config
+        /// inference.max_context_tokens). For llama-server this is
+        /// `default_generation_settings.n_ctx` from `GET /props`, which is less
+        /// than `-c` when `-np` is greater than 1. Drops shots per question
+        /// until the prompt plus max_tokens fits; needs llama-server's
+        /// /tokenize (and /apply-template in chat mode).
         #[arg(long)]
         max_context_tokens: Option<u32>,
         /// Verbosity level 0-2 (overrides config)

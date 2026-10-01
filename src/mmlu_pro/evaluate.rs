@@ -56,7 +56,7 @@ pub struct CategoryStats {
     pub errors: u32,
     /// Questions not sent because they did not fit `max_context_tokens`.
     pub skipped: u32,
-    /// Number of answered questions at each shot count.
+    /// Number of questions that received a response, by shot count.
     pub shots_used: BTreeMap<usize, u32>,
 }
 
@@ -67,12 +67,9 @@ impl CategoryStats {
         self.correct + self.wrong + self.errors + self.skipped
     }
 
-    /// Count a saved result (used when resuming from a result file).
+    /// Count a saved, answered result (used when resuming from a result
+    /// file). Skipped results are dropped before this and re-evaluated.
     fn record_saved(&mut self, r: &QuestionResult) {
-        if r.skipped {
-            self.skipped += 1;
-            return;
-        }
         match &r.pred {
             Some(pred) if pred == &r.answer => self.correct += 1,
             Some(_) => self.wrong += 1,
@@ -287,39 +284,46 @@ async fn persist(
     let _ = save_summary(&summary_stats, summary_path);
 }
 
-/// The text whose token count stands for the prompt's length when fitting
-/// shots into `max_context_tokens`.
+/// The value sent as `chat_template_kwargs` on chat requests. `/apply-template`
+/// gets the same value so the prompt it renders for counting is the prompt the
+/// generation request produces.
+const CHAT_TEMPLATE_KWARGS: Option<&serde_json::Value> = None;
+
+/// Exact prompt length in tokens, as the server will see it, for the prompt
+/// with the given `shots`.
 ///
-/// Completion mode: the exact prompt. Chat mode: the message contents joined
-/// by blank lines. That omits the chat template's role markers and special
-/// tokens, so in chat mode the count is low by a few tokens per message.
-/// In both modes llama-server's `/tokenize` does not add BOS by default, so
-/// the count is also one token below what generation sees.
-fn prompt_text_for_counting(
+/// Completion mode counts the prompt string. Chat mode first renders the
+/// messages with the server's chat template (`/apply-template`) and counts
+/// that. Both counts include BOS (see `OpenAIClient::count_prompt_tokens`).
+async fn count_prompt_tokens(
+    client: &OpenAIClient,
     mode: PromptMode,
     system_prompt: &str,
     shots: &[Question],
     question: &Question,
-) -> String {
-    match mode {
+) -> Result<usize> {
+    let text = match mode {
         PromptMode::Chat => {
-            build_messages(system_prompt, shots, &question.question, &question.options)
-                .into_iter()
-                .map(|m| m.content)
-                .collect::<Vec<_>>()
-                .join("\n\n")
+            let messages =
+                build_messages(system_prompt, shots, &question.question, &question.options);
+            client
+                .apply_template(&messages, CHAT_TEMPLATE_KWARGS)
+                .await?
         }
         PromptMode::Completion => {
             build_completion_prompt(system_prompt, shots, &question.question, &question.options)
         }
-    }
+    };
+    client.count_prompt_tokens(&text).await
 }
 
 /// Fail early when `max_context_tokens` is set but cannot be applied: the
-/// generation budget alone fills the window, or the server has no usable
-/// `/tokenize` endpoint (it is a llama.cpp server extension).
-async fn check_tokenize_available(
+/// generation budget alone fills the window, llama-server's `POST /tokenize`
+/// does not answer with tokens, or (chat mode) its `POST /apply-template`
+/// does not answer with a prompt.
+async fn check_token_counting_available(
     client: &OpenAIClient,
+    mode: PromptMode,
     max_context_tokens: u32,
     max_tokens: u32,
 ) -> Result<()> {
@@ -329,20 +333,132 @@ async fn check_tokenize_available(
              ({max_context_tokens}); otherwise no prompt fits"
         );
     }
-    match client.tokenize("The answer is (A).").await {
-        Ok(n) if n > 0 => Ok(()),
+    match client.count_prompt_tokens("The answer is (A).").await {
+        Ok(n) if n > 0 => {}
         Ok(_) => anyhow::bail!(
-            "max_context_tokens is set, but the server's /tokenize endpoint returned \
-             no tokens for a non-empty string. It needs llama-server's \
-             POST /tokenize ({{\"content\": ...}} -> {{\"tokens\": [...]}})."
+            "max_context_tokens is set, but POST /tokenize returned no tokens for a \
+             non-empty string. Counting needs llama-server's /tokenize \
+             ({{\"content\": ..., \"add_special\": true}} -> {{\"tokens\": [...]}})."
         ),
         Err(e) => anyhow::bail!(
-            "max_context_tokens is set, which counts prompt tokens with the server's \
-             POST /tokenize endpoint (served by llama-server at the server root, not \
-             under /v1), but that request failed: {e}. Unset max_context_tokens for \
-             servers without /tokenize."
+            "max_context_tokens is set, which counts prompt tokens with llama-server's \
+             POST /tokenize at the server root (not under /v1), but that request \
+             failed: {e}. Unset max_context_tokens for servers other than llama-server."
         ),
     }
+    if mode == PromptMode::Chat {
+        let probe = [crate::client::Message {
+            role: "user".to_string(),
+            content: "The answer is (A).".to_string(),
+        }];
+        if let Err(e) = client.apply_template(&probe, CHAT_TEMPLATE_KWARGS).await {
+            anyhow::bail!(
+                "max_context_tokens is set in chat mode, which renders the chat template \
+                 with llama-server's POST /apply-template at the server root to count \
+                 prompt tokens, but that request failed: {e}. Unset max_context_tokens \
+                 or use a server that provides /apply-template."
+            );
+        }
+    }
+    Ok(())
+}
+
+/// Settings that change what a question's result means. Saved as
+/// `run_config.json` in the output directory; resuming into a directory whose
+/// saved settings differ is refused, because the old and new results would be
+/// mixed in one score.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+struct RunConfig {
+    mode: String,
+    num_shots: usize,
+    max_context_tokens: Option<u32>,
+    max_tokens: u32,
+    system_prompt: String,
+}
+
+impl RunConfig {
+    fn from_config(config: &Config) -> Self {
+        Self {
+            mode: config.inference.mode.as_str().to_string(),
+            num_shots: config.inference.num_shots,
+            max_context_tokens: config.inference.max_context_tokens,
+            max_tokens: config.inference.max_tokens,
+            system_prompt: config.inference.system_prompt.clone(),
+        }
+    }
+
+    /// Names of the fields that differ between `self` (saved) and `current`.
+    fn differing_fields(&self, current: &RunConfig) -> Vec<String> {
+        let mut out = Vec::new();
+        let mut cmp = |name: &str, saved: String, now: String| {
+            if saved != now {
+                out.push(format!("{name}: saved {saved}, now {now}"));
+            }
+        };
+        cmp("mode", self.mode.clone(), current.mode.clone());
+        cmp(
+            "num_shots",
+            self.num_shots.to_string(),
+            current.num_shots.to_string(),
+        );
+        cmp(
+            "max_context_tokens",
+            format!("{:?}", self.max_context_tokens),
+            format!("{:?}", current.max_context_tokens),
+        );
+        cmp(
+            "max_tokens",
+            self.max_tokens.to_string(),
+            current.max_tokens.to_string(),
+        );
+        if self.system_prompt != current.system_prompt {
+            out.push("system_prompt: text differs".to_string());
+        }
+        out
+    }
+}
+
+const RUN_CONFIG_FILE: &str = "run_config.json";
+
+/// Check `output_dir/run_config.json` against this run's settings, then write
+/// it. Refuses to resume into a directory written with different settings.
+/// Results without a `run_config.json` (written by an older llm-perf) cannot
+/// be checked; that is warned about and the run proceeds.
+fn check_and_write_run_config(config: &Config, output_dir: &Path) -> Result<()> {
+    let path = output_dir.join(RUN_CONFIG_FILE);
+    let current = RunConfig::from_config(config);
+    if path.exists() {
+        let saved: RunConfig = serde_json::from_str(&std::fs::read_to_string(&path)?)
+            .map_err(|e| anyhow::anyhow!("failed to parse {}: {e}", path.display()))?;
+        let diffs = saved.differing_fields(&current);
+        if !diffs.is_empty() {
+            anyhow::bail!(
+                "{} holds results from a run with different settings, and resuming \
+                 would mix them into one score:\n  {}\nUse a fresh output directory \
+                 (move or delete {}).",
+                output_dir.display(),
+                diffs.join("\n  "),
+                output_dir.display()
+            );
+        }
+        return Ok(());
+    }
+    let has_results = std::fs::read_dir(output_dir)
+        .map(|entries| {
+            entries
+                .flatten()
+                .any(|e| e.file_name().to_string_lossy().ends_with("_result.json"))
+        })
+        .unwrap_or(false);
+    if has_results {
+        eprintln!(
+            "Warning: {} has results but no {RUN_CONFIG_FILE} (written by an older \
+             llm-perf), so they cannot be checked against this run's settings. \
+             Resuming anyway.",
+            output_dir.display()
+        );
+    }
+    write_atomic(&path, serde_json::to_string_pretty(&current)?.as_bytes())
 }
 
 /// Run evaluation across all specified categories.
@@ -390,8 +506,18 @@ pub async fn run_evaluation(
     let max_context_tokens = config.inference.max_context_tokens;
 
     if let Some(ctx) = max_context_tokens {
-        check_tokenize_available(&client, ctx, config.inference.max_tokens).await?;
+        check_token_counting_available(
+            &client,
+            config.inference.mode,
+            ctx,
+            config.inference.max_tokens,
+        )
+        .await?;
     }
+    check_and_write_run_config(config, output_dir)?;
+
+    // The first skip of a run is always printed; later ones at verbosity >= 1.
+    let skip_reported = Arc::new(std::sync::atomic::AtomicBool::new(false));
 
     // Compute overall question count for ETA across all categories
     let overall_total: u32 = categories
@@ -439,7 +565,11 @@ pub async fn run_evaluation(
         let summary_path = output_dir.join(format!("{}_summary.json", category));
 
         // Load existing results for resume
-        let existing_results = load_existing_results(&result_path);
+        // Skipped results are dropped so those questions are evaluated again.
+        let existing_results: Vec<QuestionResult> = load_existing_results(&result_path)
+            .into_iter()
+            .filter(|r| !r.skipped)
+            .collect();
         let existing_ids: std::collections::HashSet<i64> =
             existing_results.iter().map(|r| r.question_id).collect();
 
@@ -471,9 +601,6 @@ pub async fn run_evaluation(
         overall_counters
             .extraction_failures
             .fetch_add(cat_stats.extraction_failures, Ordering::Relaxed);
-        overall_counters
-            .skipped
-            .fetch_add(cat_stats.skipped, Ordering::Relaxed);
 
         if new_questions.is_empty() {
             eprintln!(
@@ -554,6 +681,7 @@ pub async fn run_evaluation(
             let verbosity = config.log.verbosity;
             let mode = config.inference.mode;
             let category = category.clone();
+            let skip_reported = Arc::clone(&skip_reported);
 
             let handle = tokio::spawn(async move {
                 let _permit = semaphore.acquire().await.unwrap();
@@ -565,24 +693,44 @@ pub async fn run_evaluation(
                     None => cot_examples.len(),
                     Some(ctx) => {
                         let fit = fit_shots(cot_examples.len(), max_tokens, ctx, |k| {
-                            let text = prompt_text_for_counting(
+                            count_prompt_tokens(
+                                &client,
                                 mode,
                                 &system_prompt,
                                 &cot_examples[..k],
                                 &question,
-                            );
-                            let client = Arc::clone(&client);
-                            async move { client.tokenize(&text).await }
+                            )
                         })
                         .await;
                         match fit {
-                            Ok(ShotFit::Fits { shots, .. }) => shots,
+                            Ok(ShotFit::Fits {
+                                shots,
+                                prompt_tokens,
+                            }) => {
+                                if verbosity >= 2 {
+                                    eprintln!(
+                                        "Q{}: {} shots, {} prompt tokens",
+                                        question.question_id, shots, prompt_tokens
+                                    );
+                                }
+                                shots
+                            }
                             Ok(ShotFit::TooLong { zero_shot_tokens }) => {
-                                if verbosity >= 1 {
+                                let first = !skip_reported.swap(true, Ordering::Relaxed);
+                                if first || verbosity >= 1 {
                                     eprintln!(
                                         "Skipping question {}: {} prompt tokens at 0 shots + \
-                                         {} max_tokens exceeds max_context_tokens {}",
-                                        question.question_id, zero_shot_tokens, max_tokens, ctx
+                                         {} max_tokens exceeds max_context_tokens {}{}",
+                                        question.question_id,
+                                        zero_shot_tokens,
+                                        max_tokens,
+                                        ctx,
+                                        if first && verbosity == 0 {
+                                            " (further skips are counted in the report; \
+                                             -v 1 prints each)"
+                                        } else {
+                                            ""
+                                        }
                                     );
                                 }
                                 stats.lock().await.skipped += 1;
@@ -657,7 +805,7 @@ pub async fn run_evaluation(
                             stream_options: None,
                             logprobs: None,
                             top_logprobs: None,
-                            chat_template_kwargs: None,
+                            chat_template_kwargs: CHAT_TEMPLATE_KWARGS.cloned(),
                             ignore_eos: None,
                         };
                         let outcome = client.chat_completion(request).await.map(|r| {
@@ -918,26 +1066,21 @@ mod tests {
     }
 
     #[test]
-    fn resume_counts_skipped_and_shots_used() {
+    fn resume_counts_saved_results_and_shots_used() {
         let mut stats = CategoryStats::default();
         let mut wrong = sample_result(2);
         wrong.pred = Some("B".to_string());
         wrong.shots_used = Some(3);
-        let mut skipped = sample_result(3);
-        skipped.pred = None;
-        skipped.shots_used = None;
-        skipped.skipped = true;
-        let mut legacy = sample_result(4);
+        let mut legacy = sample_result(3);
         legacy.shots_used = None;
 
-        for r in [sample_result(1), wrong, skipped, legacy] {
+        for r in [sample_result(1), wrong, legacy] {
             stats.record_saved(&r);
         }
         assert_eq!(stats.correct, 2);
         assert_eq!(stats.wrong, 1);
-        assert_eq!(stats.skipped, 1);
         assert_eq!(stats.extraction_failures, 0);
-        assert_eq!(stats.total(), 4);
+        assert_eq!(stats.total(), 3);
         assert_eq!(stats.shots_used, BTreeMap::from([(3, 1), (5, 1)]));
     }
 
@@ -952,22 +1095,27 @@ mod tests {
     }
 
     #[test]
-    fn completion_counting_text_is_the_exact_prompt() {
-        let q = Question {
-            question_id: 1,
-            question: "Q?".to_string(),
-            options: vec!["a".to_string()],
-            answer: "A".to_string(),
-            answer_index: 0,
-            cot_content: String::new(),
-            category: "math".to_string(),
+    fn run_config_reports_each_differing_field() {
+        let saved = RunConfig {
+            mode: "chat".to_string(),
+            num_shots: 5,
+            max_context_tokens: None,
+            max_tokens: 4096,
+            system_prompt: "a".to_string(),
         };
-        assert_eq!(
-            prompt_text_for_counting(PromptMode::Completion, "H", &[], &q),
-            build_completion_prompt("H", &[], "Q?", &q.options)
-        );
-        let chat = prompt_text_for_counting(PromptMode::Chat, "H", &[], &q);
-        assert!(chat.starts_with("H\n\nQuestion: Q?"));
+        assert!(saved.differing_fields(&saved.clone()).is_empty());
+        let now = RunConfig {
+            mode: "completion".to_string(),
+            num_shots: 5,
+            max_context_tokens: Some(2048),
+            max_tokens: 4096,
+            system_prompt: "b".to_string(),
+        };
+        let diffs = saved.differing_fields(&now);
+        assert_eq!(diffs.len(), 3, "{diffs:?}");
+        assert!(diffs[0].starts_with("mode: saved chat, now completion"));
+        assert!(diffs[1].starts_with("max_context_tokens:"));
+        assert!(diffs[2].starts_with("system_prompt:"));
     }
 
     #[test]
@@ -1010,5 +1158,337 @@ mod tests {
         );
 
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// Tests that drive `run_evaluation` against a mock llama-server.
+    mod run {
+        use super::*;
+        use mockito::{Matcher, Server, ServerGuard};
+        use serde_json::json;
+
+        const CATEGORY: &str = "math";
+        const MAX_TOKENS: u32 = 100;
+        const SYSTEM_PROMPT: &str = "Questions about {subject}.";
+
+        fn question(id: i64, text: &str, cot: &str) -> Question {
+            Question {
+                question_id: id,
+                question: text.to_string(),
+                options: vec!["yes".to_string(), "no".to_string()],
+                answer: "A".to_string(),
+                answer_index: 0,
+                cot_content: cot.to_string(),
+                category: CATEGORY.to_string(),
+            }
+        }
+
+        type Data = HashMap<String, Vec<Question>>;
+
+        fn dataset() -> (Data, Data) {
+            let test = vec![
+                question(100, "Test one?", ""),
+                question(101, "Test two?", ""),
+            ];
+            let val = (0..5)
+                .map(|i| {
+                    question(
+                        i,
+                        &format!("Shot {i}?"),
+                        &format!("A: Let's think step by step. Shot {i}. The answer is (A)."),
+                    )
+                })
+                .collect();
+            (
+                HashMap::from([(CATEGORY.to_string(), test)]),
+                HashMap::from([(CATEGORY.to_string(), val)]),
+            )
+        }
+
+        fn config(server: &ServerGuard, mode: &str, max_context_tokens: Option<u32>) -> Config {
+            let ctx = max_context_tokens
+                .map(|c| format!("max_context_tokens = {c}"))
+                .unwrap_or_default();
+            let toml = format!(
+                "[endpoint]\nbase_url = \"{}/v1\"\ntimeout = 5\n\
+                 [inference]\nmode = \"{mode}\"\nnum_shots = 5\nmax_tokens = {MAX_TOKENS}\n\
+                 system_prompt = \"{SYSTEM_PROMPT}\"\n{ctx}\n\
+                 [load]\nconcurrent_requests = 1\n",
+                server.url()
+            );
+            toml::from_str(&toml).unwrap()
+        }
+
+        fn header() -> String {
+            SYSTEM_PROMPT.replace("{subject}", CATEGORY)
+        }
+
+        fn shots(k: usize) -> Vec<Question> {
+            dataset().1[CATEGORY][..k].to_vec()
+        }
+
+        fn completion_prompt(k: usize, q: &Question) -> String {
+            build_completion_prompt(&header(), &shots(k), &q.question, &q.options)
+        }
+
+        /// Fake `/tokenize`: `1 + per_block * n` tokens, where n is the number
+        /// of "Question:" blocks in the content (shots + 1). The 1 stands for
+        /// BOS. Requires `add_special: true`.
+        async fn mock_tokenize(server: &mut ServerGuard, per_block: usize) -> mockito::Mock {
+            server
+                .mock("POST", "/tokenize")
+                .match_body(Matcher::PartialJson(json!({"add_special": true})))
+                .with_body_from_request(move |req| {
+                    let body: serde_json::Value =
+                        serde_json::from_slice(req.body().unwrap()).unwrap();
+                    let content = body["content"].as_str().unwrap();
+                    let n = 1 + per_block * content.matches("Question:").count();
+                    json!({ "tokens": vec![0; n] }).to_string().into_bytes()
+                })
+                .expect_at_least(1)
+                .create_async()
+                .await
+        }
+
+        fn completion_body() -> String {
+            json!({
+                "choices": [{"text": " The answer is (A).", "index": 0, "finish_reason": "stop"}],
+                "usage": {"prompt_tokens": 10, "completion_tokens": 5, "total_tokens": 15}
+            })
+            .to_string()
+        }
+
+        fn chat_body() -> String {
+            json!({
+                "id": "x", "object": "chat.completion", "created": 0, "model": "m",
+                "choices": [{"index": 0, "finish_reason": "stop",
+                    "message": {"role": "assistant", "content": "The answer is (A)."}}],
+                "usage": {"prompt_tokens": 10, "completion_tokens": 5, "total_tokens": 15}
+            })
+            .to_string()
+        }
+
+        async fn mock_completion_for(
+            server: &mut ServerGuard,
+            prompt: &str,
+            hits: usize,
+        ) -> mockito::Mock {
+            server
+                .mock("POST", "/v1/completions")
+                .match_body(Matcher::PartialJson(
+                    json!({"prompt": prompt, "stop": ["Question:"], "max_tokens": MAX_TOKENS}),
+                ))
+                .with_body(completion_body())
+                .expect(hits)
+                .create_async()
+                .await
+        }
+
+        async fn mock_any(server: &mut ServerGuard, path: &str, hits: usize) -> mockito::Mock {
+            let body = if path.contains("chat") {
+                chat_body()
+            } else {
+                completion_body()
+            };
+            server
+                .mock("POST", path)
+                .with_body(body)
+                .expect(hits)
+                .create_async()
+                .await
+        }
+
+        fn saved(dir: &Path) -> Vec<QuestionResult> {
+            load_existing_results(&dir.join(format!("{CATEGORY}_result.json")))
+        }
+
+        async fn run(config: &Config, dir: &Path) -> Result<EvaluationResult> {
+            let (test, val) = dataset();
+            run_evaluation(config, "m", &test, &val, dir).await
+        }
+
+        #[tokio::test(flavor = "multi_thread")]
+        async fn completion_mode_sends_one_reference_prompt_per_question() {
+            let mut server = Server::new_async().await;
+            let dir = tempfile::tempdir().unwrap();
+            let (test, _) = dataset();
+            let m0 = mock_completion_for(&mut server, &completion_prompt(5, &test[CATEGORY][0]), 1)
+                .await;
+            let m1 = mock_completion_for(&mut server, &completion_prompt(5, &test[CATEGORY][1]), 1)
+                .await;
+            let chat = mock_any(&mut server, "/v1/chat/completions", 0).await;
+
+            let result = run(&config(&server, "completion", None), dir.path())
+                .await
+                .unwrap();
+
+            m0.assert_async().await;
+            m1.assert_async().await;
+            chat.assert_async().await;
+            assert_eq!(result.category_stats[CATEGORY].correct, 2);
+            assert!(saved(dir.path()).iter().all(|r| r.shots_used == Some(5)));
+        }
+
+        #[tokio::test(flavor = "multi_thread")]
+        async fn max_context_tokens_reduces_shots_to_fit() {
+            // 1 + 400 * (k + 1) + 100 <= 1500 first holds at k = 2.
+            let mut server = Server::new_async().await;
+            let dir = tempfile::tempdir().unwrap();
+            let (test, _) = dataset();
+            let tok = mock_tokenize(&mut server, 400).await;
+            let m0 = mock_completion_for(&mut server, &completion_prompt(2, &test[CATEGORY][0]), 1)
+                .await;
+            let m1 = mock_completion_for(&mut server, &completion_prompt(2, &test[CATEGORY][1]), 1)
+                .await;
+
+            let result = run(&config(&server, "completion", Some(1500)), dir.path())
+                .await
+                .unwrap();
+
+            tok.assert_async().await;
+            m0.assert_async().await;
+            m1.assert_async().await;
+            let results = saved(dir.path());
+            assert_eq!(results.len(), 2);
+            assert!(
+                results
+                    .iter()
+                    .all(|r| r.shots_used == Some(2) && !r.skipped)
+            );
+            assert_eq!(
+                result.category_stats[CATEGORY].shots_used,
+                BTreeMap::from([(2, 2)])
+            );
+        }
+
+        #[tokio::test(flavor = "multi_thread")]
+        async fn chat_mode_counts_the_rendered_template() {
+            // /apply-template returns the contents joined, so the fake
+            // tokenizer sees one "Question:" per user turn, as in completion.
+            let mut server = Server::new_async().await;
+            let dir = tempfile::tempdir().unwrap();
+            let (test, _) = dataset();
+            let tok = mock_tokenize(&mut server, 400).await;
+            let tmpl = server
+                .mock("POST", "/apply-template")
+                .with_body_from_request(|req| {
+                    let body: serde_json::Value =
+                        serde_json::from_slice(req.body().unwrap()).unwrap();
+                    let joined = body["messages"]
+                        .as_array()
+                        .unwrap()
+                        .iter()
+                        .map(|m| m["content"].as_str().unwrap().to_string())
+                        .collect::<Vec<_>>()
+                        .join("\n");
+                    json!({ "prompt": joined }).to_string().into_bytes()
+                })
+                .expect_at_least(1)
+                .create_async()
+                .await;
+            let mut chats = Vec::new();
+            for q in &test[CATEGORY] {
+                let messages = build_messages(&header(), &shots(2), &q.question, &q.options);
+                chats.push(
+                    server
+                        .mock("POST", "/v1/chat/completions")
+                        .match_body(Matcher::PartialJson(json!({ "messages": messages })))
+                        .with_body(chat_body())
+                        .expect(1)
+                        .create_async()
+                        .await,
+                );
+            }
+
+            run(&config(&server, "chat", Some(1500)), dir.path())
+                .await
+                .unwrap();
+
+            tok.assert_async().await;
+            tmpl.assert_async().await;
+            for m in &chats {
+                m.assert_async().await;
+            }
+            assert!(saved(dir.path()).iter().all(|r| r.shots_used == Some(2)));
+        }
+
+        #[tokio::test(flavor = "multi_thread")]
+        async fn too_long_at_zero_shots_is_skipped_then_retried_on_resume() {
+            // 1 + 400 + 100 > 300: even 0 shots does not fit.
+            let mut server = Server::new_async().await;
+            let dir = tempfile::tempdir().unwrap();
+            let config_a = config(&server, "completion", Some(300));
+            let _tok = mock_tokenize(&mut server, 400).await;
+            let gen_calls = mock_any(&mut server, "/v1/completions", 0).await;
+
+            let result = run(&config_a, dir.path()).await.unwrap();
+
+            gen_calls.assert_async().await;
+            assert_eq!(result.category_stats[CATEGORY].skipped, 2);
+            assert_eq!(result.category_stats[CATEGORY].total(), 2);
+            let results = saved(dir.path());
+            assert_eq!(results.len(), 2);
+            assert!(results.iter().all(|r| r.skipped && r.shots_used.is_none()));
+
+            // Same settings, but a server whose prompts are shorter: the skipped
+            // questions are evaluated again rather than kept from the file.
+            let mut server_b = Server::new_async().await;
+            let config_b = config(&server_b, "completion", Some(300));
+            let _tok_b = mock_tokenize(&mut server_b, 10).await;
+            let gen_b = mock_any(&mut server_b, "/v1/completions", 2).await;
+
+            let result = run(&config_b, dir.path()).await.unwrap();
+
+            gen_b.assert_async().await;
+            assert_eq!(result.category_stats[CATEGORY].skipped, 0);
+            assert_eq!(result.category_stats[CATEGORY].correct, 2);
+            let results = saved(dir.path());
+            assert_eq!(results.len(), 2);
+            assert!(
+                results
+                    .iter()
+                    .all(|r| !r.skipped && r.shots_used == Some(5))
+            );
+        }
+
+        #[tokio::test(flavor = "multi_thread")]
+        async fn resume_with_a_changed_mode_is_refused() {
+            let mut server = Server::new_async().await;
+            let dir = tempfile::tempdir().unwrap();
+            let gen_calls = mock_any(&mut server, "/v1/completions", 2).await;
+            run(&config(&server, "completion", None), dir.path())
+                .await
+                .unwrap();
+            gen_calls.assert_async().await;
+            assert!(dir.path().join(RUN_CONFIG_FILE).exists());
+
+            let chat = mock_any(&mut server, "/v1/chat/completions", 0).await;
+            let err = run(&config(&server, "chat", None), dir.path())
+                .await
+                .err()
+                .expect("resume with a different mode must fail");
+            let msg = err.to_string();
+            assert!(msg.contains("mode: saved completion, now chat"), "{msg}");
+            assert!(msg.contains("fresh output directory"), "{msg}");
+            chat.assert_async().await;
+        }
+
+        #[tokio::test(flavor = "multi_thread")]
+        async fn results_without_run_config_are_resumed() {
+            let mut server = Server::new_async().await;
+            let dir = tempfile::tempdir().unwrap();
+            let mut old = sample_result(100);
+            old.category = CATEGORY.to_string();
+            old.shots_used = None;
+            save_results(&[old], &dir.path().join(format!("{CATEGORY}_result.json"))).unwrap();
+            let gen_calls = mock_any(&mut server, "/v1/completions", 1).await;
+
+            let result = run(&config(&server, "completion", None), dir.path())
+                .await
+                .unwrap();
+
+            gen_calls.assert_async().await;
+            assert_eq!(result.category_stats[CATEGORY].correct, 2);
+            assert!(dir.path().join(RUN_CONFIG_FILE).exists());
+        }
     }
 }
