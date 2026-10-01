@@ -71,9 +71,10 @@ pub enum Command {
         /// inference.max_context_tokens)
         ///
         /// For llama-server this is `default_generation_settings.n_ctx` from
-        /// `GET /props`. This can be less than `-c`: with `-np` greater than 1
-        /// and no `--kv-unified`, it is `-c` divided by `-np`, rounded up to a
-        /// multiple of 256, and `--kv-unified-per-slot` also caps it.
+        /// `GET /props`. This can be less than `-c`. With `-np` greater than 1
+        /// and without `--kv-unified`, it is `-c` divided by `-np`, rounded up
+        /// to a multiple of 256. `--kv-unified-per-slot` and the model's
+        /// training context also cap it.
         ///
         /// Drops shots per question until the prompt plus max_tokens fits;
         /// needs llama-server's /tokenize (and /apply-template in chat mode).

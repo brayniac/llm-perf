@@ -386,9 +386,9 @@ impl OpenAIClient {
     /// counted when the model adds one) and `parse_special: true` (so special
     /// tokens written in a rendered chat template count as single tokens).
     /// This is the same tokenization `/completions` and `/chat/completions`
-    /// apply to their prompt. llama-server only. `Self::tokenize` does not add
-    /// special tokens and also sends vLLM's `prompt` field; it is used for
-    /// benchmark calibration.
+    /// apply to their prompt. llama-server only. `Self::tokenize` omits
+    /// `add_special` (llama-server then adds no special tokens) and also sends
+    /// vLLM's `prompt` field; benchmark calibration uses it.
     pub async fn count_prompt_tokens(&self, text: &str) -> Result<usize> {
         let url = format!("{}/tokenize", self.server_root());
         let body = serde_json::json!({
@@ -402,9 +402,9 @@ impl OpenAIClient {
 
     /// Render chat `messages` to the prompt string llama-server would generate
     /// from, via `POST /apply-template`. That endpoint runs the same request
-    /// parsing as `/chat/completions`, so any field that changes rendering
-    /// (`chat_template_kwargs`, `tools`, `reasoning_effort`,
-    /// `add_generation_prompt`) must match the generation request.
+    /// parsing as `/chat/completions`, so any field that changes rendering, for
+    /// example `chat_template_kwargs`, `tools`, `reasoning_effort` or
+    /// `add_generation_prompt`, must match the generation request.
     pub async fn apply_template(
         &self,
         messages: &[Message],

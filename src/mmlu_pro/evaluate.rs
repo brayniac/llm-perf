@@ -424,7 +424,16 @@ impl RunConfig {
             .into_iter()
             .zip(current.displayed_fields())
             .filter(|((_, saved), (_, now))| saved != now)
-            .map(|((name, saved), (_, now))| format!("{name}: saved {saved}, now {now}"))
+            .map(|((name, saved), (_, now))| {
+                if name == "model" {
+                    format!(
+                        "model: saved {saved}, now {now} (pass --model {saved} to resume \
+                         against the saved model name)"
+                    )
+                } else {
+                    format!("{name}: saved {saved}, now {now}")
+                }
+            })
             .collect();
         if self.system_prompt != current.system_prompt {
             out.push("system_prompt: text differs".to_string());
@@ -446,11 +455,14 @@ const RUN_CONFIG_FILE: &str = "run_config.json";
 fn check_and_write_run_config(config: &Config, model: &str, output_dir: &Path) -> Result<()> {
     let path = output_dir.join(RUN_CONFIG_FILE);
     let current = RunConfig::from_config(config, model);
+    // Skipped rows do not count: resume evaluates them again, so they do not
+    // tie the directory to the settings that skipped them.
     let has_results = std::fs::read_dir(output_dir)
         .map(|entries| {
-            entries
-                .flatten()
-                .any(|e| e.file_name().to_string_lossy().ends_with("_result.json"))
+            entries.flatten().any(|e| {
+                e.file_name().to_string_lossy().ends_with("_result.json")
+                    && load_existing_results(&e.path()).iter().any(|r| !r.skipped)
+            })
         })
         .unwrap_or(false);
     if has_results && path.exists() {
@@ -1136,7 +1148,8 @@ mod tests {
         assert_eq!(
             saved.differing_fields(&now),
             vec![
-                "model: saved model-a, now model-b",
+                "model: saved model-a, now model-b (pass --model model-a to resume \
+                 against the saved model name)",
                 "mode: saved chat, now completion",
                 "max_context_tokens: saved unset, now 2048",
                 "temperature: saved 0, now 0.5",
@@ -1390,8 +1403,9 @@ mod tests {
         #[tokio::test(flavor = "multi_thread")]
         async fn chat_mode_counts_the_rendered_template() {
             // `/apply-template` adds one 'Question:' block, standing in for
-            // template overhead, so the fit is k=1 here and k=2 without the
-            // template (1 + 400 * (k + 2) + 100 <= 1500).
+            // template overhead. With it, 1 + 400 * (k + 2) + 100 <= 1500
+            // gives k = 1; without it, 1 + 400 * (k + 1) + 100 <= 1500 gives
+            // k = 2.
             let mut server = Server::new_async().await;
             let dir = tempfile::tempdir().unwrap();
             let (test, _) = dataset();
@@ -1521,6 +1535,31 @@ mod tests {
             )
             .unwrap();
             assert_eq!(saved, RunConfig::from_config(&completion, "m"));
+        }
+
+        #[tokio::test(flavor = "multi_thread")]
+        async fn all_skipped_results_do_not_lock_settings() {
+            // Every question is skipped at max_context_tokens 300; a rerun with
+            // a larger window is a different setting but must be accepted,
+            // because the only saved rows are skipped ones.
+            let mut server = Server::new_async().await;
+            let dir = tempfile::tempdir().unwrap();
+            let _tok = mock_tokenize(&mut server, 400).await;
+            let none = mock_any(&mut server, "/v1/completions", 0).await;
+            run(&config(&server, "completion", Some(300)), dir.path())
+                .await
+                .unwrap();
+            none.assert_async().await;
+            assert!(saved(dir.path()).iter().all(|r| r.skipped));
+
+            // 1 + 400 * (k + 1) + 100 <= 1500 gives k = 2.
+            let gen_calls = mock_any(&mut server, "/v1/completions", 2).await;
+            let result = run(&config(&server, "completion", Some(1500)), dir.path())
+                .await
+                .unwrap();
+            gen_calls.assert_async().await;
+            assert_eq!(result.category_stats[CATEGORY].skipped, 0);
+            assert!(saved(dir.path()).iter().all(|r| r.shots_used == Some(2)));
         }
 
         #[tokio::test(flavor = "multi_thread")]
