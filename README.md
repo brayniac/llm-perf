@@ -334,6 +334,8 @@ The `mmlu-pro` binary runs MMLU-Pro accuracy evaluations against LLM servers:
 
 This is a separate binary for measuring model quality (accuracy) rather than performance (latency/throughput). It downloads the MMLU-Pro dataset from HuggingFace, runs chain-of-thought evaluation, and produces per-category accuracy scores with resume support.
 
+By default the few-shot prompt is sent as chat turns to `/chat/completions`. For base models without a chat template, set `[inference] mode = "completion"` (or pass `--mode completion`) to send a single plain-text prompt to `/completions` in the layout of TIGER-Lab's `evaluate_from_local.py`, which is the layout used for published base-model MMLU-Pro scores.
+
 ## Development
 
 ### Building and Testing

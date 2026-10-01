@@ -8,6 +8,13 @@ base_url = "http://localhost:8080/v1"
 timeout = 600
 
 [inference]
+# "chat": system prompt plus one user/assistant turn pair per shot, sent to
+#   /chat/completions. The server applies the model's chat template.
+# "completion": one plain-text prompt in the layout of TIGER-Lab's
+#   evaluate_from_local.py, sent to /completions. Use this for base models,
+#   which have no chat template. The header is system_prompt below.
+# Overridden by --mode.
+mode = "chat"
 # 5-shot Chain-of-Thought (uses validation split examples)
 num_shots = 5
 temperature = 0.0

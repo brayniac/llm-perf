@@ -7,12 +7,14 @@ use std::sync::atomic::{AtomicU32, Ordering};
 use std::time::Instant;
 use tokio::sync::Semaphore;
 
-use crate::client::{ChatCompletionRequest, ClientConfig, ClientError, OpenAIClient};
+use crate::client::{
+    ChatCompletionRequest, ClientConfig, ClientError, CompletionRequest, OpenAIClient, Usage,
+};
 
-use super::config::Config;
+use super::config::{Config, PromptMode};
 use super::dataset::Question;
 use super::extract::extract_answer;
-use super::prompt::build_messages;
+use super::prompt::{build_completion_prompt, build_messages};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct QuestionResult {
@@ -24,6 +26,9 @@ pub struct QuestionResult {
     pub answer_index: i64,
     pub response: String,
     pub pred: Option<String>,
+    /// The exact prompt sent, when `log_prompt` is set. In chat mode this is
+    /// one entry per chat message; in completion mode it is a single entry with
+    /// role `"prompt"` holding the whole prompt string.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub prompt: Option<Vec<PromptMessage>>,
 }
@@ -412,36 +417,93 @@ pub async fn run_evaluation(
             let presence_penalty = config.inference.presence_penalty;
             let model = model.to_string();
             let verbosity = config.log.verbosity;
+            let mode = config.inference.mode;
 
             let handle = tokio::spawn(async move {
                 let _permit = semaphore.acquire().await.unwrap();
 
-                let messages = build_messages(
-                    &system_prompt,
-                    &cot_examples,
-                    &question.question,
-                    &question.options,
-                );
+                let stop = Some(vec!["Question:".to_string()]);
 
-                let request = ChatCompletionRequest {
-                    model,
-                    messages: messages.clone(),
-                    max_tokens: Some(max_tokens),
-                    temperature: Some(temperature),
-                    top_p: Some(top_p),
-                    frequency_penalty: Some(frequency_penalty),
-                    presence_penalty: Some(presence_penalty),
-                    stop: Some(vec!["Question:".to_string()]),
-                    stream: Some(false),
-                    stream_options: None,
-                    logprobs: None,
-                    top_logprobs: None,
-                    chat_template_kwargs: None,
-                    ignore_eos: None,
+                // Send the request in the configured mode. Both arms yield the
+                // generated text, the server's token usage, and the prompt as it
+                // would be logged.
+                let (outcome, prompt_messages) = match mode {
+                    PromptMode::Chat => {
+                        let messages = build_messages(
+                            &system_prompt,
+                            &cot_examples,
+                            &question.question,
+                            &question.options,
+                        );
+                        let request = ChatCompletionRequest {
+                            model,
+                            messages: messages.clone(),
+                            max_tokens: Some(max_tokens),
+                            temperature: Some(temperature),
+                            top_p: Some(top_p),
+                            frequency_penalty: Some(frequency_penalty),
+                            presence_penalty: Some(presence_penalty),
+                            stop,
+                            stream: Some(false),
+                            stream_options: None,
+                            logprobs: None,
+                            top_logprobs: None,
+                            chat_template_kwargs: None,
+                            ignore_eos: None,
+                        };
+                        let outcome = client.chat_completion(request).await.map(|r| {
+                            let text = r
+                                .choices
+                                .first()
+                                .map(|c| c.message.content.clone())
+                                .unwrap_or_default();
+                            (text, r.usage)
+                        });
+                        let logged = messages
+                            .into_iter()
+                            .map(|m| PromptMessage {
+                                role: m.role,
+                                content: m.content,
+                            })
+                            .collect::<Vec<_>>();
+                        (outcome, logged)
+                    }
+                    PromptMode::Completion => {
+                        let prompt = build_completion_prompt(
+                            &system_prompt,
+                            &cot_examples,
+                            &question.question,
+                            &question.options,
+                        );
+                        let request = CompletionRequest {
+                            model,
+                            prompt: prompt.clone(),
+                            max_tokens: Some(max_tokens),
+                            temperature: Some(temperature),
+                            top_p: Some(top_p),
+                            frequency_penalty: Some(frequency_penalty),
+                            presence_penalty: Some(presence_penalty),
+                            stop,
+                            stream: Some(false),
+                        };
+                        let outcome = client.completion(request).await.map(|r| {
+                            let text = r
+                                .choices
+                                .first()
+                                .map(|c| c.text.clone())
+                                .unwrap_or_default();
+                            (text, r.usage)
+                        });
+                        let logged = vec![PromptMessage {
+                            role: "prompt".to_string(),
+                            content: prompt,
+                        }];
+                        (outcome, logged)
+                    }
                 };
 
-                let response = match client.chat_completion(request).await {
-                    Ok(resp) => resp,
+                let (response_text, usage): (String, Usage) = match outcome {
+                    Ok(out) => out,
                     Err(e) => {
                         let error_kind = match e.downcast_ref::<ClientError>() {
                             Some(ClientError::Connection(_)) => "connection",
@@ -476,21 +538,17 @@ pub async fn run_evaluation(
                 // Track token usage
                 {
                     let mut ts = token_stats.lock().await;
-                    ts.prompt_tokens.push(response.usage.prompt_tokens);
-                    ts.completion_tokens.push(response.usage.completion_tokens);
+                    ts.prompt_tokens.push(usage.prompt_tokens);
+                    ts.completion_tokens.push(usage.completion_tokens);
                 }
                 overall_counters
                     .prompt_tokens
-                    .fetch_add(response.usage.prompt_tokens, Ordering::Relaxed);
+                    .fetch_add(usage.prompt_tokens, Ordering::Relaxed);
                 overall_counters
                     .completion_tokens
-                    .fetch_add(response.usage.completion_tokens, Ordering::Relaxed);
+                    .fetch_add(usage.completion_tokens, Ordering::Relaxed);
 
-                let response_text = response
-                    .choices
-                    .first()
-                    .map(|c| c.message.content.trim().to_string())
-                    .unwrap_or_default();
+                let response_text = response_text.trim().to_string();
 
                 let pred = extract_answer(&response_text);
                 let pred_str = pred.map(|c| c.to_string());
@@ -505,19 +563,7 @@ pub async fn run_evaluation(
                     );
                 }
 
-                let prompt_log = if log_prompt {
-                    Some(
-                        messages
-                            .iter()
-                            .map(|m| PromptMessage {
-                                role: m.role.clone(),
-                                content: m.content.clone(),
-                            })
-                            .collect(),
-                    )
-                } else {
-                    None
-                };
+                let prompt_log = log_prompt.then_some(prompt_messages);
 
                 let result = QuestionResult {
                     question_id: question.question_id,

@@ -1,6 +1,8 @@
 use clap::{Parser, Subcommand};
 use std::path::PathBuf;
 
+use crate::mmlu_pro::config::PromptMode;
+
 #[derive(Parser, Debug)]
 #[command(name = "llm-perf")]
 #[command(author, version, about = "Benchmark OpenAI-compatible LLM servers", long_about = None)]
@@ -62,6 +64,11 @@ pub enum Command {
         /// Number of few-shot examples, 0 for zero-shot (overrides config)
         #[arg(long)]
         num_shots: Option<usize>,
+        /// Prompt mode (overrides config inference.mode). "chat" sends chat
+        /// turns to /chat/completions; "completion" sends one plain-text
+        /// prompt to /completions, for base models without a chat template.
+        #[arg(long, value_enum)]
+        mode: Option<PromptMode>,
         /// Verbosity level 0-2 (overrides config)
         #[arg(short, long)]
         verbosity: Option<u8>,
@@ -110,5 +117,41 @@ impl Cli {
         }
 
         Cli::parse()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn mmlu_mode(args: &[&str]) -> Result<Option<PromptMode>, clap::Error> {
+        let mut argv = vec!["llm-perf", "mmlu-pro", "config.toml"];
+        argv.extend_from_slice(args);
+        match Cli::try_parse_from(argv)?.command {
+            Command::MmluPro { mode, .. } => Ok(mode),
+            other => panic!("parsed as {other:?}"),
+        }
+    }
+
+    #[test]
+    fn mmlu_pro_mode_flag_is_optional() {
+        assert_eq!(mmlu_mode(&[]).unwrap(), None);
+    }
+
+    #[test]
+    fn mmlu_pro_mode_flag_parses_both_modes() {
+        assert_eq!(
+            mmlu_mode(&["--mode", "completion"]).unwrap(),
+            Some(PromptMode::Completion)
+        );
+        assert_eq!(
+            mmlu_mode(&["--mode", "chat"]).unwrap(),
+            Some(PromptMode::Chat)
+        );
+    }
+
+    #[test]
+    fn mmlu_pro_mode_flag_rejects_unknown_values() {
+        assert!(mmlu_mode(&["--mode", "raw"]).is_err());
     }
 }

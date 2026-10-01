@@ -1,6 +1,7 @@
 use anyhow::Result;
 use rand::Rng;
 use reqwest::Client;
+use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 use std::time::{Duration, Instant};
 use thiserror::Error;
@@ -80,6 +81,45 @@ pub struct ChatCompletionRequest {
     /// Suppress EOS so generation runs to `max_tokens` (llama.cpp / vLLM).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub ignore_eos: Option<bool>,
+}
+
+/// Request body for the legacy OpenAI `/completions` endpoint (served by
+/// llama-server, vLLM and others). The prompt is sent as-is with no chat template.
+#[derive(Debug, Clone, Serialize)]
+pub struct CompletionRequest {
+    pub model: String,
+    pub prompt: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub max_tokens: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub temperature: Option<f32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub top_p: Option<f32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub frequency_penalty: Option<f32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub presence_penalty: Option<f32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub stop: Option<Vec<String>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub stream: Option<bool>,
+}
+
+/// Response body from `/completions`. Only the fields the callers read are
+/// declared; others are ignored.
+#[derive(Debug, Clone, Deserialize)]
+pub struct CompletionResponse {
+    pub choices: Vec<CompletionChoice>,
+    pub usage: Usage,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct CompletionChoice {
+    #[serde(default)]
+    pub index: u32,
+    pub text: String,
+    #[serde(default)]
+    pub finish_reason: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -311,6 +351,23 @@ impl OpenAIClient {
         &self,
         request: ChatCompletionRequest,
     ) -> Result<ChatCompletionResponse> {
+        self.post_with_retry("chat/completions", &request).await
+    }
+
+    /// Non-streaming request to the legacy `/completions` endpoint, which takes
+    /// a raw prompt string and applies no chat template. Uses the same retry,
+    /// timeout and error classification as [`Self::chat_completion`].
+    pub async fn completion(&self, request: CompletionRequest) -> Result<CompletionResponse> {
+        self.post_with_retry("completions", &request).await
+    }
+
+    /// POST `request` as JSON to `{base_url}/{path}` and decode the response,
+    /// retrying retriable errors with backoff.
+    async fn post_with_retry<Req, Resp>(&self, path: &str, request: &Req) -> Result<Resp>
+    where
+        Req: Serialize,
+        Resp: DeserializeOwned,
+    {
         let mut attempt = 0;
         // Overall budget for the whole logical request: enough for every attempt
         // to use its full per-attempt timeout, but no more — this bounds total
@@ -320,7 +377,7 @@ impl OpenAIClient {
         let deadline = Instant::now() + self.timeout.saturating_mul(self.max_retries + 1);
 
         loop {
-            match self.chat_completion_internal(request.clone()).await {
+            match self.post_json(path, request).await {
                 Ok(resp) => {
                     if attempt > 0 {
                         log::debug!("Request succeeded after {} retries", attempt);
@@ -354,14 +411,15 @@ impl OpenAIClient {
         }
     }
 
-    /// Internal implementation of non-streaming request (without retry logic)
-    async fn chat_completion_internal(
-        &self,
-        request: ChatCompletionRequest,
-    ) -> Result<ChatCompletionResponse> {
-        let url = format!("{}/chat/completions", self.base_url);
+    /// Single non-streaming POST (without retry logic).
+    async fn post_json<Req, Resp>(&self, path: &str, request: &Req) -> Result<Resp>
+    where
+        Req: Serialize,
+        Resp: DeserializeOwned,
+    {
+        let url = format!("{}/{}", self.base_url, path);
 
-        let mut req = self.client.post(&url).json(&request);
+        let mut req = self.client.post(&url).json(request);
 
         if let Some(api_key) = &self.api_key {
             req = req.header("Authorization", format!("Bearer {}", api_key));
@@ -410,8 +468,8 @@ impl OpenAIClient {
             }
         }
 
-        let completion: ChatCompletionResponse = response.json().await?;
-        Ok(completion)
+        let decoded: Resp = response.json().await?;
+        Ok(decoded)
     }
 
     pub fn create_request(
@@ -1486,6 +1544,46 @@ mod tests {
         };
         let client = OpenAIClient::new(config).unwrap();
         assert_eq!(client.timeout, Duration::from_secs(7));
+    }
+
+    #[test]
+    fn completion_request_serializes_prompt_and_stop() {
+        let req = CompletionRequest {
+            model: "m".to_string(),
+            prompt: "Question:\nQ?\nAnswer: Let's think step by step.".to_string(),
+            max_tokens: Some(16),
+            temperature: Some(0.0),
+            top_p: None,
+            frequency_penalty: None,
+            presence_penalty: None,
+            stop: Some(vec!["Question:".to_string()]),
+            stream: Some(false),
+        };
+        let body: serde_json::Value = serde_json::to_value(&req).unwrap();
+        assert_eq!(body["prompt"], req.prompt.as_str());
+        assert_eq!(body["max_tokens"], 16);
+        assert_eq!(body["stop"], serde_json::json!(["Question:"]));
+        assert_eq!(body["stream"], false);
+        assert!(body.get("messages").is_none());
+        assert!(body.get("top_p").is_none());
+    }
+
+    #[test]
+    fn completion_response_parses_llama_server_shape() {
+        let json = r#"{
+            "choices": [{"text": " The answer is (B).", "index": 0, "logprobs": null, "finish_reason": "stop"}],
+            "created": 1700000000,
+            "model": "m",
+            "system_fingerprint": "b1",
+            "object": "text_completion",
+            "usage": {"completion_tokens": 6, "prompt_tokens": 40, "total_tokens": 46},
+            "id": "chatcmpl-x"
+        }"#;
+        let resp: CompletionResponse = serde_json::from_str(json).unwrap();
+        assert_eq!(resp.choices[0].text, " The answer is (B).");
+        assert_eq!(resp.choices[0].finish_reason.as_deref(), Some("stop"));
+        assert_eq!(resp.usage.prompt_tokens, 40);
+        assert_eq!(resp.usage.completion_tokens, 6);
     }
 
     #[test]

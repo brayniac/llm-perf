@@ -86,6 +86,8 @@ fn generate_text_report(
         config.load.concurrent_requests
     ));
     lines.push(format!("Subset: {}", config.load.subset));
+    lines.push(format!("Mode: {}", config.inference.mode));
+    lines.push(format!("Shots: {}", config.inference.num_shots));
     if !config.comment.is_empty() {
         lines.push(format!("Comment: {}", config.comment));
     }
@@ -300,6 +302,8 @@ fn generate_json_report(
             "max_tokens": config.inference.max_tokens,
             "concurrent_requests": config.load.concurrent_requests,
             "subset": config.load.subset,
+            "mode": config.inference.mode.as_str(),
+            "num_shots": config.inference.num_shots,
         },
         "overall": {
             "correct": total_correct,
