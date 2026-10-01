@@ -26,6 +26,7 @@ A high-performance benchmarking tool for OpenAI-compatible LLM inference servers
 - **`bench`** (default) - Run load benchmarks against an LLM server
 - **`logprobs`** - Collect token-level log probabilities sequentially (one request at a time to avoid GPU batching effects on distributions)
 - **`kl-divergence`** - Compare token probability distributions between two logprob captures (e.g., baseline FP16 vs quantized model)
+- **`convert-trace`** - Convert the coding-agent session dataset from [Azure/AzurePublicDataset](https://github.com/Azure/AzurePublicDataset/blob/master/GitHubCopilotCodingAgentDataset2026.md) into a per-session replay trace
 
 ### Performance Metrics
 
@@ -143,7 +144,24 @@ llm-perf logprobs my-config.toml
 # Compare two logprob captures
 llm-perf kl-divergence baseline.jsonl candidate.jsonl
 llm-perf kl-divergence baseline.jsonl candidate.jsonl --format json --output report.json
+
+# Convert one day of the coding-agent dataset, keeping sessions that fit 128K
+# context and start on that day
+gh release download ghcp-coding-agent-2026 -R Azure/AzurePublicDataset -p 'date.2026-06-03.tar.gz'
+llm-perf convert-trace date.2026-06-03.tar.gz --max-context 131072 \
+    --from 2026-06-03T00:00:00Z --to 2026-06-04T00:00:00Z -o trace.jsonl
 ```
+
+`convert-trace` writes one JSON object per session, sorted by start. Each call
+carries `prompt`, `completion` and `cached` token counts from the source,
+`gap_ms` (idle time since the previous call ended), and `reuse`: how many
+leading tokens of the previous call's prompt and completion this prompt
+repeats. The source's `timestamp` is a call's end time; start is computed as
+`timestamp - duration_ms`. When the source reports zero cached tokens after an
+idle gap of at least `--cache-ttl-secs` (default 300), `reuse` is estimated as
+`--evicted-reuse-ratio` (default 0.98) times the smaller of the two prompts and
+the call is marked `reuse_inferred`. Partition files include calls from
+sessions that began weeks earlier; use `--from`/`--to` to bound the window.
 
 ### Configuration
 

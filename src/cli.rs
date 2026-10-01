@@ -97,6 +97,38 @@ pub enum Command {
         /// Path to output JSONL file
         output: PathBuf,
     },
+    /// Convert a coding-agent session trace (Azure public dataset,
+    /// GitHubCopilotCodingAgentDataset2026) into a per-session replay trace
+    ConvertTrace {
+        /// Input files or directories: per-day .tar.gz archives, .jsonl.gz or
+        /// .jsonl shards. Directories are searched recursively.
+        #[arg(required = true)]
+        inputs: Vec<PathBuf>,
+        /// Output JSONL file (writes to stdout if omitted)
+        #[arg(short, long)]
+        output: Option<PathBuf>,
+        /// Keep only sessions whose calls all use this model label (repeatable)
+        #[arg(long = "model")]
+        models: Vec<String>,
+        /// Drop sessions with any call whose prompt + completion tokens exceed this
+        #[arg(long)]
+        max_context: Option<u64>,
+        /// Idle gap in seconds after which a zero cache hit is treated as eviction
+        #[arg(long, default_value_t = 300)]
+        cache_ttl_secs: u64,
+        /// Fraction of the previous prompt assumed reused after eviction
+        #[arg(long, default_value_t = 0.98)]
+        evicted_reuse_ratio: f64,
+        /// Keep only sessions starting at or after this RFC 3339 time
+        #[arg(long)]
+        from: Option<chrono::DateTime<chrono::Utc>>,
+        /// Keep only sessions starting before this RFC 3339 time
+        #[arg(long)]
+        to: Option<chrono::DateTime<chrono::Utc>>,
+        /// Worker threads (defaults to the number of CPUs)
+        #[arg(long)]
+        threads: Option<usize>,
+    },
 }
 
 impl Cli {
@@ -115,6 +147,7 @@ impl Cli {
                     | "kl-divergence"
                     | "mmlu-pro"
                     | "generate-prompts"
+                    | "convert-trace"
                     | "help"
                     | "--help"
                     | "-h"

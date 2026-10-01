@@ -51,7 +51,7 @@ cargo clippy
 - `Cargo.toml` - Project manifest with dependencies (two binaries: llm-perf, mmlu-pro)
 - `src/main.rs` - Entry point, CLI dispatch, tokio runtime and logging setup
 - `src/lib.rs` - Library root that exports public modules
-- `src/cli.rs` - Command-line interface using clap (bench, logprobs, kl-divergence subcommands)
+- `src/cli.rs` - Command-line interface using clap (bench, logprobs, kl-divergence, mmlu-pro, generate-prompts, convert-trace subcommands)
 - `src/config.rs` - Configuration structures with TOML parsing
 - `src/benchmark.rs` - Core benchmarking engine (concurrent and QPS modes)
 - `src/client.rs` - OpenAI-compatible HTTP client with SSE streaming, retries, model detection
@@ -64,6 +64,7 @@ cargo clippy
 - `src/tokenizer.rs` - Token counting via tiktoken
 - `src/logprobs.rs` - Log probability collection and JSONL writer
 - `src/kl_divergence.rs` - KL divergence computation between logprob captures
+- `src/trace.rs` - `convert-trace`: coding-agent session dataset to per-session replay trace
 - `src/mmlu_pro/` - MMLU-Pro accuracy evaluation binary
 - `examples/config.example.toml` - Comprehensive configuration reference
 

@@ -29,6 +29,35 @@ fn main() -> Result<()> {
             ref config,
             ref output,
         } => run_generate_prompts(config, output),
+        Command::ConvertTrace {
+            ref inputs,
+            ref output,
+            ref models,
+            max_context,
+            cache_ttl_secs,
+            evicted_reuse_ratio,
+            from,
+            to,
+            threads,
+        } => {
+            if !(0.0..=1.0).contains(&evicted_reuse_ratio) {
+                anyhow::bail!("--evicted-reuse-ratio must be in [0, 1]");
+            }
+            let opts = llm_perf::trace::ConvertOptions {
+                models: models.clone(),
+                max_context,
+                cache_ttl_ms: cache_ttl_secs.saturating_mul(1000),
+                evicted_reuse_ratio,
+                from,
+                to,
+            };
+            llm_perf::trace::run_convert_trace(
+                inputs,
+                output.as_deref(),
+                &opts,
+                threads.unwrap_or_else(num_cpus::get),
+            )
+        }
     }
 }
 
