@@ -11,17 +11,22 @@
 //! 2026-06-03 partition:
 //!
 //! - An LLM call's `timestamp` is when the call finished. Start is
-//!   `timestamp - duration_ms`; read as a start time, a third of consecutive
-//!   calls within a turn would overlap, read as an end time 0.1% do.
-//! - A session has at most one call in flight, so its calls form one sequence.
+//!   `timestamp - duration_ms`. Read as start times, 34% of consecutive calls
+//!   within a turn overlap; read as end times, 0.1% do.
+//! - In 99.9% of consecutive call pairs the next call starts after the
+//!   previous one ends, so a session's calls are treated as one sequence.
+//!   Overlapping pairs get `gap_ms` 0.
+//! - Timestamps have millisecond resolution, except that 25% of turn-opening
+//!   calls carry a whole-second timestamp. Their start and the adjacent
+//!   `gap_ms` values may be off by up to 1 s.
 //! - `message_metadata` segment lengths change on every call, including the
 //!   system prompt, so they cannot locate the shared prefix. `tokens.cached`
 //!   is used instead.
-//! - After the session has been idle for more than about five minutes the
-//!   source's cache usually reports zero cached tokens, while shorter idle
-//!   gaps keep ~98% of the previous prompt. Zero hits after a long gap are
-//!   treated as the source's eviction, not as the prompt having changed; see
-//!   [`ConvertOptions::cache_ttl_ms`].
+//! - Across turns, 59% of calls after an idle gap of 300 s or more report
+//!   `cached == 0`, against 10% after shorter gaps. After shorter gaps the
+//!   median of `cached / min(previous prompt, prompt)` is 0.977. A call with
+//!   `cached == 0` after a gap of at least [`ConvertOptions::cache_ttl_ms`]
+//!   gets an estimated `reuse`.
 
 use anyhow::{Context, Result, bail};
 use chrono::{DateTime, Utc};
@@ -40,7 +45,7 @@ pub struct TraceSession {
     pub session_id: String,
     /// Start of the session's first call.
     pub start: DateTime<Utc>,
-    /// `start` relative to the earliest session start in the output.
+    /// Milliseconds from the earliest `start` in the output, rounded.
     pub start_ms: u64,
     /// Distinct model labels used by the session's calls.
     pub models: Vec<String>,
@@ -52,25 +57,30 @@ pub struct TraceSession {
 pub struct TraceCall {
     /// Index of the user turn in the source record.
     pub turn: u32,
-    /// "user" for the call that opens a turn, "agent" for the agent loop.
+    /// The source's `initiator_type`, omitted when empty. On 2026-06-03, 93%
+    /// of turn-opening calls are "user".
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub initiator: Option<String>,
-    /// Time from the end of the previous call to the start of this one; 0 for
-    /// the first call of a session.
+    /// Time from the end of the previous kept call to the start of this one.
+    /// It is 0 for the first call and when the two overlap. It includes the
+    /// duration of any dropped call between them (see
+    /// [`ConvertStats::calls_dropped_no_prompt`]).
     pub gap_ms: u64,
     pub prompt: u64,
     pub completion: u64,
     /// Cached prompt tokens as reported by the source.
     pub cached: u64,
-    /// Leading tokens this prompt repeats from the previous call's prompt
-    /// followed by its completion. 0 for the first call; prefix shared across
-    /// sessions shows only in `cached`.
+    /// `min(cached, previous prompt + previous completion, prompt)`, or an
+    /// estimate when `reuse_inferred`. Tokens beyond the previous prompt come
+    /// from the previous completion, so a replayer must cap `reuse` at the
+    /// previous prompt plus the response it actually received. 0 for the
+    /// first call; a prefix shared across sessions shows only in `cached`.
     pub reuse: u64,
     /// `reuse` was estimated because the source reported no cache hit after
-    /// an idle gap longer than the cache TTL.
+    /// an idle gap of at least [`ConvertOptions::cache_ttl_ms`].
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub reuse_inferred: bool,
-    /// The source's own latency for this call.
+    /// The source's `duration_ms`, rounded to milliseconds.
     pub duration_ms: u64,
 }
 
@@ -84,8 +94,10 @@ pub struct ConvertOptions {
     /// A zero cache hit after an idle gap at least this long is treated as
     /// eviction, and `reuse` is estimated with `evicted_reuse_ratio`.
     pub cache_ttl_ms: u64,
-    /// Fraction of `min(previous prompt, prompt)` assumed reused after
-    /// eviction. 0.98 is the median observed for idle gaps under 300 s.
+    /// Fraction of `min(previous prompt, prompt)` used as the estimated
+    /// reuse. The default, 0.98, is the median of
+    /// `cached / min(previous prompt, prompt)` across turns after idle gaps
+    /// under 300 s on the 2026-06-03 partition (0.977).
     pub evicted_reuse_ratio: f64,
     /// Keep only sessions whose first call starts at or after this time.
     pub from: Option<DateTime<Utc>>,
@@ -115,9 +127,13 @@ pub struct ConvertStats {
     pub sessions_dropped_model: u64,
     pub sessions_dropped_context: u64,
     pub sessions_dropped_window: u64,
+    /// Sessions whose computed start is outside chrono's representable range.
+    pub sessions_dropped_bad_time: u64,
     pub calls_read: u64,
     pub calls_kept: u64,
-    /// Calls with no prompt tokens (failed before reaching the model).
+    /// Calls whose source `tokens.prompt` is missing or 0. These are
+    /// cancelled or failed calls, and successful calls that report no token
+    /// counts.
     pub calls_dropped_no_prompt: u64,
     pub calls_reuse_inferred: u64,
     /// Calls whose `cached` exceeded `min(previous prompt + previous
@@ -133,6 +149,7 @@ impl ConvertStats {
         self.sessions_dropped_model += o.sessions_dropped_model;
         self.sessions_dropped_context += o.sessions_dropped_context;
         self.sessions_dropped_window += o.sessions_dropped_window;
+        self.sessions_dropped_bad_time += o.sessions_dropped_bad_time;
         self.calls_read += o.calls_read;
         self.calls_kept += o.calls_kept;
         self.calls_dropped_no_prompt += o.calls_dropped_no_prompt;
@@ -142,7 +159,8 @@ impl ConvertStats {
 }
 
 // Source records. Only the fields the conversion reads are declared; serde
-// skips the rest (`message_metadata`, `tool_batches`, ids).
+// skips the rest (`message_metadata`, `tool_batches`, ids, and
+// `result`/`status_code`, which no filter uses).
 
 #[derive(Debug, Deserialize)]
 struct RawSession {
@@ -214,7 +232,7 @@ fn flatten(raw: RawSession, stats: &mut ConvertStats) -> (String, Vec<FlatCall>)
             let duration_us = (c.duration_ms.unwrap_or(0.0).max(0.0) * 1000.0).round() as i64;
             calls.push(FlatCall {
                 turn: turn as u32,
-                start_us: c.timestamp.timestamp_micros() - duration_us,
+                start_us: c.timestamp.timestamp_micros().saturating_sub(duration_us),
                 duration_us,
                 initiator: c.initiator_type.filter(|s| !s.is_empty()),
                 model: c.model,
@@ -281,7 +299,10 @@ fn convert_session(
         stats.sessions_dropped_empty += 1;
         return None;
     };
-    let start = DateTime::from_timestamp_micros(first.start_us)?;
+    let Some(start) = DateTime::from_timestamp_micros(first.start_us) else {
+        stats.sessions_dropped_bad_time += 1;
+        return None;
+    };
     if opts.from.is_some_and(|f| start < f) || opts.to.is_some_and(|t| start >= t) {
         stats.sessions_dropped_window += 1;
         return None;
@@ -313,7 +334,8 @@ fn convert_session(
     })
 }
 
-/// A unit of input handed to a worker: one JSONL shard, still compressed.
+/// One JSONL shard as read from disk; `gzipped` says whether `bytes` needs
+/// decompressing.
 struct Shard {
     name: String,
     bytes: Vec<u8>,
@@ -426,9 +448,9 @@ pub fn convert(
     let paths = expand_inputs(inputs)?;
     let threads = threads.max(1);
     let (tx, rx) = sync_channel::<Shard>(threads * 2);
-    let rx: Arc<Mutex<Receiver<Shard>>> = Arc::new(Mutex::new(rx));
 
     let (mut sessions, stats) = std::thread::scope(|s| -> Result<_> {
+        let rx: Arc<Mutex<Receiver<Shard>>> = Arc::new(Mutex::new(rx));
         let workers: Vec<_> = (0..threads)
             .map(|_| {
                 let rx = Arc::clone(&rx);
@@ -446,10 +468,12 @@ pub fn convert(
                 })
             })
             .collect();
+        drop(rx);
 
-        // Each worker returns on its first error, so a send fails only once
-        // every worker has exited; the joins below report the worker's error
-        // ahead of the read error.
+        // The workers hold the only references to the receiver. A worker
+        // returns on its first error, so once every worker has returned,
+        // `send` fails and the reader stops. The joins below report a
+        // worker's error ahead of the read error.
         let read = read_shards(&paths, |shard| {
             tx.send(shard)
                 .map_err(|_| anyhow::anyhow!("all workers exited"))
@@ -474,7 +498,8 @@ pub fn convert(
     });
     if let Some(t0) = sessions.first().map(|s| s.start) {
         for s in &mut sessions {
-            s.start_ms = (s.start - t0).num_milliseconds() as u64;
+            let us = (s.start - t0).num_microseconds().unwrap_or(i64::MAX);
+            s.start_ms = (us as f64 / 1000.0).round() as u64;
         }
     }
     Ok((sessions, stats))
@@ -510,13 +535,14 @@ pub fn run_convert_trace(
         .map(|s| s.start_ms as f64 / 1000.0)
         .unwrap_or(0.0);
     eprintln!(
-        "sessions: read {} kept {} (dropped: empty {}, model {}, context {}, window {})",
+        "sessions: read {} kept {} (dropped: empty {}, model {}, context {}, window {}, bad time {})",
         stats.sessions_read,
         stats.sessions_kept,
         stats.sessions_dropped_empty,
         stats.sessions_dropped_model,
         stats.sessions_dropped_context,
         stats.sessions_dropped_window,
+        stats.sessions_dropped_bad_time,
     );
     eprintln!(
         "calls: read {} kept {} (no prompt {}); reuse inferred {}, clamped {}",
@@ -569,7 +595,7 @@ mod tests {
     }
 
     #[test]
-    fn fixture_reuse_follows_cached_within_ttl() {
+    fn fixture_reuse_follows_cached_and_infers_after_idle() {
         let mut stats = ConvertStats::default();
         let s = convert_session(fixture(), &ConvertOptions::default(), &mut stats).unwrap();
         let reuse: Vec<u64> = s.calls.iter().map(|c| c.reuse).collect();
@@ -604,6 +630,76 @@ mod tests {
     }
 
     #[test]
+    fn overlapping_calls_get_zero_gap() {
+        let calls = [call(0, 3000, 5000, 0), call(2000, 1000, 6000, 4000)];
+        let mut stats = ConvertStats::default();
+        let out = derive_calls(&calls, &ConvertOptions::default(), &mut stats);
+        assert_eq!(out[1].gap_ms, 0);
+        assert_eq!(out[1].reuse, 4000);
+    }
+
+    #[test]
+    fn first_call_reuse_is_zero_even_when_cached() {
+        let calls = [call(0, 1000, 5000, 4000)];
+        let mut stats = ConvertStats::default();
+        let out = derive_calls(&calls, &ConvertOptions::default(), &mut stats);
+        assert_eq!(out[0].cached, 4000);
+        assert_eq!(out[0].reuse, 0);
+        assert!(!out[0].reuse_inferred);
+    }
+
+    #[test]
+    fn dropped_call_duration_folds_into_next_gap() {
+        // Null the second call's prompt; call 3 then follows call 1.
+        let mut raw: serde_json::Value = serde_json::from_str(FIXTURE).unwrap();
+        raw["turns"][0]["llm_calls"][1]["tokens"]["prompt"] = serde_json::Value::Null;
+        let raw: RawSession = serde_json::from_value(raw).unwrap();
+        let mut stats = ConvertStats::default();
+        let s = convert_session(raw, &ConvertOptions::default(), &mut stats).unwrap();
+        assert_eq!(stats.calls_dropped_no_prompt, 1);
+        assert_eq!(s.calls.len(), 5);
+        // Call 3 ends 06:23:38.065 after 2394.2392 ms: start 06:23:35.670761,
+        // 5670.761 ms after call 1 ended at 06:23:30.000.
+        assert_eq!(s.calls[1].gap_ms, 5671);
+    }
+
+    #[test]
+    fn cli_parses_convert_trace_options() {
+        use crate::cli::{Cli, Command};
+        use clap::Parser;
+        let cli = Cli::try_parse_from([
+            "llm-perf",
+            "convert-trace",
+            "day.tar.gz",
+            "--model",
+            "Model E",
+            "--model",
+            "Model A",
+            "--from",
+            "2026-06-03T00:00:00Z",
+            "--max-context",
+            "131072",
+        ])
+        .unwrap();
+        let Command::ConvertTrace {
+            inputs,
+            models,
+            from,
+            max_context,
+            cache_ttl_secs,
+            ..
+        } = cli.command
+        else {
+            panic!("wrong subcommand");
+        };
+        assert_eq!(inputs, vec![PathBuf::from("day.tar.gz")]);
+        assert_eq!(models, vec!["Model E".to_string(), "Model A".to_string()]);
+        assert_eq!(from.unwrap().to_rfc3339(), "2026-06-03T00:00:00+00:00");
+        assert_eq!(max_context, Some(131_072));
+        assert_eq!(cache_ttl_secs, 300);
+    }
+
+    #[test]
     fn filters_drop_sessions() {
         let opts = ConvertOptions {
             models: vec!["Model A".into()],
@@ -632,6 +728,19 @@ mod tests {
         };
         assert!(convert_session(fixture(), &opts, &mut stats).is_none());
         assert_eq!(stats.sessions_dropped_window, 1);
+
+        // `to` is exclusive: a session starting exactly at `to` is dropped.
+        let opts = ConvertOptions {
+            to: Some("2026-06-03T06:23:23.501825Z".parse().unwrap()),
+            ..Default::default()
+        };
+        assert!(convert_session(fixture(), &opts, &mut stats).is_none());
+        assert_eq!(stats.sessions_dropped_window, 2);
+        let opts = ConvertOptions {
+            to: Some("2026-06-03T06:23:23.501826Z".parse().unwrap()),
+            ..Default::default()
+        };
+        assert!(convert_session(fixture(), &opts, &mut stats).is_some());
     }
 
     #[test]
@@ -642,7 +751,14 @@ mod tests {
         {
             let mut e = flate2::write::GzEncoder::new(&mut gz, flate2::Compression::fast());
             writeln!(e, "{line}").unwrap();
-            writeln!(e, "{}", line.replace("439cf5fc", "00000000")).unwrap();
+            // Second session: the first turn moved one hour later.
+            writeln!(
+                e,
+                "{}",
+                line.replace("439cf5fc", "00000000")
+                    .replace("2026-06-03T06:", "2026-06-03T07:")
+            )
+            .unwrap();
         }
         let shard = dir.path().join("shard-0000.jsonl.gz");
         std::fs::write(&shard, &gz).unwrap();
@@ -666,7 +782,9 @@ mod tests {
             convert(&[dir.path().to_path_buf()], &ConvertOptions::default(), 2).unwrap();
         assert_eq!(stats.sessions_read, 4);
         assert_eq!(sessions.len(), 4);
-        assert!(sessions.iter().all(|s| s.start_ms == 0));
+        let starts: Vec<u64> = sessions.iter().map(|s| s.start_ms).collect();
+        assert_eq!(starts, vec![0, 0, 3_600_000, 3_600_000]);
+        assert!(sessions[2].session_id.starts_with("00000000"));
 
         let out = dir.path().join("trace.jsonl");
         write_trace(&sessions, Some(&out)).unwrap();
@@ -676,6 +794,31 @@ mod tests {
             .map(|l| serde_json::from_str(l).unwrap())
             .collect();
         assert_eq!(back, sessions);
+    }
+
+    #[test]
+    fn a_failing_worker_does_not_block_the_reader() {
+        // One worker fails on the first shard; the remaining shards exceed
+        // the channel's capacity of 2 * threads.
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("a0.jsonl"), "{\"turns\": []}\n").unwrap();
+        for i in 1..=6 {
+            std::fs::write(
+                dir.path().join(format!("a{i}.jsonl")),
+                "{\"session_id\":\"x\",\"turns\":[]}\n",
+            )
+            .unwrap();
+        }
+        let (tx, rx) = std::sync::mpsc::channel();
+        let p = dir.path().to_path_buf();
+        std::thread::spawn(move || {
+            let _ = tx.send(convert(&[p], &ConvertOptions::default(), 1).is_err());
+        });
+        assert_eq!(
+            rx.recv_timeout(std::time::Duration::from_secs(10)),
+            Ok(true),
+            "convert hung or succeeded"
+        );
     }
 
     #[test]

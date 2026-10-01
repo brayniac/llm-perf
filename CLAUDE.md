@@ -70,7 +70,7 @@ cargo clippy
 
 ## Key Architecture Decisions
 
-1. **Configuration-driven**: All settings come from TOML config file, no CLI overrides
+1. **Configuration-driven**: Benchmark settings come from the TOML config file; `mmlu-pro` accepts CLI overrides, and the utility subcommands (`kl-divergence`, `convert-trace`) take CLI arguments
 2. **Async runtime**: Uses Tokio with configurable worker threads
 3. **OpenAI-compatible**: Focuses on `/v1/chat/completions` endpoint
 4. **Logging**: Uses ringlog with async ring buffer

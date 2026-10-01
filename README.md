@@ -154,14 +154,26 @@ llm-perf convert-trace date.2026-06-03.tar.gz --max-context 131072 \
 
 `convert-trace` writes one JSON object per session, sorted by start. Each call
 carries `prompt`, `completion` and `cached` token counts from the source,
-`gap_ms` (idle time since the previous call ended), and `reuse`: how many
-leading tokens of the previous call's prompt and completion this prompt
-repeats. The source's `timestamp` is a call's end time; start is computed as
+`gap_ms` (idle time since the previous call ended), and `reuse`: the number of
+leading tokens taken to repeat the previous call's prompt and completion. It is
+derived from `cached` and capped at the previous prompt plus completion; the
+stats line on stderr reports how many calls were capped. The source's
+`timestamp` is a call's end time; start is computed as
 `timestamp - duration_ms`. When the source reports zero cached tokens after an
 idle gap of at least `--cache-ttl-secs` (default 300), `reuse` is estimated as
 `--evicted-reuse-ratio` (default 0.98) times the smaller of the two prompts and
-the call is marked `reuse_inferred`. Partition files include calls from
-sessions that began weeks earlier; use `--from`/`--to` to bound the window.
+the call is marked `reuse_inferred`.
+
+Calls whose `tokens.prompt` is missing or 0 are dropped, and their duration
+becomes part of the next call's `gap_ms`. `--model` keeps a session only if
+every call's model label is listed; a call with no label fails the filter.
+`--max-context` drops a session if any call's prompt plus completion exceeds
+the limit. `--from` is inclusive and `--to` exclusive, both compared with the
+session's first call start.
+
+Without `--from`/`--to`, one partition's session starts can span about 90
+days. All kept sessions are held in memory before sorting, about 220 MB per day
+of input.
 
 ### Configuration
 

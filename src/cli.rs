@@ -107,22 +107,26 @@ pub enum Command {
         /// Output JSONL file (writes to stdout if omitted)
         #[arg(short, long)]
         output: Option<PathBuf>,
-        /// Keep only sessions whose calls all use this model label (repeatable)
+        /// Keep only sessions in which every call's model label (e.g. "Model E")
+        /// is one of these; repeatable
         #[arg(long = "model")]
         models: Vec<String>,
         /// Drop sessions with any call whose prompt + completion tokens exceed this
         #[arg(long)]
         max_context: Option<u64>,
-        /// Idle gap in seconds after which a zero cache hit is treated as eviction
+        /// Idle gap in seconds at or above which a call reporting zero cached
+        /// tokens gets an estimated reuse
         #[arg(long, default_value_t = 300)]
         cache_ttl_secs: u64,
-        /// Fraction of the previous prompt assumed reused after eviction
+        /// Fraction of min(previous prompt, prompt) used as the estimated reuse
         #[arg(long, default_value_t = 0.98)]
         evicted_reuse_ratio: f64,
         /// Keep only sessions starting at or after this RFC 3339 time
+        /// (e.g. 2026-06-03T00:00:00Z)
         #[arg(long)]
         from: Option<chrono::DateTime<chrono::Utc>>,
         /// Keep only sessions starting before this RFC 3339 time
+        /// (e.g. 2026-06-04T00:00:00Z)
         #[arg(long)]
         to: Option<chrono::DateTime<chrono::Utc>>,
         /// Worker threads (defaults to the number of CPUs)
