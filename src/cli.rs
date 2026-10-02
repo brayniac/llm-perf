@@ -97,6 +97,44 @@ pub enum Command {
         /// Path to output JSONL file
         output: PathBuf,
     },
+    /// Convert a coding-agent session trace (Azure public dataset,
+    /// GitHubCopilotCodingAgentDataset2026) into a per-session replay trace
+    ConvertTrace {
+        /// Input files or directories: per-day .tar.gz archives, .jsonl.gz or
+        /// .jsonl shards. Directories are searched recursively.
+        #[arg(required = true)]
+        inputs: Vec<PathBuf>,
+        /// Output JSONL file (writes to stdout if omitted)
+        #[arg(short, long)]
+        output: Option<PathBuf>,
+        /// Keep only sessions in which every call's model label (e.g. "Model E")
+        /// is one of these; repeatable
+        #[arg(long = "model")]
+        models: Vec<String>,
+        /// Drop sessions with any call whose prompt + completion tokens exceed this
+        #[arg(long)]
+        max_context: Option<u64>,
+        /// Idle gap in seconds at or above which a call whose cached tokens
+        /// fall below the --evicted-reuse-ratio estimate gets the estimate as
+        /// its reuse. 0 applies this to every call after the first
+        #[arg(long, default_value_t = 300)]
+        cache_ttl_secs: u64,
+        /// Fraction of min(previous prompt, prompt) used as the estimated
+        /// reuse. Must be in [0, 1]; 0 disables the estimate
+        #[arg(long, default_value_t = 0.98)]
+        evicted_reuse_ratio: f64,
+        /// Keep only sessions starting at or after this RFC 3339 time
+        /// (e.g. 2026-06-03T00:00:00Z)
+        #[arg(long)]
+        from: Option<chrono::DateTime<chrono::Utc>>,
+        /// Keep only sessions starting before this RFC 3339 time
+        /// (e.g. 2026-06-04T00:00:00Z)
+        #[arg(long)]
+        to: Option<chrono::DateTime<chrono::Utc>>,
+        /// Worker threads (defaults to the number of CPUs)
+        #[arg(long)]
+        threads: Option<usize>,
+    },
 }
 
 impl Cli {
@@ -115,6 +153,7 @@ impl Cli {
                     | "kl-divergence"
                     | "mmlu-pro"
                     | "generate-prompts"
+                    | "convert-trace"
                     | "help"
                     | "--help"
                     | "-h"

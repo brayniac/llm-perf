@@ -6,7 +6,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 `llm-perf` is a benchmarking tool for OpenAI-compatible LLM servers. It's designed to measure performance characteristics of local LLM inference servers like llama-server, vLLM, TGI, etc. The project uses Rust edition 2024 with async/await via Tokio.
 
-Also includes `mmlu-pro`, a separate binary for MMLU-Pro accuracy evaluation.
+Also includes an `mmlu-pro` subcommand for MMLU-Pro accuracy evaluation.
 
 ## Common Development Commands
 
@@ -48,10 +48,10 @@ cargo clippy
 
 ## Project Structure
 
-- `Cargo.toml` - Project manifest with dependencies (two binaries: llm-perf, mmlu-pro)
+- `Cargo.toml` - Project manifest with dependencies (one binary, llm-perf)
 - `src/main.rs` - Entry point, CLI dispatch, tokio runtime and logging setup
 - `src/lib.rs` - Library root that exports public modules
-- `src/cli.rs` - Command-line interface using clap (bench, logprobs, kl-divergence subcommands)
+- `src/cli.rs` - Command-line interface using clap (bench, logprobs, kl-divergence, mmlu-pro, generate-prompts, convert-trace subcommands)
 - `src/config.rs` - Configuration structures with TOML parsing
 - `src/benchmark.rs` - Core benchmarking engine (concurrent and QPS modes)
 - `src/client.rs` - OpenAI-compatible HTTP client with SSE streaming, retries, model detection
@@ -64,12 +64,13 @@ cargo clippy
 - `src/tokenizer.rs` - Token counting via tiktoken
 - `src/logprobs.rs` - Log probability collection and JSONL writer
 - `src/kl_divergence.rs` - KL divergence computation between logprob captures
-- `src/mmlu_pro/` - MMLU-Pro accuracy evaluation binary
+- `src/trace.rs` - `convert-trace`: coding-agent session dataset to per-session replay trace
+- `src/mmlu_pro/` - MMLU-Pro accuracy evaluation (`mmlu-pro` subcommand)
 - `examples/config.example.toml` - Comprehensive configuration reference
 
 ## Key Architecture Decisions
 
-1. **Configuration-driven**: All settings come from TOML config file, no CLI overrides
+1. **Configuration-driven**: Benchmark settings come from the TOML config file; `mmlu-pro` accepts CLI overrides, and the utility subcommands (`kl-divergence`, `convert-trace`) take CLI arguments
 2. **Async runtime**: Uses Tokio with configurable worker threads
 3. **OpenAI-compatible**: Focuses on `/v1/chat/completions` endpoint
 4. **Logging**: Uses ringlog with async ring buffer

@@ -26,6 +26,7 @@ A high-performance benchmarking tool for OpenAI-compatible LLM inference servers
 - **`bench`** (default) - Run load benchmarks against an LLM server
 - **`logprobs`** - Collect token-level log probabilities sequentially (one request at a time to avoid GPU batching effects on distributions)
 - **`kl-divergence`** - Compare token probability distributions between two logprob captures (e.g., baseline FP16 vs quantized model)
+- **`convert-trace`** - Convert the coding-agent session dataset from [Azure/AzurePublicDataset](https://github.com/Azure/AzurePublicDataset/blob/master/GitHubCopilotCodingAgentDataset2026.md) into a per-session replay trace
 
 ### Performance Metrics
 
@@ -143,7 +144,53 @@ llm-perf logprobs my-config.toml
 # Compare two logprob captures
 llm-perf kl-divergence baseline.jsonl candidate.jsonl
 llm-perf kl-divergence baseline.jsonl candidate.jsonl --format json --output report.json
+
+# Convert one day of the coding-agent dataset, keeping sessions that fit 128K
+# context and start on that day
+gh release download ghcp-coding-agent-2026 -R Azure/AzurePublicDataset -p 'date.2026-06-03.tar.gz'
+llm-perf convert-trace date.2026-06-03.tar.gz --max-context 131072 \
+    --from 2026-06-03T00:00:00Z --to 2026-06-04T00:00:00Z -o trace.jsonl
 ```
+
+`convert-trace` writes one JSON object per session, sorted by start. A session
+carries `session_id`, `start` (RFC 3339), `start_ms` (milliseconds from the
+earliest `start` in the output), `models` (distinct labels) and `calls`. Each
+call carries:
+
+- `turn`: index of the user turn in the source record
+- `initiator`: the source's `initiator_type` (`user` or `agent`), when present
+- `model`: the call's model label, so a replayer can see where a session
+  switches model
+- `prompt`, `completion`, `cached`: token counts from the source
+- `gap_ms`: idle time from the end of the previous call to the start of this
+  one
+- `reuse`: how many leading tokens of this prompt repeat the previous call's
+  prompt followed by its completion
+- `reuse_inferred`: present and `true` when `reuse` is an estimate
+- `duration_ms`: the source's latency for the call
+
+`reuse` is derived from `cached` and capped at the previous prompt plus
+completion; the stats line on stderr reports how many calls were capped. The
+source's `timestamp` is a call's end time; start is computed as
+`timestamp - duration_ms`. After an idle gap of at least `--cache-ttl-secs`
+(default 300), a call whose `cached` is below `--evicted-reuse-ratio` (default
+0.98) times the smaller of the two prompts gets that estimate as its `reuse`
+and is marked `reuse_inferred`. A ratio of 0 disables the estimate; a TTL of 0
+applies it to every call after the first.
+
+Calls whose `tokens.prompt` is missing or 0 are dropped, and their duration
+becomes part of the next call's `gap_ms`. `--model` keeps a session only if
+every kept call's model label is listed; a call with no label fails the
+filter. `--max-context` drops a session if any call's prompt plus completion
+exceeds the limit. `--from` is inclusive and `--to` exclusive, both compared
+with the start of the session's first kept call. A `session_id` that appears
+more than once across the inputs is an error that names both files; this
+catches passing a tarball together with its extracted directory.
+
+Without `--from`/`--to`, one partition's session starts can span several
+months (59 to 127 days for 2026-06-02 to 2026-06-04). All kept sessions are
+held in memory before sorting. Peak resident memory was about 0.72 GB for one
+day of input and 1.4 GB for three days.
 
 ### Configuration
 
