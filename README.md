@@ -231,7 +231,10 @@ prefixes the server evicted.
 
 Replay requires `endpoint.max_retries = 0` and no `endpoint.max_tokens`, and
 accepts only `duration_seconds` and `warmup_duration` from `[load]`. Every
-selected call must fit the server's per-slot context, read from `/props`.
+selected call must fit the server's per-slot context, read from `/props`. The
+run fails if a response reports no `usage.prompt_tokens_details`, since reuse
+cannot be measured without the server's cached token count. The summary
+reports the server's `build_info`.
 Filler is fixed by `seed`, the session id and the call index, so a second run
 against a server that still holds the first run's prompts gets cache hits on
 first calls; restart the server or change `seed` between runs.
