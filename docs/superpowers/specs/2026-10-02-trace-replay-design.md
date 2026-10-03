@@ -94,12 +94,13 @@ From the 2026-06-03 partition converted with `--from`/`--to` for that day
 
 A top-level `[replay]` section selects replay. With it, `[input]` is rejected
 and `[load]` is optional; of `[load]`, only `duration_seconds` and
-`warmup_duration` are accepted. This makes `Config.input` an
-`Option<InputConfig>` (32 call sites in `src/benchmark.rs`, `src/main.rs` and
-`src/report.rs`) and `Config.load` optional, and turns the `[load]` fields with
-serde defaults (`concurrent_requests`, `arrival_distribution`) into `Option` so
-an explicit value can be rejected. `Config::validate` requires
-`total_requests` or `duration_seconds` only when `[replay]` is absent.
+`warmup_duration` are accepted. `Config.input` is an `Option<InputConfig>`, and
+`Config.load` takes its defaults when the section is absent. Because `[load]`'s
+fields have serde defaults, `Config::from_toml` checks the keys present in the
+raw `[load]` table rather than the deserialized values. `Config::validate`
+requires `total_requests` or `duration_seconds` only when `[replay]` is absent.
+`[saturation]`, `[logprobs]`, `[conversation]` and `[metrics]` are rejected
+with `[replay]`.
 
 ```toml
 [replay]
@@ -110,10 +111,16 @@ speedup = 24.0            # divides session start offsets and gaps; > 0
 max_gap_ms = 300000       # optional cap on a gap after speedup; unset = no cap
 seed = 1                  # filler text seed
 system_prompt_tokens = 0  # optional system prompt shared by every session
+log = "replay.jsonl"      # optional per-call log
 ```
 
 Replay rejects `endpoint.max_tokens` and `endpoint.max_retries > 0` (a retry
-resends a prompt the server may already have cached). Each call sends
+resends a prompt the server may already have cached). Generation requests use
+a client that neither retries nor reuses an idle connection: llama-server can
+close a kept-alive connection just as the client reuses it, which fails the
+request with "connection closed before message completed". Render, tokenize
+and detokenize requests are idempotent and use a pooled client that retries.
+Each call sends
 `max_tokens = max(completion, 1)` and `ignore_eos = true` and logs
 `finish_reason`; a call whose `completion_tokens < max_tokens` is counted as
 EOS not ignored.
@@ -194,20 +201,34 @@ For call `n`:
    the cut are dropped. A message that straddles the cut is cut at a token
    boundary of its content. A cut that falls in a message's template tokens
    keeps that message whole without content.
-3. Append one user message of new filler so the rendered prompt reaches
-   `prompt` tokens. When `prompt - reuse` is smaller than one message's
-   template tokens plus one (12% of non-first calls have `prompt == reuse`),
-   the new message has one filler token, the prompt overshoots `prompt`, and
-   the call is flagged `overshoot` in the log.
+3. Add filler so the rendered prompt reaches `prompt` tokens: on the end of
+   the last kept message when it is a user message, otherwise in a new user
+   message. The size is measured by rendering, and corrected once. A new
+   message needs at least one filler word, so when the kept part plus one
+   message already exceeds `prompt` (12% of non-first calls have
+   `prompt == reuse`, and most of those end on the previous reply), the prompt
+   overshoots and the call is flagged `overshoot` in the log.
 4. Render and tokenize the result. `expected_reuse` is the length of its
    common token prefix with call `n-1`'s rendered prompt followed by the
    tokenized reply.
 
 If `reuse` exceeds call `n-1`'s rendered prompt plus the tokenized reply, all
-of it is kept and the difference is logged as `shortfall`.
+of it is kept and the difference is logged as `shortfall`. Re-tokenizing a
+reply's text can give fewer tokens than were generated (91 for a 92-token
+reply in one Llama 3.1 call), so a call that keeps the whole reply can show a
+shortfall of a token or two.
+
+`expected_reuse` never falls below the template's fixed preamble. On Llama 3.1
+without a system message that is 30 tokens (BOS, the system header and its
+date lines), so a call whose traced `reuse` is 0 still shares and has cached
+those 30 tokens.
 
 The first call of a session is the optional shared system prompt plus one user
-message of filler.
+message of filler. The system prompt is kept whole in every call.
+
+Filler is deterministic for a given `seed`, so a second run against a server
+that still holds the first run's prompts gets cache hits on first calls.
+Restart the server or change `seed` between runs.
 
 ### Filler
 
@@ -231,21 +252,28 @@ exceeds 0.01.
 
 ## Metrics and output
 
-Per call, appended to a JSONL file:
+Per call, appended to `replay.log` when set:
 
-`session_id`, `call`, `model` (trace label), `scheduled_ms`, `sent_ms`, `overshoot`,
-`lag_ms`, `gap_capped`, `target_prompt`, `prompt_tokens`, `reuse` (trace),
-`reuse_inferred`, `expected_reuse`, `shortfall`, `cached_tokens`,
-`completion_tokens`, `finish_reason`, `ttft_ms`, `e2e_ms`, `error`.
+`session_id`, `call`, `model` (trace label), `scheduled_ms`, `sent_ms`,
+`lag_ms`, `gap_capped`, `warmup`, `target_prompt`, `prompt_tokens`,
+`overshoot`, `reuse` (trace), `reuse_inferred`, `expected_reuse`, `shortfall`,
+`cached_tokens`, `max_tokens`, `completion_tokens`, `finish_reason`,
+`ttft_ms`, `e2e_ms`, `error`.
 
 Aggregates, named like the existing metrics in `src/metrics.rs`:
 
-- `replay_reuse_expected` and `replay_reuse_cached` counters;
+- `replay_reuse` counter group, `kind` = `expected` or `cached`;
 - `replay_reuse_permille` histogram of `1000 * cached / expected` for calls
   with `expected_reuse > 0`;
-- prefill tokens computed (`prompt_tokens - cached_tokens`);
-- the existing `schedule_slip`, `cache`, `ttft_by_cache`, TTFT, ITL and
-  end-to-end metrics.
+- `replay_sessions` counter group, `status` = `started`, `completed`,
+  `failed` or `truncated`;
+- `schedule_slip` records `lag_ms`;
+- the existing request, token, TTFT, ITL, TPOT and latency metrics.
+
+The run ends with a summary (console or JSON per `output.format`): session
+outcomes, call counts, expected and cached reuse totals, prefill tokens
+computed (`prompt_tokens - cached_tokens`), percentiles of cached/expected,
+`lag_ms` and TTFT, and the median prompt size error.
 
 The log is the primary output. The aggregates are for reading a run without
 post-processing.

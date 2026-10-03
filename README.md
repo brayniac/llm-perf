@@ -192,6 +192,48 @@ months (59 to 127 days for 2026-06-02 to 2026-06-04). All kept sessions are
 held in memory before sorting. Peak resident memory was about 0.72 GB for one
 day of input and 1.4 GB for three days.
 
+### Trace replay
+
+A `[replay]` section in a bench config replays the sessions in a
+`convert-trace` file against llama-server, instead of drawing requests from
+`[input]`. See `examples/scenarios/trace-replay.toml`.
+
+```bash
+llm-perf bench examples/scenarios/trace-replay.toml
+```
+
+Each session starts at its traced start time divided by `speedup`, and each
+call is sent at its scaled time on the source timeline, never before the
+previous call of the session has finished. Each prompt repeats the previous
+call's messages and the server's actual reply, cut to the traced `reuse` in
+tokens, and adds filler words to reach the traced `prompt` size. Each call asks
+for the traced `completion` length with `ignore_eos`. Sizes and cut points are
+measured with the server's `/apply-template` and `/tokenize`, so replay needs
+llama-server.
+
+The per-call log (`replay.log`) records, among other fields:
+
+- `expected_reuse`: tokens the prompt shares with the previous rendered prompt
+  followed by the tokenized reply
+- `cached_tokens`: cached prompt tokens the server reported
+- `lag_ms`: how far the call was sent behind its scaled source time
+- `overshoot`: the prompt is longer than traced, because the call adds fewer
+  tokens than a new message needs
+- `shortfall`: reuse the replay could not provide, because the traced reply
+  was longer than the server's
+
+On a dense-attention model with sessions replayed one at a time,
+`expected_reuse - cached_tokens` is 0, or 1 when the whole previous reply is
+kept, because the last generated token is never computed. With concurrent
+sessions, the difference is what the server evicted.
+
+Replay requires `endpoint.max_retries = 0` and no `endpoint.max_tokens`, and
+accepts only `duration_seconds` and `warmup_duration` from `[load]`. Every
+selected call must fit the server's per-slot context, read from `/props`.
+Filler depends only on `seed`, so a second run against a server that still holds
+the first run's prompts gets cache hits on first calls; restart the server or
+change `seed` between runs.
+
 ### Configuration
 
 **Use `examples/config.example.toml` as your starting point.** It contains all available options with detailed comments explaining each field.

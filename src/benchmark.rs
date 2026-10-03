@@ -117,7 +117,7 @@ pub(crate) fn compute_bust_prefix(expected_hit: bool, counter: &AtomicU64) -> St
 ///
 /// The window must be measured on the send-relative clock so that decode rate
 /// reflects only generation, never queueing/schedule slip.
-fn decode_tpot(gen_window: Duration, token_count: u64) -> Option<Duration> {
+pub(crate) fn decode_tpot(gen_window: Duration, token_count: u64) -> Option<Duration> {
     // A zero window means we never observed inter-token timing (e.g. the server
     // batched all output into one SSE chunk). Server usage may still report many
     // tokens, but dividing a zero window by that count would record a bogus 0ns
@@ -140,7 +140,7 @@ fn decode_tpot(gen_window: Duration, token_count: u64) -> Option<Duration> {
 /// also reports `reasoning_tokens` we split on it; when it reports only a total for
 /// a stream that did contain reasoning, we can't split it cleanly, so we keep the
 /// per-chunk split rather than mislabel the phases.
-fn effective_output_tokens(
+pub(crate) fn effective_output_tokens(
     server_usage: Option<&crate::client::Usage>,
     chunk_reasoning: u64,
     chunk_content: u64,
@@ -392,6 +392,28 @@ async fn drain_and_settle(target: usize, max_drain: Duration, settle: Duration) 
 }
 
 /// Returns Some(true/false) if the server reported cache details, None otherwise.
+/// The metrics error type for a failed request: the `ClientError` variant
+/// when there is one, else a guess from the message.
+pub(crate) fn classify_error(e: &anyhow::Error) -> ErrorType {
+    if let Some(client_error) = e.downcast_ref::<ClientError>() {
+        match client_error {
+            ClientError::Connection(_) => ErrorType::Connection,
+            ClientError::Http4xx { status, .. } => ErrorType::Http4xx(*status),
+            ClientError::Http5xx { status, .. } => ErrorType::Http5xx(*status),
+            ClientError::Parse(_) => ErrorType::Parse,
+            ClientError::Timeout(_) => ErrorType::Timeout,
+            ClientError::StreamError { .. } => ErrorType::Stream,
+            ClientError::Other(_) => ErrorType::Other,
+        }
+    } else if e.to_string().contains("timeout") {
+        ErrorType::Timeout
+    } else if e.to_string().contains("connection") {
+        ErrorType::Connection
+    } else {
+        ErrorType::Other
+    }
+}
+
 pub(crate) fn actual_cache_hit_option(usage: &crate::client::Usage) -> Option<bool> {
     usage
         .prompt_tokens_details
@@ -2275,23 +2297,7 @@ impl BenchmarkRunner {
                 }
                 Err(e) => {
                     debug!("Conversation {} turn {} failed: {}", index, turn_idx, e);
-                    let error_type = if let Some(client_error) = e.downcast_ref::<ClientError>() {
-                        match client_error {
-                            ClientError::Connection(_) => ErrorType::Connection,
-                            ClientError::Http4xx { status, .. } => ErrorType::Http4xx(*status),
-                            ClientError::Http5xx { status, .. } => ErrorType::Http5xx(*status),
-                            ClientError::Parse(_) => ErrorType::Parse,
-                            ClientError::Timeout(_) => ErrorType::Timeout,
-                            ClientError::StreamError { .. } => ErrorType::Stream,
-                            ClientError::Other(_) => ErrorType::Other,
-                        }
-                    } else if e.to_string().contains("timeout") {
-                        ErrorType::Timeout
-                    } else if e.to_string().contains("connection") {
-                        ErrorType::Connection
-                    } else {
-                        ErrorType::Other
-                    };
+                    let error_type = classify_error(&e);
 
                     guard.complete(RequestStatus::Failed(error_type));
                     conversation_failed = true;
@@ -2512,23 +2518,7 @@ impl BenchmarkRunner {
             }
             Err(e) => {
                 debug!("Request {} failed: {}", index, e);
-                let error_type = if let Some(client_error) = e.downcast_ref::<ClientError>() {
-                    match client_error {
-                        ClientError::Connection(_) => ErrorType::Connection,
-                        ClientError::Http4xx { status, .. } => ErrorType::Http4xx(*status),
-                        ClientError::Http5xx { status, .. } => ErrorType::Http5xx(*status),
-                        ClientError::Parse(_) => ErrorType::Parse,
-                        ClientError::Timeout(_) => ErrorType::Timeout,
-                        ClientError::StreamError { .. } => ErrorType::Stream,
-                        ClientError::Other(_) => ErrorType::Other,
-                    }
-                } else if e.to_string().contains("timeout") {
-                    ErrorType::Timeout
-                } else if e.to_string().contains("connection") {
-                    ErrorType::Connection
-                } else {
-                    ErrorType::Other
-                };
+                let error_type = classify_error(&e);
 
                 guard.complete(RequestStatus::Failed(error_type));
                 Err(e)

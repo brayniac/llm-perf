@@ -99,7 +99,14 @@ fn run_bench_mode(config_path: &std::path::Path) -> Result<()> {
         println!("   Config: {}", config_path.display());
         println!("   Target: {}", config.endpoint.base_url);
 
-        if let Some(ref sat) = config.saturation {
+        if let Some(ref replay) = config.replay {
+            println!(
+                "   Mode: Trace replay ({}, sample {}, speedup {}x)",
+                replay.trace.display(),
+                replay.sample,
+                replay.speedup
+            );
+        } else if let Some(ref sat) = config.saturation {
             println!(
                 "   Mode: Saturation Search (concurrency {}..{}, step {:.1}x, window {})",
                 sat.start_concurrency, sat.max_concurrency, sat.step_multiplier, sat.sample_window,
@@ -145,6 +152,13 @@ async fn run_benchmark(config: Config) -> Result<()> {
         tokio::spawn(async move {
             llm_perf::admin::start_server(addr).await;
         });
+    }
+
+    if config.replay.is_some() {
+        info!("Starting trace replay");
+        llm_perf::replay::runner::run(config).await?;
+        info!("Trace replay completed");
+        return Ok(());
     }
 
     debug!("Initializing benchmark runner");

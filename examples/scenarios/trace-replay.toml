@@ -1,0 +1,25 @@
+# Replay coding-agent sessions from `llm-perf convert-trace` against
+# llama-server. Convert with --max-context set to the server's per-slot
+# context (llama-server -c divided by -np).
+
+[endpoint]
+base_url = "http://localhost:8080/v1"
+timeout = 600
+# Llama 3.1: pin the date the chat template inserts, so prompts do not change
+# at midnight. Qwen3.5: use { enable_thinking = false } instead; replay sends
+# back the reply's content only.
+chat_template_kwargs = { date_string = "26 Jul 2024" }
+
+[load]
+duration_seconds = 3600   # optional; without it the run ends when every session finishes
+warmup_duration = 60      # optional; calls sent in the first 60 s are left out of the summary
+
+[output]
+format = "console"
+
+[replay]
+trace = "trace.jsonl"
+sample = 0.001            # fraction of sessions, chosen by session id; 1.0 replays all
+speedup = 24.0            # divides session start offsets, call durations and gaps
+seed = 1                  # filler text; change it, or restart the server, between runs
+log = "replay.jsonl"      # one line per call: expected reuse, cached tokens, timings
