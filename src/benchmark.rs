@@ -1,4 +1,4 @@
-use anyhow::Result;
+use anyhow::{Context, Result};
 use log::{debug, info, warn};
 use rand::SeedableRng;
 use rand::seq::SliceRandom;
@@ -13,7 +13,7 @@ use tokio::sync::Semaphore;
 use tokio::time::{sleep, timeout};
 
 use crate::client::{ClientError, Message, OpenAIClient};
-use crate::config::{Config, ConversationConfig, resolve_max_tokens};
+use crate::config::{Config, ConversationConfig, InputConfig, resolve_max_tokens};
 use crate::distribution::{RequestDistribution, TurnDelayDistribution};
 use crate::metrics::{ErrorType, InflightGuard, Metrics, RequestStatus};
 use crate::report::ReportBuilder;
@@ -93,6 +93,8 @@ pub enum Workload {
 pub struct BenchmarkRunner {
     client: Arc<OpenAIClient>,
     config: Config,
+    /// `config.input`, which validation guarantees outside replay mode.
+    input: InputConfig,
     workloads: Arc<Vec<Workload>>, // Wrapped in Arc to avoid cloning
     tokenizer: Arc<Tokenizer>,
     system_prompt: Arc<Option<String>>, // Wrapped in Arc to avoid per-request cloning
@@ -430,6 +432,10 @@ impl BenchmarkRunner {
     /// # }
     /// ```
     pub async fn new(mut config: Config) -> Result<Self> {
+        let input = config
+            .input
+            .clone()
+            .context("the benchmark runner requires an [input] section")?;
         // Initialize metrics
         Metrics::init();
 
@@ -483,12 +489,12 @@ impl BenchmarkRunner {
             build_tokenizer(&client, config.endpoint.tokenizer.as_deref(), &model).await?;
 
         // Load or generate workloads
-        let workloads: Vec<Workload> = if config.input.is_synthetic() {
+        let workloads: Vec<Workload> = if input.is_synthetic() {
             // Synthetic mode - generate random prompts
             // Config validation ensures synthetic.is_some() when is_synthetic() is true
-            let synthetic_config = config.input.synthetic.as_ref().unwrap();
-            let sample_size = config.input.sample_size.unwrap_or(10000);
-            let seed = config.input.seed.unwrap_or(42);
+            let synthetic_config = input.synthetic.as_ref().unwrap();
+            let sample_size = input.sample_size.unwrap_or(10000);
+            let seed = input.seed.unwrap_or(42);
 
             info!("Generating {} synthetic workloads", sample_size);
             crate::synthetic::generate_synthetic_workloads(
@@ -500,10 +506,10 @@ impl BenchmarkRunner {
             )?
         } else {
             // File/dataset mode - load from disk or HuggingFace
-            let input_path = crate::dataset::resolve_input(&config.input.file).await?;
+            let input_path = crate::dataset::resolve_input(&input.file).await?;
             let workloads = Self::load_workloads(&input_path).await?;
 
-            match config.input.sample_size {
+            match input.sample_size {
                 Some(sample_size) => {
                     if sample_size > workloads.len() {
                         warn!(
@@ -515,13 +521,13 @@ impl BenchmarkRunner {
                     }
                     // Shuffle the full dataset before sampling so the sample is
                     // representative (a sorted file would otherwise bias it).
-                    let seed = config.input.seed.unwrap_or(42);
+                    let seed = input.seed.unwrap_or(42);
                     sample_workloads(workloads, sample_size, seed)
                 }
                 // No sampling: shuffle the whole set only when a seed is set (preserves
                 // prior file-ordered default when unseeded).
                 None => {
-                    if let Some(seed) = config.input.seed {
+                    if let Some(seed) = input.seed {
                         let mut rng = rand::rngs::StdRng::seed_from_u64(seed);
                         let mut shuffled = workloads;
                         shuffled.shuffle(&mut rng);
@@ -535,7 +541,7 @@ impl BenchmarkRunner {
         };
 
         // Log what we loaded or generated
-        if config.input.is_synthetic() {
+        if input.is_synthetic() {
             info!("Generated {} synthetic prompts", workloads.len());
         } else {
             let (single_count, multi_count) = workloads.iter().fold((0, 0), |(s, m), w| match w {
@@ -554,7 +560,7 @@ impl BenchmarkRunner {
             }
         }
 
-        let system_prompt_text: Option<String> = match &config.input.system_prompt {
+        let system_prompt_text: Option<String> = match &input.system_prompt {
             None => None,
             Some(sp) => {
                 if let Some(ref content) = sp.content {
@@ -571,7 +577,7 @@ impl BenchmarkRunner {
                         }
                     }
                 } else if let Some(tokens) = sp.tokens {
-                    let seed = config.input.seed.unwrap_or(42);
+                    let seed = input.seed.unwrap_or(42);
                     info!("Generating {}-token synthetic system prompt", tokens);
                     Some(crate::synthetic::generate_fixed_text(
                         tokens,
@@ -585,7 +591,7 @@ impl BenchmarkRunner {
         };
         let system_prompt = Arc::new(system_prompt_text);
 
-        let shared_prefix_text: Option<String> = match &config.input.shared_prefix {
+        let shared_prefix_text: Option<String> = match &input.shared_prefix {
             None => None,
             Some(pfx) => {
                 if let Some(ref content) = pfx.content {
@@ -602,7 +608,7 @@ impl BenchmarkRunner {
                         }
                     }
                 } else if let Some(tokens) = pfx.tokens {
-                    let seed = config.input.seed.unwrap_or(42).wrapping_add(1);
+                    let seed = input.seed.unwrap_or(42).wrapping_add(1);
                     info!("Generating {}-token synthetic shared prefix", tokens);
                     Some(crate::synthetic::generate_fixed_text(
                         tokens,
@@ -619,6 +625,7 @@ impl BenchmarkRunner {
         Ok(Self {
             client: Arc::new(client),
             config,
+            input,
             workloads: Arc::new(workloads), // Wrap in Arc
             tokenizer,
             system_prompt, // Arc-wrapped to avoid per-request cloning
@@ -911,7 +918,6 @@ impl BenchmarkRunner {
                 let shared_prefix = Arc::clone(&self.shared_prefix);
                 let miss_counter = Arc::clone(&self.miss_counter);
                 let miss_rate = self
-                    .config
                     .input
                     .shared_prefix
                     .as_ref()
@@ -928,7 +934,7 @@ impl BenchmarkRunner {
                     String::new()
                 };
                 let conversation_cfg = self.config.conversation;
-                let delay_base_seed = self.config.input.seed.unwrap_or(42);
+                let delay_base_seed = self.input.seed.unwrap_or(42);
 
                 let handle = tokio::spawn(async move {
                     let workload = &workloads[workload_idx];
@@ -988,14 +994,13 @@ impl BenchmarkRunner {
                 let shared_prefix = Arc::clone(&self.shared_prefix);
                 let miss_counter = Arc::clone(&self.miss_counter);
                 let miss_rate = self
-                    .config
                     .input
                     .shared_prefix
                     .as_ref()
                     .map(|p| p.miss_rate)
                     .unwrap_or(0.0);
                 let conversation_cfg = self.config.conversation;
-                let delay_base_seed = self.config.input.seed.unwrap_or(42);
+                let delay_base_seed = self.input.seed.unwrap_or(42);
 
                 handles.push(tokio::spawn(async move {
                     loop {
@@ -1060,14 +1065,13 @@ impl BenchmarkRunner {
                     let shared_prefix = Arc::clone(&self.shared_prefix);
                     let miss_counter = Arc::clone(&self.miss_counter);
                     let miss_rate = self
-                        .config
                         .input
                         .shared_prefix
                         .as_ref()
                         .map(|p| p.miss_rate)
                         .unwrap_or(0.0);
                     let conversation_cfg = self.config.conversation;
-                    let delay_base_seed = self.config.input.seed.unwrap_or(42);
+                    let delay_base_seed = self.input.seed.unwrap_or(42);
 
                     let handle = tokio::spawn(async move {
                         while Instant::now() < warmup_deadline {
@@ -1148,14 +1152,13 @@ impl BenchmarkRunner {
                 let shared_prefix = Arc::clone(&self.shared_prefix);
                 let miss_counter = Arc::clone(&self.miss_counter);
                 let miss_rate = self
-                    .config
                     .input
                     .shared_prefix
                     .as_ref()
                     .map(|p| p.miss_rate)
                     .unwrap_or(0.0);
                 let conversation_cfg = self.config.conversation;
-                let delay_base_seed = self.config.input.seed.unwrap_or(42);
+                let delay_base_seed = self.input.seed.unwrap_or(42);
 
                 let handle = tokio::spawn(async move {
                     while !should_stop.load(Ordering::Relaxed) {
@@ -1346,14 +1349,13 @@ impl BenchmarkRunner {
                 let shared_prefix = Arc::clone(&self.shared_prefix);
                 let miss_counter = Arc::clone(&self.miss_counter);
                 let miss_rate = self
-                    .config
                     .input
                     .shared_prefix
                     .as_ref()
                     .map(|p| p.miss_rate)
                     .unwrap_or(0.0);
                 let conversation_cfg = self.config.conversation;
-                let delay_base_seed = self.config.input.seed.unwrap_or(42);
+                let delay_base_seed = self.input.seed.unwrap_or(42);
 
                 let handle = tokio::spawn(async move {
                     while Instant::now() < warmup_deadline {
@@ -1430,14 +1432,13 @@ impl BenchmarkRunner {
             let shared_prefix = Arc::clone(&self.shared_prefix);
             let miss_counter = Arc::clone(&self.miss_counter);
             let miss_rate = self
-                .config
                 .input
                 .shared_prefix
                 .as_ref()
                 .map(|p| p.miss_rate)
                 .unwrap_or(0.0);
             let conversation_cfg = self.config.conversation;
-            let delay_base_seed = self.config.input.seed.unwrap_or(42);
+            let delay_base_seed = self.input.seed.unwrap_or(42);
 
             handles.push(tokio::spawn(async move {
                 loop {
@@ -1567,7 +1568,7 @@ impl BenchmarkRunner {
         let mut distribution = RequestDistribution::new(
             &self.config.load.arrival_distribution,
             qps,
-            self.config.input.seed.unwrap_or(42),
+            self.input.seed.unwrap_or(42),
         );
 
         info!(
@@ -1635,7 +1636,6 @@ impl BenchmarkRunner {
                 let shared_prefix = Arc::clone(&self.shared_prefix);
                 let miss_counter = Arc::clone(&self.miss_counter);
                 let miss_rate = self
-                    .config
                     .input
                     .shared_prefix
                     .as_ref()
@@ -1652,7 +1652,7 @@ impl BenchmarkRunner {
                     String::new()
                 };
                 let conversation_cfg = self.config.conversation;
-                let delay_base_seed = self.config.input.seed.unwrap_or(42);
+                let delay_base_seed = self.input.seed.unwrap_or(42);
 
                 let handle = tokio::spawn(async move {
                     let workload = &workloads[workload_idx];
@@ -1711,7 +1711,6 @@ impl BenchmarkRunner {
                 let shared_prefix = Arc::clone(&self.shared_prefix);
                 let miss_counter = Arc::clone(&self.miss_counter);
                 let miss_rate = self
-                    .config
                     .input
                     .shared_prefix
                     .as_ref()
@@ -1728,7 +1727,7 @@ impl BenchmarkRunner {
                     String::new()
                 };
                 let conversation_cfg = self.config.conversation;
-                let delay_base_seed = self.config.input.seed.unwrap_or(42);
+                let delay_base_seed = self.input.seed.unwrap_or(42);
 
                 let handle = tokio::spawn(async move {
                     let workload = &workloads[workload_idx];
@@ -1852,7 +1851,6 @@ impl BenchmarkRunner {
             let shared_prefix = Arc::clone(&self.shared_prefix);
             let miss_counter = Arc::clone(&self.miss_counter);
             let miss_rate = self
-                .config
                 .input
                 .shared_prefix
                 .as_ref()
@@ -1869,7 +1867,7 @@ impl BenchmarkRunner {
                 String::new()
             };
             let conversation_cfg = self.config.conversation;
-            let delay_base_seed = self.config.input.seed.unwrap_or(42);
+            let delay_base_seed = self.input.seed.unwrap_or(42);
 
             let handle = tokio::spawn(async move {
                 let workload = &workloads[workload_idx];

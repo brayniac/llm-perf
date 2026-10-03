@@ -1,4 +1,4 @@
-use anyhow::Result;
+use anyhow::{Context, Result};
 use llm_perf::cli::Command;
 use llm_perf::{Cli, Config};
 use log::{debug, info, warn};
@@ -383,7 +383,11 @@ async fn run_logprobs_collection(
     })?;
 
     // Load prompts
-    let file = tokio::fs::File::open(&config.input.file).await?;
+    let input = config
+        .input
+        .as_ref()
+        .context("the logprobs subcommand requires an [input] section")?;
+    let file = tokio::fs::File::open(&input.file).await?;
     let reader = tokio::io::BufReader::new(file);
     let mut lines = reader.lines();
     let mut prompts: Vec<Prompt> = Vec::new();
@@ -398,7 +402,7 @@ async fn run_logprobs_collection(
         }
     }
 
-    if let Some(sample_size) = config.input.sample_size {
+    if let Some(sample_size) = input.sample_size {
         prompts.truncate(sample_size);
     }
 
@@ -478,7 +482,11 @@ fn run_generate_prompts(
     let config = Config::load(&config_path.to_path_buf())?;
 
     // Validate that synthetic mode is configured
-    if !config.input.is_synthetic() {
+    let input = config
+        .input
+        .as_ref()
+        .context("generate-prompts requires an [input] section")?;
+    if !input.is_synthetic() {
         anyhow::bail!(
             "generate-prompts command requires synthetic mode (file = \"synthetic\") in config"
         );
@@ -492,9 +500,9 @@ fn run_generate_prompts(
     println!();
 
     // Get synthetic config (guaranteed to be Some by config validation)
-    let synthetic_config = config.input.synthetic.as_ref().unwrap();
-    let sample_size = config.input.sample_size.unwrap_or(10000);
-    let seed = config.input.seed.unwrap_or(42);
+    let synthetic_config = input.synthetic.as_ref().unwrap();
+    let sample_size = input.sample_size.unwrap_or(10000);
+    let seed = input.seed.unwrap_or(42);
 
     // Create tokenizer
     let model_name = config.endpoint.model.as_deref().unwrap_or("gpt-3.5-turbo");
