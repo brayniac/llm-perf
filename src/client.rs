@@ -127,6 +127,48 @@ struct TokenizeResponse {
     tokens: Vec<serde_json::Value>,
 }
 
+/// One token from llama-server `POST /tokenize`. `piece` is the token's text
+/// when the request set `with_pieces` and the piece is valid UTF-8 on its own;
+/// the server sends other pieces as byte arrays, which are left as `None`.
+#[derive(Debug, Clone, PartialEq)]
+pub struct TokenPiece {
+    pub id: u32,
+    pub piece: Option<String>,
+}
+
+/// Parse a `/tokenize` response whose `tokens` are bare ids or, with
+/// `with_pieces`, `{id, piece}` objects.
+pub(crate) fn parse_token_pieces(v: &serde_json::Value) -> Result<Vec<TokenPiece>> {
+    let tokens = v
+        .get("tokens")
+        .and_then(|t| t.as_array())
+        .ok_or_else(|| anyhow::anyhow!("/tokenize response missing `tokens`"))?;
+    tokens
+        .iter()
+        .map(|t| {
+            let (id, piece) = match t {
+                serde_json::Value::Number(n) => (n.as_u64(), None),
+                serde_json::Value::Object(o) => (
+                    o.get("id").and_then(|i| i.as_u64()),
+                    o.get("piece").and_then(|p| p.as_str()).map(str::to_string),
+                ),
+                _ => (None, None),
+            };
+            let id = id.ok_or_else(|| anyhow::anyhow!("/tokenize token without an id: {t}"))?;
+            Ok(TokenPiece {
+                id: u32::try_from(id)?,
+                piece,
+            })
+        })
+        .collect()
+}
+
+/// llama-server `POST /detokenize` response.
+#[derive(Debug, Clone, Deserialize)]
+struct DetokenizeResponse {
+    content: String,
+}
+
 /// llama-server `POST /apply-template` response.
 #[derive(Debug, Clone, Deserialize)]
 struct ApplyTemplateResponse {
@@ -398,6 +440,37 @@ impl OpenAIClient {
         });
         let resp: TokenizeResponse = self.post_with_retry(&url, &body).await?;
         Ok(resp.tokens.len())
+    }
+
+    /// Tokenize `text` with llama-server's `/tokenize` and return the token ids
+    /// and, when `with_pieces` is set, each token's text. `add_special` adds
+    /// BOS when the model uses one; `parse_special` makes special tokens written
+    /// in the text (as in a rendered chat template) count as single tokens.
+    /// llama-server only.
+    pub async fn tokenize_pieces(
+        &self,
+        text: &str,
+        add_special: bool,
+        parse_special: bool,
+        with_pieces: bool,
+    ) -> Result<Vec<TokenPiece>> {
+        let url = format!("{}/tokenize", self.server_root());
+        let body = serde_json::json!({
+            "content": text,
+            "add_special": add_special,
+            "parse_special": parse_special,
+            "with_pieces": with_pieces,
+        });
+        let resp: serde_json::Value = self.post_with_retry(&url, &body).await?;
+        parse_token_pieces(&resp)
+    }
+
+    /// Text for `tokens` via llama-server's `/detokenize`. llama-server only.
+    pub async fn detokenize(&self, tokens: &[u32]) -> Result<String> {
+        let url = format!("{}/detokenize", self.server_root());
+        let body = serde_json::json!({ "tokens": tokens });
+        let resp: DetokenizeResponse = self.post_with_retry(&url, &body).await?;
+        Ok(resp.content)
     }
 
     /// Render chat `messages` to the prompt string llama-server would generate
@@ -1622,6 +1695,32 @@ mod tests {
         assert_eq!(body["stream"], false);
         assert!(body.get("messages").is_none());
         assert!(body.get("top_p").is_none());
+    }
+
+    #[test]
+    fn token_pieces_parse_captured_llama_server_tokenize() {
+        let v: serde_json::Value = serde_json::from_str(include_str!(
+            "../tests/fixtures/llama-server/llama-3.1-8b-instruct-q8_0/tokenize.json"
+        ))
+        .unwrap();
+        let pieces = parse_token_pieces(&v).unwrap();
+        let ids: Vec<u32> = pieces.iter().map(|p| p.id).collect();
+        assert_eq!(ids, vec![19665, 16, 9689, 28811]);
+        assert_eq!(pieces[0].piece.as_deref(), Some(" golf"));
+    }
+
+    #[test]
+    fn token_pieces_parse_bare_ids_and_byte_pieces() {
+        let v = serde_json::json!({"tokens": [5, {"id": 7, "piece": [226, 130]}]});
+        let pieces = parse_token_pieces(&v).unwrap();
+        assert_eq!(
+            pieces,
+            vec![
+                TokenPiece { id: 5, piece: None },
+                TokenPiece { id: 7, piece: None },
+            ]
+        );
+        assert!(parse_token_pieces(&serde_json::json!({"tokens": ["x"]})).is_err());
     }
 
     #[test]
