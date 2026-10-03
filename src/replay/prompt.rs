@@ -13,7 +13,7 @@ use crate::client::Message;
 use anyhow::Result;
 use rand::rngs::StdRng;
 
-/// How far past the previous message's content to look for a message's
+/// How far past the end of the last located content to look for a message's
 /// content in a rendered prompt; covers role headers and template preambles.
 const LOCATE_WINDOW: usize = 256;
 
@@ -48,7 +48,11 @@ pub struct BuiltCall {
 pub struct SessionPrompt {
     segments: Vec<Segment>,
     rendered: Vec<u32>,
+    /// The last reply as a history message, with its trimmed content tokens.
     reply: Option<Segment>,
+    /// Tokens of the last reply as generated (untrimmed): the reference for
+    /// reuse and for cuts inside the reply.
+    reply_tokens: Vec<u32>,
 }
 
 impl SessionPrompt {
@@ -99,7 +103,8 @@ impl SessionPrompt {
         }
         let base_len = renderer.render(&messages).await?.len();
 
-        // Draw enough words for one size correction.
+        // Draw 64 words more than the estimate, so one correction can add up
+        // to 64 tokens.
         let mut n = prompt.saturating_sub(base_len).max(min_words);
         let words: Vec<String> = (0..n + 64).map(|_| pool.text(rng, 1)).collect();
         let fill = |messages: &mut Vec<Message>, n: usize| {
@@ -119,8 +124,8 @@ impl SessionPrompt {
 
         let expected_reuse = common_prefix(&rendered, &reference);
 
-        // Content tokens: unchanged for whole kept messages, re-tokenized for
-        // the last (filled) message and any message that was cut.
+        // Content tokens: reused for whole kept messages that were located in
+        // the previous prompt, re-tokenized otherwise.
         let mut segments = Vec::with_capacity(messages.len());
         for (i, msg) in messages.iter().enumerate() {
             let tokens = match kept.get(i) {
@@ -145,12 +150,14 @@ impl SessionPrompt {
         self.segments = segments;
         self.rendered = rendered;
         self.reply = None;
+        self.reply_tokens.clear();
         Ok(built)
     }
 
     /// Record the server's reply to the last call built.
     pub async fn record_reply<R: Renderer>(&mut self, renderer: &R, content: String) -> Result<()> {
-        let tokens = renderer.tokenize(&content).await?;
+        self.reply_tokens = renderer.tokenize(&content).await?;
+        let tokens = renderer.tokenize(content.trim()).await?;
         self.reply = Some(Segment {
             msg: Message {
                 role: "assistant".to_string(),
@@ -171,10 +178,11 @@ impl SessionPrompt {
     ) -> Result<(Vec<Segment>, Vec<u32>, usize)> {
         let mut list = self.segments.clone();
         let mut reference = self.rendered.clone();
-        if let Some(reply) = &self.reply {
-            reference.extend(&reply.tokens);
+        let reply_index = self.reply.as_ref().map(|reply| {
+            reference.extend(&self.reply_tokens);
             list.push(reply.clone());
-        }
+            list.len() - 1
+        });
         let shortfall = reuse.saturating_sub(reference.len());
         let reuse = reuse.min(reference.len());
 
@@ -185,17 +193,23 @@ impl SessionPrompt {
             return Ok((Vec::new(), reference, shortfall));
         };
         let k = reuse - list[j].start.unwrap();
+        // Positions inside the reply count generated tokens.
+        let tokens = if reply_index == Some(j) {
+            &self.reply_tokens
+        } else {
+            &list[j].tokens
+        };
         let mut kept: Vec<Segment> = list[..j].to_vec();
-        if k >= list[j].tokens.len() {
+        if k >= tokens.len() {
             kept.push(list[j].clone());
         } else if k > 0 {
-            let content = renderer.detokenize(&list[j].tokens[..k]).await?;
+            let content = renderer.detokenize(&tokens[..k]).await?;
             kept.push(Segment {
                 msg: Message {
                     role: list[j].msg.role.clone(),
                     content,
                 },
-                tokens: list[j].tokens[..k].to_vec(),
+                tokens: tokens[..k].to_vec(),
                 start: None,
             });
         }
@@ -211,9 +225,9 @@ fn locate(rendered: &[u32], segments: &mut [Segment]) {
         let n = s.tokens.len();
         let last = (cursor + LOCATE_WINDOW).min(rendered.len().saturating_sub(n));
         s.start = (cursor..=last).find(|&p| rendered.get(p..p + n) == Some(&s.tokens[..]));
-        if let Some(p) = s.start {
-            cursor = p + n;
-        }
+        // After a miss, assume the content sat at the cursor, so one miss
+        // does not move the window away from every later message.
+        cursor = s.start.unwrap_or(cursor) + n;
     }
 }
 
@@ -315,6 +329,38 @@ mod tests {
         assert!(b.overshoot);
         assert_eq!(b.expected_reuse, 17);
         assert_eq!(b.prompt_tokens, 22);
+    }
+
+    #[tokio::test]
+    async fn reply_with_surrounding_whitespace_is_still_located() {
+        // A reply ending in a space is rendered trimmed in history. The next
+        // call must still find it, and the call after must still find the
+        // messages that follow it.
+        let r = FakeRenderer::default();
+        let mut s = SessionPrompt::default();
+        first(&r, &mut s, 14).await;
+        let reply: String = (0..400).map(|i| format!(" r{i}")).collect::<String>() + " ";
+        s.record_reply(&r, reply.trim_start().to_string())
+            .await
+            .unwrap();
+        // Keep the whole previous prompt and reply: 14 + 400 words + the
+        // trailing space token. History renders the reply trimmed, so the
+        // space is not shared.
+        let b = s
+            .build(&r, None, 415, 430, &pool(), &mut call_rng(1, "s", 1))
+            .await
+            .unwrap();
+        assert_eq!(b.expected_reuse, 414);
+        assert!(s.segments.iter().all(|seg| seg.start.is_some()));
+        s.record_reply(&r, "x1 x2".to_string()).await.unwrap();
+        // 425 lands inside the third message (user filler after the reply).
+        let b = s
+            .build(&r, None, 425, 440, &pool(), &mut call_rng(1, "s", 2))
+            .await
+            .unwrap();
+        assert_eq!(b.expected_reuse, 425);
+        let roles: Vec<&str> = b.messages.iter().map(|m| m.role.as_str()).collect();
+        assert_eq!(roles, vec!["user", "assistant", "user"]);
     }
 
     #[tokio::test]

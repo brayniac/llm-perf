@@ -1,6 +1,6 @@
 # Replay coding-agent sessions from `llm-perf convert-trace` against
 # llama-server. Convert with --max-context set to the server's per-slot
-# context (llama-server -c divided by -np).
+# context: default_generation_settings.n_ctx in its /props.
 
 [endpoint]
 base_url = "http://localhost:8080/v1"
@@ -11,8 +11,8 @@ timeout = 600
 chat_template_kwargs = { date_string = "26 Jul 2024" }
 
 [load]
-duration_seconds = 3600   # optional; without it the run ends when every session finishes
-warmup_duration = 60      # optional; calls sent in the first 60 s are left out of the summary
+duration_seconds = 3600   # optional; the run ends at this limit or when every session finishes, whichever is first
+warmup_duration = 60      # optional; calls sent in the first 60 s are left out of metrics and of the reuse, lag and TTFT results
 
 [output]
 format = "console"
@@ -21,5 +21,8 @@ format = "console"
 trace = "trace.jsonl"
 sample = 0.001            # fraction of sessions, chosen by session id; 1.0 replays all
 speedup = 24.0            # divides session start offsets, call durations and gaps
+# sample_seed = 0         # a different sample of the same size
+# max_gap_ms = 300000     # cap each gap after speedup; capped calls are flagged in the log
+# system_prompt_tokens = 0 # a system prompt of this many tokens shared by every session
 seed = 1                  # filler text; change it, or restart the server, between runs
 log = "replay.jsonl"      # one line per call: expected reuse, cached tokens, timings

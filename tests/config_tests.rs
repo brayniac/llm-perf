@@ -199,8 +199,60 @@ fn replay_rejects_retries_max_tokens_and_bad_ranges() {
         let err = Config::from_toml(&toml).unwrap_err().to_string();
         assert!(err.contains(needle), "{value}: {err}");
     }
-    let toml = replay_toml("").replace("speedup = 24.0", "speedup = 0.0");
-    assert!(Config::from_toml(&toml).is_err());
+    for value in ["speedup = 0.0", "speedup = inf"] {
+        let toml = replay_toml("").replace("speedup = 24.0", value);
+        let err = Config::from_toml(&toml).unwrap_err().to_string();
+        assert!(err.contains("replay.speedup"), "{value}: {err}");
+    }
+    let toml = replay_toml("").replace("sample = 0.01", "sample = nan");
+    let err = Config::from_toml(&toml).unwrap_err().to_string();
+    assert!(err.contains("replay.sample"), "{err}");
+}
+
+#[test]
+fn replay_rejects_settings_it_would_ignore() {
+    for (patch, needle) in [
+        ("tokenizer = \"gpt2\"", "endpoint.tokenizer"),
+        ("retry_on_timeout = true", "retry_on_timeout"),
+    ] {
+        let toml = replay_toml("").replace(
+            "base_url = \"http://localhost:8080/v1\"",
+            &format!("base_url = \"http://localhost:8080/v1\"\n{patch}"),
+        );
+        let err = Config::from_toml(&toml).unwrap_err().to_string();
+        assert!(err.contains(needle), "{patch}: {err}");
+    }
+    for (load, needle) in [
+        (
+            "duration_seconds = 0",
+            "duration_seconds must be greater than 0",
+        ),
+        (
+            "duration_seconds = 60\nwarmup_duration = 60",
+            "warmup_duration (60) must be less than",
+        ),
+    ] {
+        let toml = format!("{}\n[load]\n{load}\n", replay_toml(""));
+        let err = Config::from_toml(&toml).unwrap_err().to_string();
+        assert!(err.contains(needle), "{load}: {err}");
+    }
+}
+
+#[test]
+fn replay_rejects_other_mode_sections() {
+    for (section, body) in [
+        ("[saturation]", "[saturation.slo.ttft]\np99_ms = 100.0"),
+        ("[metrics]", "[metrics]\noutput = \"m.parquet\""),
+        ("[logprobs]", "[logprobs]\noutput = \"l.jsonl\""),
+        ("[conversation]", "[conversation]\nturn_delay_ms = 10"),
+    ] {
+        let toml = format!("{}\n{body}\n", replay_toml(""));
+        let err = Config::from_toml(&toml).unwrap_err().to_string();
+        assert!(
+            err.contains(&format!("{section} cannot be used with [replay]")),
+            "{section}: {err}"
+        );
+    }
 }
 
 #[test]

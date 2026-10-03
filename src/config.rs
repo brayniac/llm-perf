@@ -930,6 +930,25 @@ impl Config {
         if self.endpoint.ignore_eos == Some(false) {
             anyhow::bail!("endpoint.ignore_eos cannot be false with [replay]");
         }
+        if self.endpoint.tokenizer.is_some() {
+            anyhow::bail!(
+                "endpoint.tokenizer cannot be used with [replay]; prompts are sized with the server's tokenizer"
+            );
+        }
+        if self.endpoint.retry_on_timeout {
+            anyhow::bail!("endpoint.retry_on_timeout cannot be used with [replay]");
+        }
+        if self.load.duration_seconds == Some(0) {
+            anyhow::bail!("load.duration_seconds must be greater than 0");
+        }
+        if let (Some(warmup), Some(duration)) =
+            (self.load.warmup_duration, self.load.duration_seconds)
+            && warmup >= duration
+        {
+            anyhow::bail!(
+                "load.warmup_duration ({warmup}) must be less than load.duration_seconds ({duration})"
+            );
+        }
         if self.runtime.worker_threads == 0 {
             anyhow::bail!("worker_threads must be greater than 0");
         }

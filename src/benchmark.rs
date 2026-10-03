@@ -93,7 +93,7 @@ pub enum Workload {
 pub struct BenchmarkRunner {
     client: Arc<OpenAIClient>,
     config: Config,
-    /// `config.input`, which validation guarantees outside replay mode.
+    /// `config.input`; `new` fails when it is `None`.
     input: InputConfig,
     workloads: Arc<Vec<Workload>>, // Wrapped in Arc to avoid cloning
     tokenizer: Arc<Tokenizer>,
@@ -391,7 +391,6 @@ async fn drain_and_settle(target: usize, max_drain: Duration, settle: Duration) 
     sleep(settle).await;
 }
 
-/// Returns Some(true/false) if the server reported cache details, None otherwise.
 /// The metrics error type for a failed request: the `ClientError` variant
 /// when there is one, else a guess from the message.
 pub(crate) fn classify_error(e: &anyhow::Error) -> ErrorType {
@@ -414,6 +413,7 @@ pub(crate) fn classify_error(e: &anyhow::Error) -> ErrorType {
     }
 }
 
+/// Returns Some(true/false) if the server reported cache details, None otherwise.
 pub(crate) fn actual_cache_hit_option(usage: &crate::client::Usage) -> Option<bool> {
     usage
         .prompt_tokens_details

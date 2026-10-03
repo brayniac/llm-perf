@@ -199,7 +199,8 @@ pub const REPLAY_REUSE_CACHED: usize = 1;
 #[metric(name = "replay_reuse")]
 pub static REPLAY_REUSE: CounterGroup = CounterGroup::new(2);
 
-/// Per call with expected reuse > 0: 1000 * cached / expected.
+/// Per non-warmup call with expected reuse > 0: 1000 * cached / expected.
+/// Exceeds 1000 when the server cached more than the call was built to reuse.
 #[metric(name = "replay_reuse_permille")]
 pub static REPLAY_REUSE_PERMILLE: AtomicHistogram = AtomicHistogram::new(7, 64);
 

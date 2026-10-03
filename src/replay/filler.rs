@@ -93,7 +93,9 @@ impl FillerPool {
 }
 
 /// Generator for one call's filler, fixed by the run seed, the session and the
-/// call index. FNV-1a keeps the seed the same across Rust releases.
+/// call index. Hashing with FNV-1a rather than `DefaultHasher` gives the same
+/// seed on every Rust release. `StdRng`'s algorithm can change with a `rand`
+/// upgrade, which would change the filler.
 pub fn call_rng(seed: u64, session_id: &str, call: usize) -> StdRng {
     let mut h: u64 = 0xcbf2_9ce4_8422_2325;
     let bytes = seed

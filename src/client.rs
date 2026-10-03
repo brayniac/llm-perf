@@ -875,15 +875,6 @@ impl OpenAIClient {
     }
 }
 
-/// Whether a `reqwest` request error was caused by the connection dying rather
-/// than by the request itself.
-///
-/// `reqwest`'s own `Display` is generic ("error sending request for url (...)"),
-/// so matching on it alone misses every real cause -- those live in the source
-/// chain ("connection closed before message completed"). A pooled keep-alive
-/// connection that the server has already closed surfaces exactly this way, and
-/// is safe to retry: the request never reached the server, so no generation was
-/// started and no work is duplicated.
 /// `e` followed by each of its sources, so a reqwest error shows its cause
 /// (for example "connection closed before message completed").
 fn error_chain(e: &(dyn std::error::Error + 'static)) -> String {
@@ -897,6 +888,15 @@ fn error_chain(e: &(dyn std::error::Error + 'static)) -> String {
     s
 }
 
+/// Whether a `reqwest` request error was caused by the connection dying rather
+/// than by the request itself.
+///
+/// `reqwest`'s own `Display` is generic ("error sending request for url (...)"),
+/// so matching on it alone misses every real cause -- those live in the source
+/// chain ("connection closed before message completed"). A pooled keep-alive
+/// connection that the server has already closed surfaces exactly this way, and
+/// is safe to retry: the request never reached the server, so no generation was
+/// started and no work is duplicated.
 fn is_connection_cause(e: &reqwest::Error) -> bool {
     let mut chain = e.to_string();
     let mut src: Option<&(dyn std::error::Error + 'static)> = std::error::Error::source(e);

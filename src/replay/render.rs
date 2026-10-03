@@ -69,7 +69,7 @@ impl Renderer for LlamaServerRenderer {
 
 /// A word-level tokenizer and chat template for tests. Each space-prefixed
 /// word is one token; the template trims message content and wraps each
-/// message in role and end tokens, as llama-server templates do.
+/// message in role and end tokens, as the Llama 3.1 template does.
 #[cfg(test)]
 pub mod fake {
     use super::*;

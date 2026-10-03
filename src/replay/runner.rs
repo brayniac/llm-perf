@@ -19,18 +19,21 @@ use anyhow::{Context, Result, bail};
 use log::{debug, info, warn};
 use serde::Serialize;
 use std::io::{BufRead, Write};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::Ordering;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, watch};
 use tokio::time::Instant;
 
-/// The prompt-size check runs after every this many calls.
+/// The prompt-size check runs each time this many more calls have reported
+/// `prompt_tokens`.
 const SIZE_CHECK_EVERY: usize = 100;
 /// Largest allowed median of |prompt_tokens - target| / target.
 const SIZE_CHECK_MAX_ERROR: f64 = 0.01;
 
-/// One line of the per-call log. Times are milliseconds from the run start.
+/// One line of the per-call log. `scheduled_ms` and `sent_ms` are milliseconds
+/// from the run start; `lag_ms`, `ttft_ms` and `e2e_ms` are durations in
+/// milliseconds.
 #[derive(Debug, Clone, Serialize)]
 pub struct CallRecord {
     pub session_id: String,
@@ -38,8 +41,7 @@ pub struct CallRecord {
     pub model: Option<String>,
     pub scheduled_ms: f64,
     pub sent_ms: f64,
-    /// `sent_ms - scheduled_ms`: how far the call fell behind the scaled
-    /// source timeline.
+    /// `sent_ms - scheduled_ms`, or 0 if the call was sent on time.
     pub lag_ms: f64,
     pub gap_capped: bool,
     pub warmup: bool,
@@ -60,8 +62,9 @@ pub struct CallRecord {
     pub error: Option<String>,
 }
 
-/// Totals printed or written at the end of a run. Percentiles cover
-/// non-warmup calls that succeeded.
+/// Totals printed or written at the end of a run. `calls_sent`,
+/// `calls_failed` and `prompt_size_error_median` include warmup calls; every
+/// other total and percentile covers non-warmup calls that succeeded.
 #[derive(Debug, Default, Serialize)]
 pub struct ReplaySummary {
     pub sessions_in_trace: usize,
@@ -120,7 +123,9 @@ struct Shared {
     warmup_until: Option<Instant>,
     log: Option<mpsc::UnboundedSender<CallRecord>>,
     stats: Mutex<Stats>,
-    abort: AtomicBool,
+    /// Set to true to stop the run; sessions waiting for a start time or a
+    /// gap wake on it.
+    stop: watch::Sender<bool>,
     abort_reason: Mutex<Option<String>>,
 }
 
@@ -134,7 +139,7 @@ impl Shared {
         if r.is_none() {
             *r = Some(reason);
         }
-        self.abort.store(true, Ordering::SeqCst);
+        self.stop.send_replace(true);
     }
 
     fn past_deadline(&self) -> bool {
@@ -146,6 +151,19 @@ impl Shared {
             let _ = tx.send(record);
         }
     }
+}
+
+/// Sleep until `t`, waking early at `deadline` or when `stop` is set. Returns
+/// whether the caller should go on: false once the run is stopped or past its
+/// deadline.
+async fn wait_until(deadline: Option<Instant>, stop: &watch::Sender<bool>, t: Instant) -> bool {
+    let wake = deadline.map_or(t, |d| t.min(d));
+    let mut rx = stop.subscribe();
+    tokio::select! {
+        _ = tokio::time::sleep_until(wake) => {}
+        _ = rx.wait_for(|stopped| *stopped) => {}
+    }
+    !(*stop.borrow() || deadline.is_some_and(|d| Instant::now() >= d))
 }
 
 fn percentile(v: &mut [f64], p: f64) -> Option<f64> {
@@ -223,8 +241,8 @@ pub async fn run(mut config: Config) -> Result<()> {
     );
 
     // Generation requests are never retried (a retry resends a prompt the
-    // server may have cached) and never reuse an idle connection, so a
-    // connection the server has just closed cannot fail one.
+    // server may have cached) and never reuse an idle connection, so no
+    // generation request is sent on a connection the server may have closed.
     let client_config = |max_retries: u32, pool_size: usize| ClientConfig {
         base_url: config.endpoint.base_url.clone(),
         api_key: config.endpoint.api_key.clone(),
@@ -316,7 +334,7 @@ pub async fn run(mut config: Config) -> Result<()> {
             .map(|d| start + Duration::from_secs(d)),
         log: log_tx,
         stats: Mutex::new(Stats::default()),
-        abort: AtomicBool::new(false),
+        stop: watch::Sender::new(false),
         abort_reason: Mutex::new(None),
         replay: replay.clone(),
     });
@@ -331,10 +349,16 @@ pub async fn run(mut config: Config) -> Result<()> {
     }
     let (mut completed, mut failed, mut truncated) = (0, 0, 0);
     for h in handles {
-        match h.await? {
-            Outcome::Completed => completed += 1,
-            Outcome::Failed => failed += 1,
-            Outcome::Truncated => truncated += 1,
+        match h.await {
+            Ok(Outcome::Completed) => completed += 1,
+            Ok(Outcome::Failed) => failed += 1,
+            Ok(Outcome::Truncated) => truncated += 1,
+            // Stop the other sessions, keep joining them, and report the panic
+            // as the run's error.
+            Err(e) => {
+                shared.fail_run(format!("a session task panicked: {e}"));
+                failed += 1;
+            }
         }
     }
     crate::metrics::RUNNING.store(false, Ordering::SeqCst);
@@ -424,8 +448,8 @@ fn report(config: &Config, s: &ReplaySummary) -> Result<()> {
 
 async fn run_session(sh: Arc<Shared>, s: TraceSession, offset: Duration) -> Outcome {
     let session_t0 = sh.start + offset;
-    tokio::time::sleep_until(session_t0).await;
-    if sh.abort.load(Ordering::SeqCst) || sh.past_deadline() {
+    if !wait_until(sh.deadline, &sh.stop, session_t0).await {
+        REPLAY_SESSIONS.increment(REPLAY_SESSION_TRUNCATED);
         return Outcome::Truncated;
     }
     REPLAY_SESSIONS.increment(REPLAY_SESSION_STARTED);
@@ -437,7 +461,7 @@ async fn run_session(sh: Arc<Shared>, s: TraceSession, offset: Duration) -> Outc
     let mut prompt = SessionPrompt::default();
     let outcome = 'calls: {
         for (i, c) in s.calls.iter().enumerate() {
-            if sh.abort.load(Ordering::SeqCst) || sh.past_deadline() {
+            if *sh.stop.borrow() || sh.past_deadline() {
                 break 'calls Outcome::Truncated;
             }
             let model = c.model.clone().or_else(|| s.models.first().cloned());
@@ -489,8 +513,7 @@ async fn run_session(sh: Arc<Shared>, s: TraceSession, offset: Duration) -> Outc
             record.shortfall = built.shortfall as u64;
             record.overshoot = built.overshoot;
 
-            tokio::time::sleep_until(session_t0 + slots[i].offset).await;
-            if sh.abort.load(Ordering::SeqCst) || sh.past_deadline() {
+            if !wait_until(sh.deadline, &sh.stop, session_t0 + slots[i].offset).await {
                 break 'calls Outcome::Truncated;
             }
             let sent = Instant::now();
@@ -525,10 +548,9 @@ async fn run_session(sh: Arc<Shared>, s: TraceSession, offset: Duration) -> Outc
 /// if the call failed.
 async fn send_call(sh: &Shared, messages: &[Message], record: &mut CallRecord) -> Option<String> {
     let guard = InflightGuard::new(!record.warmup);
-    let mut request =
-        sh.client
-            .create_messages_request(messages, Some(record.max_tokens), None, None);
-    request.ignore_eos = Some(true);
+    let request = sh
+        .client
+        .create_messages_request(messages, Some(record.max_tokens), None, None);
     let started = std::time::Instant::now();
 
     let mut stream = match sh.client.chat_completion_stream(request).await {
@@ -656,11 +678,56 @@ fn account(sh: &Shared, r: &CallRecord) {
     let n = st.size_errors.len();
     if n > 0 && n.is_multiple_of(SIZE_CHECK_EVERY) {
         let mut v = st.size_errors.clone();
+        drop(st);
         let median = percentile(&mut v, 50.0).unwrap_or(0.0);
         if median > SIZE_CHECK_MAX_ERROR {
             sh.fail_run(format!(
                 "median prompt size error {median:.4} over {n} calls exceeds {SIZE_CHECK_MAX_ERROR}; prompts are not being sized correctly"
             ));
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn wait_until_returns_at_the_target_time() {
+        let stop = watch::Sender::new(false);
+        let t = Instant::now() + Duration::from_millis(50);
+        assert!(wait_until(None, &stop, t).await);
+        assert!(Instant::now() >= t);
+    }
+
+    #[tokio::test]
+    async fn wait_until_wakes_at_the_deadline() {
+        let stop = watch::Sender::new(false);
+        let start = Instant::now();
+        let deadline = Some(start + Duration::from_millis(50));
+        let go = wait_until(deadline, &stop, start + Duration::from_secs(30)).await;
+        assert!(!go);
+        assert!(
+            start.elapsed() < Duration::from_secs(5),
+            "{:?}",
+            start.elapsed()
+        );
+    }
+
+    #[tokio::test]
+    async fn wait_until_wakes_when_stopped() {
+        let stop = Arc::new(watch::Sender::new(false));
+        let s = stop.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(50)).await;
+            s.send_replace(true);
+        });
+        let start = Instant::now();
+        assert!(!wait_until(None, &stop, start + Duration::from_secs(30)).await);
+        assert!(
+            start.elapsed() < Duration::from_secs(5),
+            "{:?}",
+            start.elapsed()
+        );
     }
 }

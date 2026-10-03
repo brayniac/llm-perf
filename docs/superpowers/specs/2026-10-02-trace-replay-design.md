@@ -107,7 +107,7 @@ with `[replay]`.
 trace = "trace.jsonl"     # output of `llm-perf convert-trace`
 sample = 0.01             # fraction of sessions to replay, in (0, 1]
 sample_seed = 0           # selects a different sample of the same size
-speedup = 24.0            # divides session start offsets and gaps; > 0
+speedup = 24.0            # divides session start offsets, call durations and gaps; > 0
 max_gap_ms = 300000       # optional cap on a gap after speedup; unset = no cap
 seed = 1                  # filler text seed
 system_prompt_tokens = 0  # optional system prompt shared by every session
@@ -152,7 +152,7 @@ model; the labels are anonymised.
 ### Session sampling
 
 Session ids in the dataset are 32 hex digits. A session is replayed when
-`(u64::from_str_radix(&session_id[..16], 16) ^ sample_seed) <= (sample * 2^64) as u64`,
+`(u64::from_str_radix(&session_id[..16], 16) ^ sample_seed.wrapping_mul(0x9E37_79B9_7F4A_7C15)) <= (sample * 2^64) as u64`,
 with `sample = 1` selecting every session. For a fixed `sample_seed`, selection
 is stable across runs and nested: every session in a 0.05 sample is also in
 the 0.10 sample. An id that is not hex fails the run. The report gives the
@@ -199,8 +199,9 @@ For call `n`:
 2. Cut the list so its rendered sequence shares `reuse` tokens with call
    `n-1`'s rendered prompt followed by the tokenized reply. Whole messages past
    the cut are dropped. A message that straddles the cut is cut at a token
-   boundary of its content. A cut that falls in a message's template tokens
-   keeps that message whole without content.
+   boundary of its content. A cut that falls in template tokens
+   between two messages keeps the earlier message whole and drops the later
+   one.
 3. Add filler so the rendered prompt reaches `prompt` tokens: on the end of
    the last kept message when it is a user message, otherwise in a new user
    message. The size is measured by rendering, and corrected once. A new
@@ -218,7 +219,8 @@ reply's text can give fewer tokens than were generated (91 for a 92-token
 reply in one Llama 3.1 call), so a call that keeps the whole reply can show a
 shortfall of a token or two.
 
-`expected_reuse` never falls below the template's fixed preamble. On Llama 3.1
+After a session's first call, `expected_reuse` never falls below the
+template's fixed preamble. On Llama 3.1
 without a system message that is 30 tokens (BOS, the system header and its
 date lines), so a call whose traced `reuse` is 0 still shares and has cached
 those 30 tokens.
@@ -232,9 +234,9 @@ Restart the server or change `seed` between runs.
 
 ### Filler
 
-At startup the replay builds a pool of filler words: each word is a single
-token with a leading space under the server's tokenizer, and tokenizing the
-detokenized word gives the same token. A filler message of `k` tokens is `k`
+At startup the replay builds a pool of filler words from an embedded list:
+a candidate is kept when tokenizing the block of all candidates, each with a
+leading space, gives it one token. A filler message of `k` tokens is `k`
 words drawn from the pool with a generator seeded by `(seed, session_id, call
 index)`. Startup checks that a 10,000-word sample tokenizes to 10,000 tokens and
 fails otherwise. Because templates trim a message's leading whitespace, sizes
@@ -243,10 +245,10 @@ counts.
 
 ### Prompt size check
 
-Each call records `target_prompt` and the server's `prompt_tokens`. After call
-100, and every 100 calls after that, the run fails if the median of
-`|prompt_tokens - target_prompt| / target_prompt` over all calls so far
-exceeds 0.01.
+Each call records `target_prompt` and the server's `prompt_tokens`. Each time
+another 100 calls have reported `prompt_tokens`, warmup included, the run fails
+if the median of `|prompt_tokens - target_prompt| / target_prompt` over those
+calls exceeds 0.01.
 
 ---
 
@@ -267,7 +269,7 @@ Aggregates, named like the existing metrics in `src/metrics.rs`:
   with `expected_reuse > 0`;
 - `replay_sessions` counter group, `status` = `started`, `completed`,
   `failed` or `truncated`;
-- `schedule_slip` records `lag_ms`;
+- `schedule_slip` records `lag_ms` for successful non-warmup calls;
 - the existing request, token, TTFT, ITL, TPOT and latency metrics.
 
 The run ends with a summary (console or JSON per `output.format`): session
@@ -283,9 +285,9 @@ post-processing.
 ## Stopping
 
 The run ends when every selected session has finished, or at
-`duration_seconds`. At the duration limit no new call is sent, in-flight calls
-finish within the endpoint timeout, and sessions cut short are counted in the
-report.
+`duration_seconds`. At the duration limit no new call is sent, sessions waiting
+for a start time or a gap stop at once, in-flight calls finish within the
+endpoint timeout, and sessions cut short are counted in the report.
 
 A failed call ends its session: the session is counted as failed and its
 remaining calls are not sent.
