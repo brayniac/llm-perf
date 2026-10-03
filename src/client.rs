@@ -377,7 +377,10 @@ impl OpenAIClient {
         let client = Client::builder()
             .timeout(config.timeout)
             .pool_max_idle_per_host(config.pool_size) // Match concurrency for optimal connection reuse
-            .pool_idle_timeout(Duration::from_secs(300)) // Keep connections alive for 5 minutes
+            // Drop idle connections before the server does: llama-server
+            // (cpp-httplib) closes them after 5 s, and reusing a connection the
+            // server has closed fails the request with "error sending request".
+            .pool_idle_timeout(Duration::from_secs(2))
             .tcp_keepalive(Duration::from_secs(60)) // TCP keep-alive every 60 seconds
             .http2_keep_alive_interval(Duration::from_secs(30)) // HTTP/2 keep-alive
             .http2_keep_alive_timeout(Duration::from_secs(20))
@@ -463,6 +466,21 @@ impl OpenAIClient {
         });
         let resp: serde_json::Value = self.post_with_retry(&url, &body).await?;
         parse_token_pieces(&resp)
+    }
+
+    /// llama-server's `GET /props`: server settings, including the per-slot
+    /// context at `default_generation_settings.n_ctx`. llama-server only.
+    pub async fn props(&self) -> Result<serde_json::Value> {
+        let url = format!("{}/props", self.server_root());
+        let mut req = self.client.get(&url).timeout(self.timeout);
+        if let Some(api_key) = &self.api_key {
+            req = req.header("Authorization", format!("Bearer {}", api_key));
+        }
+        let resp = req.send().await?;
+        if !resp.status().is_success() {
+            anyhow::bail!("/props returned HTTP {}", resp.status());
+        }
+        Ok(resp.json().await?)
     }
 
     /// Text for `tokens` via llama-server's `/detokenize`. llama-server only.
@@ -558,14 +576,22 @@ impl OpenAIClient {
             Ok(resp) => resp,
             Err(e) => {
                 if e.is_connect() {
-                    return Err(ClientError::Connection(e.to_string()).into());
+                    return Err(ClientError::Connection(error_chain(&e)).into());
                 } else if e.is_timeout() {
                     return Err(ClientError::Timeout(self.timeout).into());
                 } else if e.is_request() {
                     if is_connection_cause(&e) {
-                        return Err(ClientError::Connection(format!("Request error: {}", e)).into());
+                        return Err(ClientError::Connection(format!(
+                            "Request error: {}",
+                            error_chain(&e)
+                        ))
+                        .into());
                     } else {
-                        return Err(ClientError::Other(format!("Request error: {}", e)).into());
+                        return Err(ClientError::Other(format!(
+                            "Request error: {}",
+                            error_chain(&e)
+                        ))
+                        .into());
                     }
                 } else {
                     return Err(ClientError::Other(e.to_string()).into());
@@ -757,14 +783,22 @@ impl OpenAIClient {
             Ok(resp) => resp,
             Err(e) => {
                 if e.is_connect() {
-                    return Err(ClientError::Connection(e.to_string()).into());
+                    return Err(ClientError::Connection(error_chain(&e)).into());
                 } else if e.is_timeout() {
                     return Err(ClientError::Timeout(self.timeout).into());
                 } else if e.is_request() {
                     if is_connection_cause(&e) {
-                        return Err(ClientError::Connection(format!("Request error: {}", e)).into());
+                        return Err(ClientError::Connection(format!(
+                            "Request error: {}",
+                            error_chain(&e)
+                        ))
+                        .into());
                     } else {
-                        return Err(ClientError::Other(format!("Request error: {}", e)).into());
+                        return Err(ClientError::Other(format!(
+                            "Request error: {}",
+                            error_chain(&e)
+                        ))
+                        .into());
                     }
                 } else {
                     return Err(ClientError::Other(e.to_string()).into());
@@ -850,6 +884,19 @@ impl OpenAIClient {
 /// connection that the server has already closed surfaces exactly this way, and
 /// is safe to retry: the request never reached the server, so no generation was
 /// started and no work is duplicated.
+/// `e` followed by each of its sources, so a reqwest error shows its cause
+/// (for example "connection closed before message completed").
+fn error_chain(e: &(dyn std::error::Error + 'static)) -> String {
+    let mut s = e.to_string();
+    let mut source = e.source();
+    while let Some(cause) = source {
+        s.push_str(": ");
+        s.push_str(&cause.to_string());
+        source = cause.source();
+    }
+    s
+}
+
 fn is_connection_cause(e: &reqwest::Error) -> bool {
     let mut chain = e.to_string();
     let mut src: Option<&(dyn std::error::Error + 'static)> = std::error::Error::source(e);
