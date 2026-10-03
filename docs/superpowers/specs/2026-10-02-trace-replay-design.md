@@ -272,10 +272,14 @@ Aggregates, named like the existing metrics in `src/metrics.rs`:
 - `schedule_slip` records `lag_ms` for successful non-warmup calls;
 - the existing request, token, TTFT, ITL, TPOT and latency metrics.
 
-The run ends with a summary (console or JSON per `output.format`): session
-outcomes, call counts, expected and cached reuse totals, prefill tokens
+The run ends with a summary (console or JSON per `output.format`): the
+server's `build_info` and per-slot context from `/props`, session outcomes, call counts, expected and cached reuse totals, prefill tokens
 computed (`prompt_tokens - cached_tokens`), percentiles of cached/expected,
 `lag_ms` and TTFT, and the median prompt size error.
+
+A successful call whose response has no `usage` or no
+`usage.prompt_tokens_details` fails the run: reuse cannot be measured without
+the server's cached token count, and recording it as 0 would read as eviction.
 
 The log is the primary output. The aggregates are for reading a run without
 post-processing.

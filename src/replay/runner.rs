@@ -67,6 +67,10 @@ pub struct CallRecord {
 /// other total and percentile covers non-warmup calls that succeeded.
 #[derive(Debug, Default, Serialize)]
 pub struct ReplaySummary {
+    /// The server's `build_info` from `/props`.
+    pub server_build: Option<String>,
+    /// The server's per-slot context from `/props`.
+    pub server_n_ctx: u64,
     pub sessions_in_trace: usize,
     pub sessions_selected: usize,
     pub sessions_completed: usize,
@@ -272,6 +276,11 @@ pub async fn run(mut config: Config) -> Result<()> {
         .pointer("/default_generation_settings/n_ctx")
         .and_then(|v| v.as_u64())
         .context("/props has no default_generation_settings.n_ctx")?;
+    let build = server_build(&props);
+    info!(
+        "server build {}, per-slot context {n_ctx}",
+        build.as_deref().unwrap_or("unknown")
+    );
     let too_long = sessions
         .iter()
         .filter(|s| s.calls.iter().any(|c| c.prompt + c.completion > n_ctx))
@@ -376,6 +385,8 @@ pub async fn run(mut config: Config) -> Result<()> {
 
     let mut st = shared.stats.into_inner().unwrap();
     let summary = ReplaySummary {
+        server_build: build,
+        server_n_ctx: n_ctx,
         sessions_in_trace,
         sessions_selected: selected_count,
         sessions_completed: completed,
@@ -408,6 +419,7 @@ fn report(config: &Config, s: &ReplaySummary) -> Result<()> {
             let f = |v: Option<f64>| v.map_or("-".to_string(), |v| format!("{v:.1}"));
             format!(
                 "Trace replay\n\
+                 \x20 server: build {}, per-slot context {} tokens\n\
                  \x20 sessions: {} selected of {} ({} completed, {} failed, {} truncated)\n\
                  \x20 calls: {} sent, {} failed, {} overshoot, {} shortfall, {} EOS not ignored\n\
                  \x20 reuse: expected {} tokens, cached {} tokens, prefill computed {} tokens\n\
@@ -415,6 +427,8 @@ fn report(config: &Config, s: &ReplaySummary) -> Result<()> {
                  \x20 lag ms: p50 {}, p99 {}, max {}\n\
                  \x20 ttft ms: p50 {}, p99 {}\n\
                  \x20 prompt size error (median): {}\n",
+                s.server_build.as_deref().unwrap_or("unknown"),
+                s.server_n_ctx,
                 s.sessions_selected,
                 s.sessions_in_trace,
                 s.sessions_completed,
@@ -592,11 +606,10 @@ async fn send_call(sh: &Shared, messages: &[Message], record: &mut CallRecord) -
     if let Some(u) = &usage {
         record.prompt_tokens = Some(u.prompt_tokens as u64);
         record.completion_tokens = Some(u.completion_tokens as u64);
-        record.cached_tokens = Some(
-            u.prompt_tokens_details
-                .as_ref()
-                .map_or(0, |d| d.cached_tokens as u64),
-        );
+        record.cached_tokens = u
+            .prompt_tokens_details
+            .as_ref()
+            .map(|d| d.cached_tokens as u64);
     }
 
     if !record.warmup {
@@ -647,11 +660,38 @@ async fn send_call(sh: &Shared, messages: &[Message], record: &mut CallRecord) -
 }
 
 /// Add a finished call to the run totals and apply the prompt-size check.
+/// Why a successful call cannot be used to measure reuse, if it cannot: the
+/// server did not report prompt or cached token counts.
+fn missing_usage(r: &CallRecord) -> Option<String> {
+    let missing = match (r.prompt_tokens, r.cached_tokens) {
+        (None, _) => "usage",
+        (Some(_), None) => "usage.prompt_tokens_details",
+        _ => return None,
+    };
+    Some(format!(
+        "session {} call {}: the response has no {missing}; replay needs the server's prompt and cached token counts",
+        r.session_id, r.call
+    ))
+}
+
+/// The server's build from `/props` (`build_info`, for example "b1-4ebdf2c").
+fn server_build(props: &serde_json::Value) -> Option<String> {
+    props
+        .get("build_info")
+        .and_then(|b| b.as_str())
+        .map(str::to_string)
+}
+
 fn account(sh: &Shared, r: &CallRecord) {
     let mut st = sh.stats.lock().unwrap();
     st.calls_sent += 1;
     if r.error.is_some() {
         st.calls_failed += 1;
+        return;
+    }
+    if let Some(reason) = missing_usage(r) {
+        drop(st);
+        sh.fail_run(reason);
         return;
     }
     if let Some(p) = r.prompt_tokens {
@@ -692,6 +732,56 @@ fn account(sh: &Shared, r: &CallRecord) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn record(prompt: Option<u64>, cached: Option<u64>) -> CallRecord {
+        CallRecord {
+            session_id: "s".to_string(),
+            call: 3,
+            model: None,
+            scheduled_ms: 0.0,
+            sent_ms: 0.0,
+            lag_ms: 0.0,
+            gap_capped: false,
+            warmup: false,
+            target_prompt: 100,
+            prompt_tokens: prompt,
+            overshoot: false,
+            reuse: 50,
+            reuse_inferred: false,
+            expected_reuse: 50,
+            shortfall: 0,
+            cached_tokens: cached,
+            max_tokens: 10,
+            completion_tokens: Some(10),
+            finish_reason: None,
+            ttft_ms: None,
+            e2e_ms: None,
+            error: None,
+        }
+    }
+
+    #[test]
+    fn missing_cached_tokens_is_reported_not_counted_as_zero() {
+        assert_eq!(missing_usage(&record(Some(100), Some(0))), None);
+        let no_details = missing_usage(&record(Some(100), None)).unwrap();
+        assert!(
+            no_details.contains("usage.prompt_tokens_details"),
+            "{no_details}"
+        );
+        assert!(no_details.contains("session s call 3"), "{no_details}");
+        let no_usage = missing_usage(&record(None, None)).unwrap();
+        assert!(no_usage.contains("no usage;"), "{no_usage}");
+    }
+
+    #[test]
+    fn server_build_reads_captured_props() {
+        let props: serde_json::Value = serde_json::from_str(include_str!(
+            "../../tests/fixtures/llama-server/llama-3.1-8b-instruct-q8_0/props.json"
+        ))
+        .unwrap();
+        assert_eq!(server_build(&props).as_deref(), Some("b1-4ebdf2c"));
+        assert_eq!(server_build(&serde_json::json!({})), None);
+    }
 
     #[tokio::test]
     async fn wait_until_returns_at_the_target_time() {
