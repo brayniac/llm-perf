@@ -58,6 +58,7 @@ format = "json"
         retry_on_timeout: false,
         chat_template_kwargs: cfg.endpoint.chat_template_kwargs.clone(),
         ignore_eos: cfg.endpoint.ignore_eos,
+        pool_idle_timeout: std::time::Duration::from_millis(cfg.endpoint.pool_idle_timeout_ms),
     })
     .unwrap();
 

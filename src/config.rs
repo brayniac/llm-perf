@@ -105,6 +105,14 @@ pub struct EndpointConfig {
     /// non-idempotent generation.
     #[serde(default)]
     pub retry_on_timeout: bool,
+    /// How long an idle HTTP connection is kept for reuse, in milliseconds.
+    /// llama-server and uvicorn (vLLM) close idle connections after 5 s, and a
+    /// request sent on a connection the server has closed fails. A request
+    /// after a longer idle period opens a new connection, and against a remote
+    /// HTTPS endpoint the handshake is included in TTFT; raise this for a
+    /// server with a longer keep-alive.
+    #[serde(default = "default_pool_idle_timeout_ms")]
+    pub pool_idle_timeout_ms: u64,
     #[serde(default = "default_health_check_timeout")]
     pub health_check_timeout: u64, // Total time to wait for server readiness in seconds (0 = disabled)
     #[serde(default = "default_health_check_interval")]
@@ -605,6 +613,10 @@ fn default_retry_initial_delay_ms() -> u64 {
 
 fn default_retry_max_delay_ms() -> u64 {
     10000 // 10 seconds
+}
+
+fn default_pool_idle_timeout_ms() -> u64 {
+    2000
 }
 
 fn default_stream_idle_timeout() -> u64 {

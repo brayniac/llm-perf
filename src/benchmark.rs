@@ -504,6 +504,7 @@ impl BenchmarkRunner {
             retry_on_timeout: config.endpoint.retry_on_timeout,
             chat_template_kwargs: config.endpoint.chat_template_kwargs.clone(),
             ignore_eos: config.endpoint.ignore_eos,
+            pool_idle_timeout: Duration::from_millis(config.endpoint.pool_idle_timeout_ms),
         })?;
 
         // Resolve the best available tokenizer for prompt sizing.

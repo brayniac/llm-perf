@@ -337,7 +337,14 @@ pub struct ClientConfig {
     pub chat_template_kwargs: Option<serde_json::Value>,
     /// Suppress EOS so generation runs to `max_tokens` (llama.cpp / vLLM).
     pub ignore_eos: Option<bool>,
+    /// How long an idle connection stays in the pool. Keep it below the
+    /// server's keep-alive timeout (5 s for llama-server), or a request can be
+    /// sent on a connection the server has closed.
+    pub pool_idle_timeout: Duration,
 }
+
+/// Default for [`ClientConfig::pool_idle_timeout`].
+pub const DEFAULT_POOL_IDLE_TIMEOUT: Duration = Duration::from_secs(2);
 
 impl OpenAIClient {
     /// Creates a new OpenAI-compatible HTTP client with retry logic and connection pooling.
@@ -369,6 +376,7 @@ impl OpenAIClient {
     ///     retry_on_timeout: false,
     ///     chat_template_kwargs: None,
     ///     ignore_eos: None,
+    ///     pool_idle_timeout: llm_perf::client::DEFAULT_POOL_IDLE_TIMEOUT,
     /// };
     ///
     /// let client = OpenAIClient::new(config).unwrap();
@@ -377,10 +385,7 @@ impl OpenAIClient {
         let client = Client::builder()
             .timeout(config.timeout)
             .pool_max_idle_per_host(config.pool_size) // Match concurrency for optimal connection reuse
-            // Drop idle connections before the server does: llama-server
-            // (cpp-httplib) closes them after 5 s, and reusing a connection the
-            // server has closed fails the request with "error sending request".
-            .pool_idle_timeout(Duration::from_secs(2))
+            .pool_idle_timeout(config.pool_idle_timeout)
             .tcp_keepalive(Duration::from_secs(60)) // TCP keep-alive every 60 seconds
             .http2_keep_alive_interval(Duration::from_secs(30)) // HTTP/2 keep-alive
             .http2_keep_alive_timeout(Duration::from_secs(20))
@@ -1717,6 +1722,7 @@ mod tests {
             retry_on_timeout: false,
             chat_template_kwargs: None,
             ignore_eos: None,
+            pool_idle_timeout: DEFAULT_POOL_IDLE_TIMEOUT,
         };
         let client = OpenAIClient::new(config).unwrap();
         assert_eq!(client.timeout, Duration::from_secs(7));
@@ -1807,6 +1813,7 @@ mod tests {
                 retry_on_timeout: false,
                 chat_template_kwargs: None,
                 ignore_eos,
+                pool_idle_timeout: DEFAULT_POOL_IDLE_TIMEOUT,
             };
             let client = OpenAIClient::new(config).unwrap();
             let req = client.create_request("hi", Some(8), None, None);

@@ -55,6 +55,13 @@ timeout = 60
 # generation. Connection and 5xx errors are always retried regardless of this.
 # retry_on_timeout = false
 
+# How long an idle connection is kept for reuse, in milliseconds. Default: 2000.
+# llama-server and uvicorn (vLLM) close idle connections after 5 s, and a request
+# sent on a connection the server has closed fails. A request after a longer idle
+# period opens a new connection; against a remote HTTPS endpoint the handshake
+# is included in TTFT. Raise this for a server with a longer keep-alive.
+# pool_idle_timeout_ms = 2000
+
 # Exact tokenizer for sizing synthetic prompts and truncation. Either a local
 # tokenizer.json path or a HuggingFace model id (downloaded + cached). When unset,
 # llm-perf calibrates a tiktoken estimate against the server's /tokenize endpoint

@@ -523,6 +523,7 @@ pub async fn run_evaluation(
         retry_on_timeout: true,
         chat_template_kwargs: None,
         ignore_eos: None,
+        pool_idle_timeout: crate::client::DEFAULT_POOL_IDLE_TIMEOUT,
     };
 
     let client = Arc::new(OpenAIClient::new(client_config)?);

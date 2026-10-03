@@ -6,12 +6,12 @@ All notable changes to this project will be documented in this file.
 
 ### Features
 
-- Trace replay — a `[replay]` section in a bench config replays `convert-trace` sessions against llama-server on the scaled source timeline. Each prompt repeats the previous call's messages and the server's actual reply, cut to the traced reuse in tokens, then adds filler to the traced size. The per-call log compares the reuse each call was built with against the cached tokens the server reported. `[input]` is required only without `[replay]`, and `[load]` may be omitted with `[replay]`.
+- Trace replay — a `[replay]` section in a bench config replays `convert-trace` sessions against llama-server on the scaled source timeline. Each prompt repeats the previous call's messages and the server's actual reply, cut to the traced reuse in tokens, then adds filler to the traced size. The per-call log compares the reuse each call was built with against the cached tokens the server reported. `[input]` is required only without `[replay]`, and `[load]` may be omitted with `[replay]`. For library users, `Config.input` is now `Option<InputConfig>` and `Config` has a `replay` field.
 - `convert-trace` subcommand — converts the metadata-only coding-agent session dataset in Azure/AzurePublicDataset into a per-session JSONL replay trace: per-call prompt, completion and cached token counts, the prefix reused from the previous call, and the idle gap before each call. Reads the per-day `.tar.gz` directly; filters by model label, maximum context and session start window. Estimates `reuse` after an idle gap when the reported cache hit is below the estimate (`--cache-ttl-secs`, `--evicted-reuse-ratio`), records each call's model label, and fails when a `session_id` appears twice across the inputs.
 
 ### Bug Fixes
 
-- Drop idle HTTP connections after 2 s instead of 300 s. llama-server closes idle keep-alive connections after 5 s, and reusing one fails the request with "connection closed before message completed". Requests sent after more than 2 s without traffic now open a new connection; against a remote HTTPS endpoint the handshake is included in TTFT. Request errors now include their underlying cause.
+- Drop idle HTTP connections after 2 s instead of 300 s. llama-server closes idle keep-alive connections after 5 s, and reusing one fails the request with "connection closed before message completed". Requests sent after more than 2 s without traffic now open a new connection; against a remote HTTPS endpoint the handshake is included in TTFT. `endpoint.pool_idle_timeout_ms` changes the timeout. Request errors now include their underlying cause.
 
 ## [0.1.18] - 2026-09-10
 

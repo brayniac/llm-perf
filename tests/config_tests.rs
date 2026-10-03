@@ -270,3 +270,15 @@ format = "console"
     let err = Config::from_toml(toml).unwrap_err().to_string();
     assert!(err.contains("[input] section is required"), "{err}");
 }
+
+#[test]
+fn pool_idle_timeout_defaults_to_two_seconds_and_can_be_set() {
+    let cfg = Config::from_toml(base_toml()).unwrap();
+    assert_eq!(cfg.endpoint.pool_idle_timeout_ms, 2000);
+    let toml = base_toml().replace(
+        "base_url = \"http://localhost:8080/v1\"",
+        "base_url = \"http://localhost:8080/v1\"\npool_idle_timeout_ms = 60000",
+    );
+    let cfg = Config::from_toml(&toml).unwrap();
+    assert_eq!(cfg.endpoint.pool_idle_timeout_ms, 60000);
+}

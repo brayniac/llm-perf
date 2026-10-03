@@ -257,6 +257,7 @@ pub async fn run(mut config: Config) -> Result<()> {
         retry_on_timeout: false,
         chat_template_kwargs: config.endpoint.chat_template_kwargs.clone(),
         ignore_eos: Some(true),
+        pool_idle_timeout: Duration::from_millis(config.endpoint.pool_idle_timeout_ms),
     };
     let client = Arc::new(OpenAIClient::new(client_config(0, 0))?);
     // Render, tokenize and detokenize requests are idempotent and may retry.

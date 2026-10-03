@@ -394,6 +394,7 @@ async fn run_logprobs_collection(
         retry_on_timeout: config.endpoint.retry_on_timeout,
         chat_template_kwargs: config.endpoint.chat_template_kwargs.clone(),
         ignore_eos: config.endpoint.ignore_eos,
+        pool_idle_timeout: std::time::Duration::from_millis(config.endpoint.pool_idle_timeout_ms),
     })?;
 
     // Load prompts
