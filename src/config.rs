@@ -16,8 +16,15 @@ pub fn resolve_max_tokens(
 #[serde(deny_unknown_fields)]
 pub struct Config {
     pub endpoint: EndpointConfig,
+    #[serde(default)]
     pub load: LoadConfig,
-    pub input: InputConfig,
+    /// Request source for every mode except replay; required unless `[replay]`
+    /// is present, and rejected with it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub input: Option<InputConfig>,
+    /// Replays `convert-trace` sessions instead of `[input]`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub replay: Option<ReplayConfig>,
     pub output: OutputConfig,
     #[serde(default)]
     pub runtime: RuntimeConfig,
@@ -98,6 +105,14 @@ pub struct EndpointConfig {
     /// non-idempotent generation.
     #[serde(default)]
     pub retry_on_timeout: bool,
+    /// How long an idle HTTP connection is kept for reuse, in milliseconds.
+    /// llama-server and uvicorn (vLLM) close idle connections after 5 s, and a
+    /// request sent on a connection the server has closed fails. A request
+    /// after a longer idle period opens a new connection, and against a remote
+    /// HTTPS endpoint the handshake is included in TTFT; raise this for a
+    /// server with a longer keep-alive.
+    #[serde(default = "default_pool_idle_timeout_ms")]
+    pub pool_idle_timeout_ms: u64,
     #[serde(default = "default_health_check_timeout")]
     pub health_check_timeout: u64, // Total time to wait for server readiness in seconds (0 = disabled)
     #[serde(default = "default_health_check_interval")]
@@ -156,6 +171,66 @@ pub struct LoadConfig {
     /// default; set explicitly to tune (or very high to effectively disable).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub max_outstanding_requests: Option<usize>,
+}
+
+impl Default for LoadConfig {
+    fn default() -> Self {
+        Self {
+            concurrent_requests: default_concurrent_requests(),
+            total_requests: None,
+            duration_seconds: None,
+            qps: None,
+            arrival_distribution: ArrivalDistribution::default(),
+            warmup_requests: None,
+            warmup_duration: None,
+            max_outstanding_requests: None,
+        }
+    }
+}
+
+/// `[load]` keys accepted alongside `[replay]`.
+pub const REPLAY_LOAD_KEYS: &[&str] = &["duration_seconds", "warmup_duration"];
+
+/// Replay of `llm-perf convert-trace` sessions. See
+/// `docs/superpowers/specs/2026-10-02-trace-replay-design.md`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ReplayConfig {
+    /// JSONL written by `llm-perf convert-trace`.
+    pub trace: PathBuf,
+    /// Fraction of sessions to replay, in (0, 1].
+    #[serde(default = "default_replay_sample")]
+    pub sample: f64,
+    /// Selects a different sample of the same size.
+    #[serde(default)]
+    pub sample_seed: u64,
+    /// Divides session start offsets, call durations and gaps; > 0.
+    #[serde(default = "default_replay_speedup")]
+    pub speedup: f64,
+    /// Caps each gap after scaling, in milliseconds.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_gap_ms: Option<u64>,
+    /// Filler text seed.
+    #[serde(default = "default_replay_seed")]
+    pub seed: u64,
+    /// Length of a system prompt shared by every session; 0 for none.
+    #[serde(default)]
+    pub system_prompt_tokens: usize,
+    /// Per-call JSONL log.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub log: Option<PathBuf>,
+}
+
+fn default_replay_sample() -> f64 {
+    1.0
+}
+
+fn default_replay_speedup() -> f64 {
+    1.0
+}
+
+fn default_replay_seed() -> u64 {
+    1
 }
 
 fn default_common_prefix_sample_ratio() -> f64 {
@@ -540,6 +615,10 @@ fn default_retry_max_delay_ms() -> u64 {
     10000 // 10 seconds
 }
 
+fn default_pool_idle_timeout_ms() -> u64 {
+    2000
+}
+
 fn default_stream_idle_timeout() -> u64 {
     0 // disabled by default to avoid surprising timeouts on legitimately slow models
 }
@@ -583,12 +662,39 @@ fn default_admin_enabled() -> bool {
 impl Config {
     pub fn load(path: &PathBuf) -> anyhow::Result<Self> {
         let contents = std::fs::read_to_string(path)?;
-        let config: Config = toml::from_str(&contents)?;
+        Self::from_toml(&contents)
+    }
+
+    /// Parse and validate a config. `[load]` keys are checked against the raw
+    /// table because its fields have serde defaults, so an explicit value
+    /// cannot be told apart from the default after deserializing.
+    pub fn from_toml(contents: &str) -> anyhow::Result<Self> {
+        let table: toml::Table = toml::from_str(contents)?;
+        let config: Config = toml::from_str(contents)?;
+        if config.replay.is_some()
+            && let Some(load) = table.get("load").and_then(|l| l.as_table())
+        {
+            for key in load.keys() {
+                if !REPLAY_LOAD_KEYS.contains(&key.as_str()) {
+                    anyhow::bail!(
+                        "load.{key} cannot be used with [replay]; accepted keys: {}",
+                        REPLAY_LOAD_KEYS.join(", ")
+                    );
+                }
+            }
+        }
         config.validate()?;
         Ok(config)
     }
 
     pub fn validate(&self) -> anyhow::Result<()> {
+        if let Some(ref replay) = self.replay {
+            return self.validate_replay(replay);
+        }
+        let Some(ref input) = self.input else {
+            anyhow::bail!("an [input] section is required (or [replay] for trace replay)");
+        };
+
         if self.load.total_requests.is_none() && self.load.duration_seconds.is_none() {
             anyhow::bail!("Either total_requests or duration_seconds must be specified");
         }
@@ -682,7 +788,7 @@ impl Config {
         }
 
         // Validate synthetic mode configuration
-        if self.input.is_synthetic() {
+        if input.is_synthetic() {
             // Require endpoint.max_tokens to be set
             if self.endpoint.max_tokens.is_none() {
                 anyhow::bail!(
@@ -691,7 +797,7 @@ impl Config {
             }
 
             // Require [input.synthetic] section and validate its fields
-            let synthetic = self.input.synthetic.as_ref().ok_or_else(|| {
+            let synthetic = input.synthetic.as_ref().ok_or_else(|| {
                 anyhow::anyhow!(
                     "Synthetic mode (file = \"synthetic\") requires [input.synthetic] configuration"
                 )
@@ -770,7 +876,7 @@ impl Config {
             }
         }
 
-        if let Some(ref sp) = self.input.system_prompt {
+        if let Some(ref sp) = input.system_prompt {
             if sp.source_count() == 0 {
                 anyhow::bail!(
                     "input.system_prompt must have exactly one of: content, file, tokens"
@@ -783,7 +889,7 @@ impl Config {
             }
         }
 
-        if let Some(ref pfx) = self.input.shared_prefix {
+        if let Some(ref pfx) = input.shared_prefix {
             if pfx.source_count() != 1 {
                 anyhow::bail!(
                     "input.shared_prefix must have exactly one of: content, file, tokens"
@@ -797,6 +903,67 @@ impl Config {
             }
         }
 
+        Ok(())
+    }
+
+    fn validate_replay(&self, replay: &ReplayConfig) -> anyhow::Result<()> {
+        if self.input.is_some() {
+            anyhow::bail!("[input] cannot be used with [replay]");
+        }
+        for (present, section) in [
+            (self.saturation.is_some(), "[saturation]"),
+            (self.logprobs.is_some(), "[logprobs]"),
+            (self.conversation.is_some(), "[conversation]"),
+            (self.metrics.is_some(), "[metrics]"),
+        ] {
+            if present {
+                anyhow::bail!("{section} cannot be used with [replay]");
+            }
+        }
+        if !(replay.sample > 0.0 && replay.sample <= 1.0) {
+            anyhow::bail!("replay.sample must be in (0, 1], got {}", replay.sample);
+        }
+        if !(replay.speedup > 0.0 && replay.speedup.is_finite()) {
+            anyhow::bail!(
+                "replay.speedup must be a positive number, got {}",
+                replay.speedup
+            );
+        }
+        if self.endpoint.max_tokens.is_some() {
+            anyhow::bail!(
+                "endpoint.max_tokens cannot be used with [replay]; each call's completion length comes from the trace"
+            );
+        }
+        if self.endpoint.max_retries > 0 {
+            anyhow::bail!(
+                "endpoint.max_retries must be 0 with [replay]; a retry resends a prompt the server may already have cached"
+            );
+        }
+        if self.endpoint.ignore_eos == Some(false) {
+            anyhow::bail!("endpoint.ignore_eos cannot be false with [replay]");
+        }
+        if self.endpoint.tokenizer.is_some() {
+            anyhow::bail!(
+                "endpoint.tokenizer cannot be used with [replay]; prompts are sized with the server's tokenizer"
+            );
+        }
+        if self.endpoint.retry_on_timeout {
+            anyhow::bail!("endpoint.retry_on_timeout cannot be used with [replay]");
+        }
+        if self.load.duration_seconds == Some(0) {
+            anyhow::bail!("load.duration_seconds must be greater than 0");
+        }
+        if let (Some(warmup), Some(duration)) =
+            (self.load.warmup_duration, self.load.duration_seconds)
+            && warmup >= duration
+        {
+            anyhow::bail!(
+                "load.warmup_duration ({warmup}) must be less than load.duration_seconds ({duration})"
+            );
+        }
+        if self.runtime.worker_threads == 0 {
+            anyhow::bail!("worker_threads must be greater than 0");
+        }
         Ok(())
     }
 }

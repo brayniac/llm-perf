@@ -345,9 +345,13 @@ impl ReportBuilder {
                 warmup_duration: config.load.warmup_duration,
                 tokenizer: tokenizer_label,
                 token_counts_estimated,
-                prompt_file: config.input.file.display().to_string(),
-                seed: config.input.seed,
-                sample_size: config.input.sample_size,
+                prompt_file: config
+                    .input
+                    .as_ref()
+                    .map(|i| i.file.display().to_string())
+                    .unwrap_or_else(|| "unknown".to_string()),
+                seed: config.input.as_ref().and_then(|i| i.seed),
+                sample_size: config.input.as_ref().and_then(|i| i.sample_size),
                 turn_delay_ms: config.conversation.map(|c| c.turn_delay_ms),
                 turn_delay_stdev_ms: config.conversation.map(|c| c.turn_delay_stdev_ms),
                 turn_delay_min_ms: config.conversation.map(|c| c.turn_delay_min_ms),

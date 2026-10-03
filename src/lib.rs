@@ -9,6 +9,7 @@ pub mod kl_divergence;
 pub mod logprobs;
 pub mod metrics;
 pub mod mmlu_pro;
+pub mod replay;
 pub mod report;
 pub mod saturation;
 pub mod server_metrics;

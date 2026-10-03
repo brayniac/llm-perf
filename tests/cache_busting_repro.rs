@@ -39,5 +39,14 @@ format = "json"
     let path = PathBuf::from("/tmp/test_cfg_repro.toml");
     std::fs::write(&path, toml_content).unwrap();
     let cfg = Config::load(&path).unwrap();
-    assert_eq!(cfg.input.shared_prefix.as_ref().unwrap().miss_rate, 0.0);
+    assert_eq!(
+        cfg.input
+            .as_ref()
+            .unwrap()
+            .shared_prefix
+            .as_ref()
+            .unwrap()
+            .miss_rate,
+        0.0
+    );
 }

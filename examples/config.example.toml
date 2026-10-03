@@ -55,6 +55,13 @@ timeout = 60
 # generation. Connection and 5xx errors are always retried regardless of this.
 # retry_on_timeout = false
 
+# How long an idle connection is kept for reuse, in milliseconds. Default: 2000.
+# llama-server and uvicorn (vLLM) close idle connections after 5 s, and a request
+# sent on a connection the server has closed fails. A request after a longer idle
+# period opens a new connection; against a remote HTTPS endpoint the handshake
+# is included in TTFT. Raise this for a server with a longer keep-alive.
+# pool_idle_timeout_ms = 2000
+
 # Exact tokenizer for sizing synthetic prompts and truncation. Either a local
 # tokenizer.json path or a HuggingFace model id (downloaded + cached). When unset,
 # llm-perf calibrates a tiktoken estimate against the server's /tokenize endpoint
@@ -332,6 +339,24 @@ level = "info"
 # enabled = true
 # top_logprobs = 5       # Number of top token probabilities to capture (1-20)
 # output = "logprobs.jsonl"  # Path to write JSONL output
+
+# =============================================================================
+# Trace Replay Configuration (Optional)
+# =============================================================================
+# Replays `llm-perf convert-trace` sessions against llama-server instead of
+# drawing requests from [input]. With [replay], omit [input], and of [load]
+# use only duration_seconds and warmup_duration. Requires max_retries = 0 and
+# no endpoint.max_tokens. See examples/scenarios/trace-replay.toml.
+#
+# [replay]
+# trace = "trace.jsonl"     # output of convert-trace
+# sample = 0.001            # fraction of sessions, chosen by session id; 1.0 replays all
+# sample_seed = 0           # a different sample of the same size
+# speedup = 24.0            # divides session start offsets, call durations and gaps
+# max_gap_ms = 300000       # cap each gap after speedup; capped calls are flagged in the log
+# seed = 1                  # filler text; change it, or restart the server, between runs
+# system_prompt_tokens = 0  # a system prompt of this many tokens shared by every session
+# log = "replay.jsonl"      # one line per call: expected reuse, cached tokens, timings
 
 # =============================================================================
 # Saturation Search Configuration (Optional)
