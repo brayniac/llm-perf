@@ -4,14 +4,22 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+## [0.1.19] - 2026-10-03
+
 ### Features
 
-- Trace replay — a `[replay]` section in a bench config replays `convert-trace` sessions against llama-server on the scaled source timeline. Each prompt repeats the previous call's messages and the server's actual reply, cut to the traced reuse in tokens, then adds filler to the traced size. The per-call log compares the reuse each call was built with against the cached tokens the server reported. `[input]` is required only without `[replay]`, and `[load]` may be omitted with `[replay]`. A response without the server's cached token count fails the run, and the summary reports the server's build and per-slot context. For library users, `Config.input` is now `Option<InputConfig>` and `Config` has a `replay` field.
-- `convert-trace` subcommand — converts the metadata-only coding-agent session dataset in Azure/AzurePublicDataset into a per-session JSONL replay trace: per-call prompt, completion and cached token counts, the prefix reused from the previous call, and the idle gap before each call. Reads the per-day `.tar.gz` directly; filters by model label, maximum context and session start window. Estimates `reuse` after an idle gap when the reported cache hit is below the estimate (`--cache-ttl-secs`, `--evicted-reuse-ratio`), records each call's model label, and fails when a `session_id` appears twice across the inputs.
+- Trace replay — a `[replay]` section in a bench config replays `convert-trace` sessions against llama-server on the scaled source timeline. Each prompt repeats the previous call's messages and the server's actual reply, cut to the traced reuse in tokens, then adds filler to the traced size. The per-call log compares the reuse each call was built with against the cached tokens the server reported. `[input]` is required only without `[replay]`, and `[load]` may be omitted with `[replay]`. A response without the server's cached token count fails the run, and the summary reports the server's build and per-slot context. For library users, `Config.input` is now `Option<InputConfig>` and `Config` has a `replay` field. Design in #179 (#180, #181)
+- `convert-trace` subcommand — converts the metadata-only coding-agent session dataset in Azure/AzurePublicDataset into a per-session JSONL replay trace: per-call prompt, completion and cached token counts, the prefix reused from the previous call, and the idle gap before each call. Reads the per-day `.tar.gz` directly; filters by model label, maximum context and session start window. Estimates `reuse` after an idle gap when the reported cache hit is below the estimate (`--cache-ttl-secs`, `--evicted-reuse-ratio`), records each call's model label, and fails when a `session_id` appears twice across the inputs. (#178)
+- `mmlu-pro` completion-prompt mode for base models — `[inference] mode = "completion"` or `--mode completion` sends the 5-shot CoT prompt as plain text to `/completions`, the format published base-model MMLU-Pro scores use. The default, `"chat"`, is unchanged. (#176)
 
 ### Bug Fixes
 
-- Drop idle HTTP connections after 2 s instead of 300 s. llama-server closes idle keep-alive connections after 5 s, and reusing one fails the request with "connection closed before message completed". Requests sent after more than 2 s without traffic now open a new connection; against a remote HTTPS endpoint the handshake is included in TTFT. `endpoint.pool_idle_timeout_ms` changes the timeout. Request errors now include their underlying cause.
+- `kl-divergence` no longer pins positions at ln(1e10) ≈ 23.03 — a token in the baseline's top-N that is missing from the candidate's was scored with probability 1e-10; it now uses the candidate's smallest returned probability as a lower bound, and the report adds `num_positions_censored` and `censored_fraction` (#174)
+- Drop idle HTTP connections after 2 s instead of 300 s. llama-server closes idle keep-alive connections after 5 s, and reusing one fails the request with "connection closed before message completed". Requests sent after more than 2 s without traffic now open a new connection; against a remote HTTPS endpoint the handshake is included in TTFT. `endpoint.pool_idle_timeout_ms` changes the timeout. Request errors now include their underlying cause. (#180)
+
+### Security
+
+- Bump rustls 0.23.37 -> 0.23.45 (RUSTSEC-2026-0285) (#177)
 
 ## [0.1.18] - 2026-09-10
 
