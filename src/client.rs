@@ -655,7 +655,7 @@ impl OpenAIClient {
     /// /tokenize` with `prompt`. vLLM's tokenizer still turns special-token
     /// text in `text` (for example `<|im_end|>`) into the special token. With
     /// `with_pieces`, each token's text is decoded from vLLM's `token_strs`;
-    /// see [`parse_vllm_tokenize`]. vLLM only.
+    /// see `parse_vllm_tokenize`. vLLM only.
     pub async fn vllm_tokenize_text(
         &self,
         text: &str,
