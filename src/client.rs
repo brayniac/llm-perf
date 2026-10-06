@@ -654,8 +654,8 @@ impl OpenAIClient {
     /// Tokens of `text` with no special tokens added, via vLLM's `POST
     /// /tokenize` with `prompt`. vLLM's tokenizer still turns special-token
     /// text in `text` (for example `<|im_end|>`) into the special token. With
-    /// `with_pieces`, each token's text is decoded from vLLM's `token_strs`;
-    /// see `parse_vllm_tokenize`. vLLM only.
+    /// `with_pieces`, each token's text is decoded from vLLM's `token_strs`
+    /// by inverting GPT-2's byte-to-character table. vLLM only.
     pub async fn vllm_tokenize_text(
         &self,
         text: &str,

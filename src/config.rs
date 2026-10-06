@@ -199,7 +199,7 @@ pub struct ReplayConfig {
     /// JSONL written by `llm-perf convert-trace`.
     pub trace: PathBuf,
     /// Server type: selects the endpoints replay uses to render and tokenize
-    /// prompts and to read the context limit and cache block size.
+    /// prompts and to read the context limit.
     #[serde(default)]
     pub server: ReplayServer,
     /// Fraction of sessions to replay, in (0, 1].

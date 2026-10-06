@@ -62,5 +62,4 @@ jq --argjson kw "$KW" '. + {add_generation_prompt: true, chat_template_kwargs: $
 	"$F/messages3.json" > "$F/tokenize-chat3.request.json"
 post /tokenize "$F/tokenize-chat3.request.json" "$F/tokenize-chat3.response.json"
 
-curl -sf "$U/metrics" > "$F/metrics.txt"
 rm "$F/messages1.json" "$F/messages3.json"

@@ -10,7 +10,7 @@ All notable changes to this project will be documented in this file.
 
 ### Changes
 
-- Trace replay reports reuse only as the server reported it, without a predicted value. The per-call log drops `expected_reuse`. The summary replaces `expected_reuse_tokens` and `reuse_permille_p50`/`p10` (cached over expected) with `prompt_tokens` and `cached_permille_p50`/`p10` (cached over prompt tokens, for calls whose traced reuse is above 0). The `replay_reuse` counter's `expected` kind becomes `prompt`, and the `replay_reuse_permille` histogram becomes `replay_cached_permille`.
+- Trace replay reports reuse only as the server reported it, without a predicted value. The per-call log drops `expected_reuse`. The summary replaces `expected_reuse_tokens` and `reuse_permille_p50`/`p10` (cached over expected) with `prompt_tokens` and `cached_permille_p50`/`p10` (cached over prompt tokens, for calls whose traced reuse is above 0). The `replay_reuse` counter's `expected` kind becomes `prompt`, and the `replay_reuse_permille` histogram becomes `replay_cached_permille`. Both `replay_reuse` kinds now count every successful non-warmup call; in 0.1.19 they counted only calls with expected reuse above 0. The console summary line `reuse: expected …` becomes `tokens: prompt …`. For library users, `BuiltCall.expected_reuse` and `CallRecord.expected_reuse` are removed, and `REPLAY_REUSE_EXPECTED`/`REPLAY_REUSE_PERMILLE` are renamed `REPLAY_REUSE_PROMPT`/`REPLAY_CACHED_PERMILLE`.
 
 ## [0.1.19] - 2026-10-03
 

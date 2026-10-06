@@ -95,8 +95,7 @@ those of `tests/fixtures/vllm/capture.sh`.
   and returns `prompt`.
 - For Qwen3.5 with prefix caching, vLLM sets `mamba_cache_mode` to `align` and
   the attention block size to 528 tokens. Cached counts are whole blocks:
-  6,864 is 13 blocks. The block size is a label on the
-  `vllm:cache_config_info` metric, with `enable_prefix_caching`.
+  6,864 is 13 blocks. The server log reports the block size at startup.
 - `usage.prompt_tokens_details` has `cached_tokens` and `created_cache_tokens`
   in the final streamed chunk.
 - `/v1/models` gives the served model's `max_model_len`, and `/version` the
@@ -105,8 +104,9 @@ those of `tests/fixtures/vllm/capture.sh`.
   requests of 131,072).
 - A replay of one six-call session alone (cuts of 4 to 217 tokens before the
   previous prompt's end) reported as cached, on all five calls with reuse,
-  the shared prefix rounded down to whole 528-token blocks. A 30-minute replay at sample 0.004 and speedup 1.5 (seven
-  sessions with calls, at most three requests running) gave 134 of 177
+  the common token prefix with the previous prompt and reply rounded down to
+  whole 528-token blocks. A 30-minute replay at sample 0.004 and speedup 1.5
+  (seven sessions with calls, at most three requests running) gave 134 of 177
   measured calls at that value, 36 short by 1 to 7 blocks and 7 short by 9 to 93
   blocks. 28 of the 36 had no other session's call sent between the
   session's previous call and this one. A short call's `cached_tokens` was
@@ -265,8 +265,8 @@ shortfall of a token or two.
 
 After a session's first call, every prompt shares at least the template's
 fixed preamble with the previous one. On Llama 3.1 without a system message
-that is 30 tokens (BOS, the system header and its date lines), so a call whose
-traced `reuse` is 0 still has those 30 tokens cached.
+that is 30 tokens (BOS, the system header and its date lines), so on
+llama-server a call whose traced `reuse` is 0 still has those 30 tokens cached.
 
 The first call of a session is the optional shared system prompt plus one user
 message of filler. The system prompt is kept whole in every call.
@@ -355,11 +355,13 @@ aggregates; the log still records them.
 1. Unit tests with no server: sampling, time scaling, cutting message lists at
    token boundaries, filler determinism.
 2. Fixture tests: parse the captured responses in `tests/fixtures/llama-server/`.
-3. Llama 3.1 8B, sessions replayed one at a time: the common token prefix of
-   each rendered prompt with the previous rendered prompt and reply, minus
-   `cached`, is 0, or 1 when the whole previous reply is kept. Any other value is a replay
-   bug. With several sessions, the RAM prompt cache evicts and larger
-   differences are expected.
-4. Qwen3.5 9B, same sample: `cached` is the largest checkpoint position at or
-   below `min(common prefix, previous prompt - 4)`. This prediction depends on
-   the replay sending each call's new content as one user message.
+3. Llama 3.1 8B on llama-server, sessions replayed one at a time: the common
+   token prefix of each rendered prompt with the previous rendered prompt and
+   reply, minus `cached`, was 0, or 1 when the whole previous reply was kept.
+4. Qwen3.5 9B, same sample: `cached` was the largest checkpoint position at or
+   below `min(common prefix, previous prompt - 4)`.
+
+Checks 3 and 4 were made with versions before 214c271, which logged the
+common prefix. Replay no longer records it, so repeating them needs the
+rendered prompts captured separately. Prefix construction is covered by the
+prompt unit tests.

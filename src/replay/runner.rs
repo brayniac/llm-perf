@@ -679,7 +679,6 @@ async fn send_call(sh: &Shared, messages: &[Message], record: &mut CallRecord) -
     Some(content)
 }
 
-/// Add a finished call to the run totals and apply the prompt-size check.
 /// Why a successful call cannot be used to measure reuse, if it cannot: the
 /// server did not report prompt or cached token counts.
 fn missing_usage(r: &CallRecord) -> Option<String> {
@@ -694,6 +693,7 @@ fn missing_usage(r: &CallRecord) -> Option<String> {
     ))
 }
 
+/// Add a finished call to the run totals and apply the prompt-size check.
 fn account(sh: &Shared, r: &CallRecord) {
     let mut st = sh.stats.lock().unwrap();
     st.calls_sent += 1;

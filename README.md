@@ -220,15 +220,17 @@ measured with the server's own chat template and tokenizer:
 
 vLLM must run with `--enable-prefix-caching` and
 `--enable-prompt-tokens-details`; without the second, responses do not report
-cached tokens.
+cached tokens. Replay does not check that prefix caching is on; without it
+every call reports 0 cached tokens.
 
 Reuse is measured from what the server reports for each call: `prompt_tokens`
 and `cached_tokens`. Replay does not predict how many tokens should be cached.
-To see whether reuse survives load, compare the cached/prompt ratio of a run
+To see how much reuse a run lost to load, compare its cached/prompt ratio
 against a low-load run of the same sessions, on the calls both runs sent (join
-the logs on `session_id` and `call`). An overloaded run falls behind and sends
-fewer of each session's later, longer calls, so the summaries of the two runs
-cover different calls.
+the logs on `session_id` and `call`). When `duration_seconds` ends the run, or
+calls fail and end their sessions, an overloaded run sends fewer of each
+session's later, longer calls, so the summaries of the two runs cover different
+calls.
 
 The per-call log (`replay.log`) records, among other fields:
 
@@ -242,8 +244,8 @@ The per-call log (`replay.log`) records, among other fields:
   tokens than were generated, more when the server stopped early
 
 The summary reports prompt, cached and prefill-computed token totals, and
-percentiles of `1000 * cached_tokens / prompt_tokens` over calls whose traced
-`reuse` is above 0.
+percentiles of `1000 * cached_tokens / prompt_tokens` over successful
+non-warmup calls whose traced `reuse` is above 0.
 
 Replay requires `endpoint.max_retries = 0` and no `endpoint.max_tokens`, and
 accepts only `duration_seconds` and `warmup_duration` from `[load]`. Every
