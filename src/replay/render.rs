@@ -12,7 +12,9 @@ pub trait Renderer: Send + Sync {
     /// Tokens of the prompt the server builds from `messages`, including the
     /// generation prompt.
     fn render(&self, messages: &[Message]) -> impl Future<Output = Result<Vec<u32>>> + Send;
-    /// Tokens of `text` with no special tokens added or parsed.
+    /// Tokens of `text` with no special tokens added. llama-server leaves
+    /// special-token text in `text` as plain text; vLLM turns it into the
+    /// special token.
     fn tokenize(&self, text: &str) -> impl Future<Output = Result<Vec<u32>>> + Send;
     /// Text of `tokens`.
     fn detokenize(&self, tokens: &[u32]) -> impl Future<Output = Result<String>> + Send;

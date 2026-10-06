@@ -191,16 +191,17 @@ pub const CACHE_EXPECTED_MISS_IDX: usize = 1;
 #[metric(name = "ttft_by_cache", metadata = { unit = "nanoseconds" })]
 pub static TTFT_BY_CACHE: HistogramGroup = HistogramGroup::new(2, 7, 64);
 
-// Replay: prompt tokens each call was built to share with the previous call,
-// and the cached prompt tokens the server reported.
+// Replay: each call's `expected_cached` (the shared prefix in whole cache
+// blocks, below the prompt length) and the cached prompt tokens the server
+// reported.
 pub const REPLAY_REUSE_EXPECTED: usize = 0;
 pub const REPLAY_REUSE_CACHED: usize = 1;
 
 #[metric(name = "replay_reuse")]
 pub static REPLAY_REUSE: CounterGroup = CounterGroup::new(2);
 
-/// Per non-warmup call with expected reuse > 0: 1000 * cached / expected.
-/// Exceeds 1000 when the server cached more than the call was built to reuse.
+/// Per non-warmup call with `expected_cached` > 0: 1000 * cached /
+/// expected_cached. Exceeds 1000 when the server cached more than that.
 #[metric(name = "replay_reuse_permille")]
 pub static REPLAY_REUSE_PERMILLE: AtomicHistogram = AtomicHistogram::new(7, 64);
 

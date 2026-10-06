@@ -198,8 +198,8 @@ pub const REPLAY_LOAD_KEYS: &[&str] = &["duration_seconds", "warmup_duration"];
 pub struct ReplayConfig {
     /// JSONL written by `llm-perf convert-trace`.
     pub trace: PathBuf,
-    /// The server under test, which decides the endpoints used to render and
-    /// tokenize prompts.
+    /// Server type: selects the endpoints replay uses to render and tokenize
+    /// prompts and to read the context limit and cache block size.
     #[serde(default)]
     pub server: ReplayServer,
     /// Fraction of sessions to replay, in (0, 1].

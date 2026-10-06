@@ -74,7 +74,7 @@ requests with `/apply-template` and tokenizing them.
 
 ### vLLM capture findings
 
-Captured 2026-10-06 against vLLM 0.31.0 serving Qwen3.5 9B (bf16 weights
+Captured 2026-10-06 UTC against vLLM 0.31.0 serving Qwen3.5 9B (bf16 weights
 quantized at load with `--quantization fp8_per_tensor`) on an RTX 4090, with
 `--enable-prefix-caching --enable-prompt-tokens-details --max-model-len
 131072`. Fixtures are in `tests/fixtures/vllm/qwen3.5-9b-fp8/`; the calls are
@@ -90,12 +90,12 @@ those of `tests/fixtures/vllm/capture.sh`.
   `chat_template_kwargs` returns the tokens `/v1/chat/completions` generates
   from (7,023 for call 1 both ways). With `prompt` and `add_special_tokens:
   false` it tokenizes plain text. `return_token_strs` adds each token's
-  vocabulary string (`Ġworld`), not its text; replay decodes these with
-  GPT-2's byte-to-character table. `/detokenize` takes `tokens` and returns
-  `prompt`.
+  vocabulary string (`Ġworld`), not its text; replay decodes these with the
+  inverse of GPT-2's byte-to-character table. `/detokenize` takes `tokens`
+  and returns `prompt`.
 - For Qwen3.5 with prefix caching, vLLM sets `mamba_cache_mode` to `align` and
-  the attention block size to 528 tokens, so the cache serves whole 528-token
-  blocks: 6,864 is 13 blocks. The block size is a label on the
+  the attention block size to 528 tokens. Cached counts are whole blocks:
+  6,864 is 13 blocks. The block size is a label on the
   `vllm:cache_config_info` metric, with `enable_prefix_caching`.
 - `usage.prompt_tokens_details` has `cached_tokens` and `created_cache_tokens`
   in the final streamed chunk.
@@ -299,8 +299,8 @@ Per call, appended to `replay.log` when set:
 `completion_tokens`, `finish_reason`, `ttft_ms`, `e2e_ms`, `error`.
 
 `expected_cached` is `min(expected_reuse, prompt_tokens - 1)` rounded down to
-a whole number of cache blocks: the most the server can report cached when
-it has evicted nothing.
+a whole number of cache blocks: the tokens the server can serve from the
+previous call's prompt and reply when it has evicted nothing.
 
 Aggregates, named like the existing metrics in `src/metrics.rs`:
 
@@ -315,10 +315,9 @@ Aggregates, named like the existing metrics in `src/metrics.rs`:
 
 The run ends with a summary (console or JSON per `output.format`): the
 server type, build, per-request context and cache block size, session
-outcomes, call counts, expected, cacheable and cached reuse totals, prefill
-tokens computed (`prompt_tokens - cached_tokens`), percentiles of
-cached/expected_cached,
-`lag_ms` and TTFT, and the median prompt size error.
+outcomes, call counts, `expected_reuse`, `expected_cached` and cached totals,
+prefill tokens computed (`prompt_tokens - cached_tokens`), percentiles of
+cached/expected_cached, `lag_ms` and TTFT, and the median prompt size error.
 
 A successful call whose response has no `usage` or no
 `usage.prompt_tokens_details` fails the run: reuse cannot be measured without

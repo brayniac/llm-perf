@@ -169,6 +169,35 @@ struct DetokenizeResponse {
     content: String,
 }
 
+/// Body of a vLLM `POST /tokenize` that renders chat `messages` with the
+/// generation prompt.
+fn vllm_tokenize_messages_body(
+    model: &str,
+    messages: &[Message],
+    chat_template_kwargs: Option<&serde_json::Value>,
+) -> serde_json::Value {
+    let mut body = serde_json::json!({
+        "model": model,
+        "messages": messages,
+        "add_generation_prompt": true,
+    });
+    if let Some(kwargs) = chat_template_kwargs {
+        body["chat_template_kwargs"] = kwargs.clone();
+    }
+    body
+}
+
+/// Body of a vLLM `POST /tokenize` for plain text with no special tokens
+/// added.
+fn vllm_tokenize_text_body(model: &str, text: &str, with_pieces: bool) -> serde_json::Value {
+    serde_json::json!({
+        "model": model,
+        "prompt": text,
+        "add_special_tokens": false,
+        "return_token_strs": with_pieces,
+    })
+}
+
 /// vLLM `POST /detokenize` response.
 #[derive(Debug, Clone, Deserialize)]
 struct VllmDetokenizeResponse {
@@ -228,8 +257,8 @@ pub(crate) fn parse_vllm_tokenize(
 /// `<0xNN>`. A `<0xNN>` string is a single byte and returns `None`. Otherwise
 /// a string that uses only characters from the byte-level table is decoded as
 /// byte-level, and any other is treated as SentencePiece. A SentencePiece
-/// token with non-ASCII text and no `▁` therefore decodes as byte-level and
-/// usually returns `None`.
+/// token with no `▁` and characters in U+0080 to U+0143 is therefore decoded
+/// as byte-level and returns `None` or wrong text.
 pub(crate) fn vocab_piece_text(s: &str) -> Option<String> {
     if s.len() == 6 && s.starts_with("<0x") && s.ends_with('>') {
         return None;
@@ -241,8 +270,8 @@ pub(crate) fn vocab_piece_text(s: &str) -> Option<String> {
     }
 }
 
-/// The byte GPT-2's `bytes_to_unicode` maps to `c`, if any. Printable bytes
-/// other than space map to themselves; the remaining 68 bytes, in order, map
+/// The byte GPT-2's `bytes_to_unicode` maps to `c`, if any. Bytes 33-126,
+/// 161-172 and 174-255 map to themselves; the other 68 bytes, in order, map
 /// to U+0100 onwards.
 fn byte_level_byte(c: char) -> Option<u8> {
     let printable =
@@ -614,14 +643,7 @@ impl OpenAIClient {
         chat_template_kwargs: Option<&serde_json::Value>,
     ) -> Result<Vec<u32>> {
         let url = format!("{}/tokenize", self.server_root());
-        let mut body = serde_json::json!({
-            "model": self.model,
-            "messages": messages,
-            "add_generation_prompt": true,
-        });
-        if let Some(kwargs) = chat_template_kwargs {
-            body["chat_template_kwargs"] = kwargs.clone();
-        }
+        let body = vllm_tokenize_messages_body(&self.model, messages, chat_template_kwargs);
         let resp: serde_json::Value = self.post_with_retry(&url, &body).await?;
         Ok(parse_vllm_tokenize(&resp, false)?
             .into_iter()
@@ -630,21 +652,17 @@ impl OpenAIClient {
     }
 
     /// Tokens of `text` with no special tokens added, via vLLM's `POST
-    /// /tokenize` with `prompt`. With `with_pieces`, each token's text is
-    /// decoded from vLLM's `token_strs`; see [`parse_vllm_tokenize`]. vLLM
-    /// only.
+    /// /tokenize` with `prompt`. vLLM's tokenizer still turns special-token
+    /// text in `text` (for example `<|im_end|>`) into the special token. With
+    /// `with_pieces`, each token's text is decoded from vLLM's `token_strs`;
+    /// see [`parse_vllm_tokenize`]. vLLM only.
     pub async fn vllm_tokenize_text(
         &self,
         text: &str,
         with_pieces: bool,
     ) -> Result<Vec<TokenPiece>> {
         let url = format!("{}/tokenize", self.server_root());
-        let body = serde_json::json!({
-            "model": self.model,
-            "prompt": text,
-            "add_special_tokens": false,
-            "return_token_strs": with_pieces,
-        });
+        let body = vllm_tokenize_text_body(&self.model, text, with_pieces);
         let resp: serde_json::Value = self.post_with_retry(&url, &body).await?;
         parse_vllm_tokenize(&resp, with_pieces)
     }
@@ -1969,6 +1987,31 @@ mod tests {
         assert!(parse_vllm_tokenize(&mismatched, false).is_ok());
     }
 
+    fn fixture_json(s: &str) -> serde_json::Value {
+        serde_json::from_str(s).unwrap()
+    }
+
+    #[test]
+    fn vllm_tokenize_bodies_match_captured_requests() {
+        // tokenize-chat3 was sent with exactly the fields render sends.
+        let captured = fixture_json(include_str!(
+            "../tests/fixtures/vllm/qwen3.5-9b-fp8/tokenize-chat3.request.json"
+        ));
+        let messages: Vec<Message> = serde_json::from_value(captured["messages"].clone()).unwrap();
+        let kwargs = serde_json::json!({"enable_thinking": false});
+        assert_eq!(
+            vllm_tokenize_messages_body("qwen3.5-9b", &messages, Some(&kwargs)),
+            captured
+        );
+        let captured = fixture_json(include_str!(
+            "../tests/fixtures/vllm/qwen3.5-9b-fp8/tokenize-text.request.json"
+        ));
+        assert_eq!(
+            vllm_tokenize_text_body("qwen3.5-9b", "Hello world, this is a test.", true),
+            captured
+        );
+    }
+
     #[test]
     fn vocab_piece_text_decodes_byte_level_and_sentencepiece() {
         assert_eq!(vocab_piece_text("Ġworld").as_deref(), Some(" world"));
@@ -1980,6 +2023,12 @@ mod tests {
         assert_eq!(vocab_piece_text("Ã"), None);
         assert_eq!(vocab_piece_text("▁world").as_deref(), Some(" world"));
         assert_eq!(vocab_piece_text("<0x0A>"), None);
+        // GPT-2's table: byte 0 is U+0100, space U+0120, 127 U+0121, 173 U+0143.
+        assert_eq!(byte_level_byte('\u{100}'), Some(0));
+        assert_eq!(byte_level_byte('\u{120}'), Some(b' '));
+        assert_eq!(byte_level_byte('\u{121}'), Some(127));
+        assert_eq!(byte_level_byte('\u{143}'), Some(173));
+        assert_eq!(byte_level_byte('\u{144}'), None);
         // Every byte has a distinct character.
         let chars: std::collections::HashSet<u8> = (0u32..0x200)
             .filter_map(char::from_u32)

@@ -219,17 +219,18 @@ measured with the server's own chat template and tokenizer:
 | Prefix cache block | 1 token | `/metrics` `vllm:cache_config_info` `block_size` |
 | Build | `/props` `build_info` | `/version` |
 
-vLLM must run with `--enable-prefix-caching` (replay fails if
-`vllm:cache_config_info` shows it disabled) and
-`--enable-prompt-tokens-details`, so responses report cached tokens.
+vLLM must have prefix caching enabled (`--enable-prefix-caching`; replay fails
+unless `vllm:cache_config_info` shows `enable_prefix_caching="True"`) and must
+run with `--enable-prompt-tokens-details`, without which responses do not
+report cached tokens.
 
 The per-call log (`replay.log`) records, among other fields:
 
 - `expected_reuse`: tokens the prompt shares with the previous rendered prompt
   followed by the tokenized reply
-- `expected_cached`: `expected_reuse` rounded down to whole prefix cache blocks
-  and at most the prompt length minus one, since the server computes at least
-  the last prompt token; the most the server can report as cached
+- `expected_cached`: `min(expected_reuse, prompt_tokens - 1)` rounded down to a
+  whole number of prefix cache blocks; the server computes at least the last
+  prompt token
 - `cached_tokens`: cached prompt tokens the server reported
 - `lag_ms`: how far the call was sent behind its scaled source time
 - `overshoot`: the prompt is longer than traced, because the call adds fewer
@@ -238,16 +239,20 @@ The per-call log (`replay.log`) records, among other fields:
   tokenized reply; a token or two when re-tokenizing the reply gives fewer
   tokens than were generated, more when the server stopped early
 
-The summary's reuse permille percentiles are of `cached_tokens /
-expected_cached`.
+The summary's reuse permille percentiles are of `1000 * cached_tokens /
+expected_cached`, over calls with `expected_cached > 0`.
 
 With sessions replayed one at a time on Llama 3.1 8B against llama-server (nine
 sessions measured), `expected_reuse - cached_tokens` was 0, or 1 when the whole
 previous reply was kept: the server never runs the last generated token through
 the model, so it has no KV entry. With concurrent sessions, the difference also
-includes prefixes the server evicted. vLLM serving Qwen3.5 9B uses 528-token
-blocks; in a captured next turn, the rendered prompts shared 7019 tokens and
-vLLM reported 6864 cached, 13 whole blocks.
+includes prefixes the server evicted. For hybrid recurrent models such as
+Qwen3.5, llama-server resumes a cached prefix only from a context checkpoint,
+so `cached_tokens` can be below `expected_cached` without eviction.
+
+In a capture with vLLM 0.31.0 serving Qwen3.5 9B on an RTX 4090, the block size
+was 528 tokens; in a next turn the rendered prompts shared 7019 tokens and vLLM
+reported 6864 cached (13 blocks).
 
 Replay requires `endpoint.max_retries = 0` and no `endpoint.max_tokens`, and
 accepts only `duration_seconds` and `warmup_duration` from `[load]`. Every

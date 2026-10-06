@@ -6,7 +6,9 @@ All notable changes to this project will be documented in this file.
 
 ### Features
 
-- Trace replay against vLLM — `[replay] server = "vllm"` renders and tokenizes prompts with vLLM's `/tokenize` and `/detokenize`, and reads the per-request context from `/v1/models`, the version from `/version` and the prefix cache block size from the `vllm:cache_config_info` metric. The default, `"llama-server"`, is unchanged. The per-call log adds `expected_cached`: the expected reuse rounded down to whole cache blocks and capped at the prompt length minus one. The reuse permille percentiles and the `replay_reuse` `expected` counter now use it. The summary adds the server type, `server_cache_block` and `expected_cached_tokens`.
+- Trace replay against vLLM — `[replay] server = "vllm"` renders and tokenizes prompts with vLLM's `/tokenize` and `/detokenize`, and reads the per-request context from `/v1/models`, the version from `/version` and the prefix cache block size from the `vllm:cache_config_info` metric. The default is `"llama-server"`.
+  - The per-call log adds `expected_cached`: `min(expected_reuse, prompt_tokens - 1)` rounded down to whole cache blocks. The reuse permille percentiles and the `replay_reuse` `expected` counter now use it. For llama-server the block is 1 token, so its runs change only by the `prompt_tokens - 1` cap.
+  - The summary adds `server`, `server_cache_block` and `expected_cached_tokens`.
 
 ## [0.1.19] - 2026-10-03
 

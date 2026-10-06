@@ -72,7 +72,7 @@ pub struct CallRecord {
 #[derive(Debug, Default, Serialize)]
 pub struct ReplaySummary {
     pub server: ReplayServer,
-    /// llama-server's `build_info`, or "vllm" and vLLM's version.
+    /// llama-server's `build_info`, or vLLM's version.
     pub server_build: Option<String>,
     /// Longest prompt plus completion one request may have: llama-server's
     /// per-slot context, or vLLM's `max_model_len`.
@@ -120,6 +120,29 @@ struct Stats {
     lag_ms: Vec<f64>,
     ttft_ms: Vec<f64>,
     size_errors: Vec<f64>,
+}
+
+impl Stats {
+    /// Add a successful non-warmup call to the measured totals.
+    fn add_measured(&mut self, r: &CallRecord) {
+        self.calls_overshoot += r.overshoot as usize;
+        self.calls_shortfall += (r.shortfall > 0) as usize;
+        self.calls_eos_not_ignored +=
+            r.completion_tokens.is_some_and(|c| c < r.max_tokens as u64) as usize;
+        let cached = r.cached_tokens.unwrap_or(0);
+        self.expected_reuse_tokens += r.expected_reuse;
+        self.expected_cached_tokens += r.expected_cached;
+        self.cached_tokens += cached;
+        self.prefill_tokens += r.prompt_tokens.unwrap_or(0).saturating_sub(cached);
+        if r.expected_cached > 0 {
+            self.permille
+                .push(1000.0 * cached as f64 / r.expected_cached as f64);
+        }
+        self.lag_ms.push(r.lag_ms);
+        if let Some(t) = r.ttft_ms {
+            self.ttft_ms.push(t);
+        }
+    }
 }
 
 enum Outcome {
@@ -435,8 +458,8 @@ fn report(config: &Config, s: &ReplaySummary) -> Result<()> {
                  \x20 server: {} build {}, per-request context {} tokens, cache block {} tokens\n\
                  \x20 sessions: {} selected of {} ({} completed, {} failed, {} truncated)\n\
                  \x20 calls: {} sent, {} failed, {} overshoot, {} shortfall, {} EOS not ignored\n\
-                 \x20 reuse: expected {} tokens ({} cacheable), cached {} tokens, prefill computed {} tokens\n\
-                 \x20 cached/cacheable permille: p50 {}, p10 {}\n\
+                 \x20 reuse: expected {} tokens (expected_cached {}), cached {} tokens, prefill computed {} tokens\n\
+                 \x20 cached/expected_cached permille: p50 {}, p10 {}\n\
                  \x20 lag ms: p50 {}, p99 {}, max {}\n\
                  \x20 ttft ms: p50 {}, p99 {}\n\
                  \x20 prompt size error (median): {}\n",
@@ -674,7 +697,7 @@ async fn send_call(sh: &Shared, messages: &[Message], record: &mut CallRecord) -
     }
     guard.complete(RequestStatus::Success);
     debug!(
-        "session {} call {}: prompt {:?} expected {} cacheable {} cached {:?}",
+        "session {} call {}: prompt {:?} expected {} expected_cached {} cached {:?}",
         record.session_id,
         record.call,
         record.prompt_tokens,
@@ -717,23 +740,7 @@ fn account(sh: &Shared, r: &CallRecord) {
             .push((p as f64 - r.target_prompt as f64).abs() / r.target_prompt.max(1) as f64);
     }
     if !r.warmup {
-        st.calls_overshoot += r.overshoot as usize;
-        st.calls_shortfall += (r.shortfall > 0) as usize;
-        st.calls_eos_not_ignored +=
-            r.completion_tokens.is_some_and(|c| c < r.max_tokens as u64) as usize;
-        let cached = r.cached_tokens.unwrap_or(0);
-        st.expected_reuse_tokens += r.expected_reuse;
-        st.expected_cached_tokens += r.expected_cached;
-        st.cached_tokens += cached;
-        st.prefill_tokens += r.prompt_tokens.unwrap_or(0).saturating_sub(cached);
-        if r.expected_cached > 0 {
-            st.permille
-                .push(1000.0 * cached as f64 / r.expected_cached as f64);
-        }
-        st.lag_ms.push(r.lag_ms);
-        if let Some(t) = r.ttft_ms {
-            st.ttft_ms.push(t);
-        }
+        st.add_measured(r);
     }
     let n = st.size_errors.len();
     if n > 0 && n.is_multiple_of(SIZE_CHECK_EVERY) {
@@ -778,6 +785,25 @@ mod tests {
             e2e_ms: None,
             error: None,
         }
+    }
+
+    #[test]
+    fn reuse_permille_is_measured_against_expected_cached() {
+        // The captured vLLM next turn: 7019 shared tokens, 6864 cacheable in
+        // 528-token blocks, 6864 cached.
+        let mut r = record(Some(7100), Some(6864));
+        r.expected_reuse = 7019;
+        r.expected_cached = 6864;
+        let mut st = Stats::default();
+        st.add_measured(&r);
+        assert_eq!(st.permille, vec![1000.0]);
+        assert_eq!(st.expected_reuse_tokens, 7019);
+        assert_eq!(st.expected_cached_tokens, 6864);
+        assert_eq!(st.prefill_tokens, 7100 - 6864);
+        // A call with nothing cacheable is left out of the percentiles.
+        r.expected_cached = 0;
+        st.add_measured(&r);
+        assert_eq!(st.permille.len(), 1);
     }
 
     #[test]

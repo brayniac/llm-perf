@@ -8,7 +8,7 @@ use anyhow::{Context, Result, bail};
 /// Server properties a replay run depends on.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ServerInfo {
-    /// The server's build or version, for the report.
+    /// llama-server's `build_info` or vLLM's version, for the report.
     pub build: Option<String>,
     /// Longest prompt plus completion one request may have, in tokens.
     pub n_ctx: u64,
@@ -85,8 +85,12 @@ fn vllm_info(version: &str, models: &str, metrics: &str, model: &str) -> Result<
         .and_then(|v| v.as_u64())
         .with_context(|| format!("/v1/models has no max_model_len for {model}"))?;
     let label = |name: &str| metric_label(metrics, "vllm:cache_config_info", name);
-    if label("enable_prefix_caching").as_deref() != Some("True") {
-        bail!("vLLM is running without prefix caching; start it with --enable-prefix-caching");
+    match label("enable_prefix_caching").as_deref() {
+        Some("True") => {}
+        Some(_) => {
+            bail!("vLLM is running without prefix caching; start it with --enable-prefix-caching")
+        }
+        None => bail!("/metrics has no vllm:cache_config_info enable_prefix_caching label"),
     }
     let cache_block = label("block_size")
         .context("/metrics has no vllm:cache_config_info block_size")?
@@ -99,23 +103,28 @@ fn vllm_info(version: &str, models: &str, metrics: &str, model: &str) -> Result<
         build: version
             .get("version")
             .and_then(|v| v.as_str())
-            .map(|v| format!("vllm {v}")),
+            .map(str::to_string),
         n_ctx,
         cache_block,
     })
 }
 
 /// The value of label `name` on the first sample of `metric` in a Prometheus
-/// text exposition. Label values containing `"` or `,` are not handled.
+/// text exposition. Escaped quotes (`\"`) inside label values are not
+/// handled.
 fn metric_label(text: &str, metric: &str, name: &str) -> Option<String> {
-    let labels = text
+    let mut rest = text
         .lines()
         .find_map(|l| l.strip_prefix(metric)?.strip_prefix('{'))?;
-    let labels = &labels[..labels.find('}')?];
-    labels.split(',').find_map(|kv| {
-        let (k, v) = kv.split_once('=')?;
-        (k == name).then(|| v.trim_matches('"').to_string())
-    })
+    // Each label is `key="value"` followed by `,` or the closing `}`.
+    loop {
+        let (key, after) = rest.split_once("=\"")?;
+        let (value, after) = after.split_once('"')?;
+        if key.trim() == name {
+            return Some(value.to_string());
+        }
+        rest = after.strip_prefix(',')?;
+    }
 }
 
 /// The longest prefix of a prompt of `prompt_tokens` tokens that a cache
@@ -153,7 +162,7 @@ mod tests {
         assert_eq!(
             info,
             ServerInfo {
-                build: Some("vllm 0.31.0".to_string()),
+                build: Some("0.31.0".to_string()),
                 n_ctx: 131072,
                 cache_block: 528,
             }
@@ -166,6 +175,24 @@ mod tests {
         );
         let err = vllm_info(version, models, &off, "qwen3.5-9b").unwrap_err();
         assert!(err.to_string().contains("--enable-prefix-caching"), "{err}");
+        let err = vllm_info(version, models, "", "qwen3.5-9b").unwrap_err();
+        assert!(
+            err.to_string().contains("no vllm:cache_config_info"),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn metric_label_reads_values_with_commas_and_braces() {
+        let text = "# HELP m x\nm_other{block_size=\"1\"} 1\nm{a=\"[1, 2]\",b=\"{x}\",block_size=\"528\"} 1.0\n";
+        assert_eq!(metric_label(text, "m", "a").as_deref(), Some("[1, 2]"));
+        assert_eq!(metric_label(text, "m", "b").as_deref(), Some("{x}"));
+        assert_eq!(
+            metric_label(text, "m", "block_size").as_deref(),
+            Some("528")
+        );
+        assert_eq!(metric_label(text, "m", "missing"), None);
+        assert_eq!(metric_label(text, "absent", "a"), None);
     }
 
     #[test]
