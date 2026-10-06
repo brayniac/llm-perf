@@ -27,4 +27,4 @@ speedup = 24.0            # divides session start offsets, call durations and ga
 # max_gap_ms = 300000     # cap each gap after speedup; capped calls are flagged in the log
 # system_prompt_tokens = 0 # a system prompt of this many tokens shared by every session
 seed = 1                  # filler text; change it, or restart the server, between runs
-log = "replay.jsonl"      # one line per call: expected reuse, cached tokens, timings
+log = "replay.jsonl"      # one line per call: prompt and cached tokens, timings

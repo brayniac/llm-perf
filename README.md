@@ -216,22 +216,21 @@ measured with the server's own chat template and tokenizer:
 | Render chat messages | `/apply-template`, then `/tokenize` | `/tokenize` with `messages` |
 | Tokenize, detokenize | `/tokenize`, `/detokenize` | `/tokenize` with `prompt`, `/detokenize` |
 | Per-request context | `/props` `n_ctx` | `/v1/models` `max_model_len` |
-| Prefix cache block | 1 token | `/metrics` `vllm:cache_config_info` `block_size` |
 | Build | `/props` `build_info` | `/version` |
 
-vLLM must have prefix caching enabled (`--enable-prefix-caching`; replay fails
-unless `vllm:cache_config_info` shows `enable_prefix_caching="True"`) and must
-run with `--enable-prompt-tokens-details`, without which responses do not
-report cached tokens.
+vLLM must run with `--enable-prefix-caching` and
+`--enable-prompt-tokens-details`; without the second, responses do not report
+cached tokens.
+
+Reuse is measured from what the server reports for each call: `prompt_tokens`
+and `cached_tokens`. Replay does not predict how many tokens should be cached.
+To see whether reuse survives load, compare the cached/prompt ratio of a run
+against a low-load run of the same sessions.
 
 The per-call log (`replay.log`) records, among other fields:
 
-- `expected_reuse`: tokens the prompt shares with the previous rendered prompt
-  followed by the tokenized reply
-- `expected_cached`: `min(expected_reuse, prompt_tokens - 1)` rounded down to a
-  whole number of prefix cache blocks; the server computes at least the last
-  prompt token
-- `cached_tokens`: cached prompt tokens the server reported
+- `prompt_tokens`, `cached_tokens`: as the server reported them
+- `reuse`: the traced reuse the call was built with
 - `lag_ms`: how far the call was sent behind its scaled source time
 - `overshoot`: the prompt is longer than traced, because the call adds fewer
   tokens than a new message needs
@@ -239,33 +238,16 @@ The per-call log (`replay.log`) records, among other fields:
   tokenized reply; a token or two when re-tokenizing the reply gives fewer
   tokens than were generated, more when the server stopped early
 
-The summary's reuse permille percentiles are of `1000 * cached_tokens /
-expected_cached`, over calls with `expected_cached > 0`.
-
-With sessions replayed one at a time on Llama 3.1 8B against llama-server (nine
-sessions measured), `expected_reuse - cached_tokens` was 0, or 1 when the whole
-previous reply was kept: the server never runs the last generated token through
-the model, so it has no KV entry. With concurrent sessions, the difference also
-includes prefixes the server evicted. For hybrid recurrent models such as
-Qwen3.5, llama-server resumes a cached prefix only from a context checkpoint,
-so `cached_tokens` can be below `expected_cached` without eviction.
-
-In a capture with vLLM 0.31.0 serving Qwen3.5 9B on an RTX 4090, the block size
-was 528 tokens; in a next turn the rendered prompts shared 7019 tokens and vLLM
-reported 6864 cached (13 blocks). Replaying one six-call session alone,
-`cached_tokens` equalled `expected_cached` on every call. Under concurrent
-sessions, 36 of 177 calls were 1 to 7 blocks short, 28 of them with no other
-session's call sent since the session's previous call, so the shortfall is not
-eviction alone. For hybrid models, treat `cached_tokens / expected_cached` below
-1000 as including the server's state-saving granularity, and compare runs
-against a low-load run of the same model rather than against 1000.
+The summary reports prompt, cached and prefill-computed token totals, and
+percentiles of `1000 * cached_tokens / prompt_tokens` over calls whose traced
+`reuse` is above 0.
 
 Replay requires `endpoint.max_retries = 0` and no `endpoint.max_tokens`, and
 accepts only `duration_seconds` and `warmup_duration` from `[load]`. Every
 selected call must fit the server's per-request context. The run fails if a
 response reports no `usage.prompt_tokens_details`, since reuse cannot be
 measured without the server's cached token count. The summary reports the
-server type, build, per-request context and cache block size.
+server type, build and per-request context.
 Filler is fixed by `seed`, the session id and the call index, so a second run
 against a server that still holds the first run's prompts gets cache hits on
 first calls; restart the server or change `seed` between runs.

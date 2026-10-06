@@ -357,7 +357,7 @@ level = "info"
 # max_gap_ms = 300000       # cap each gap after speedup; capped calls are flagged in the log
 # seed = 1                  # filler text; change it, or restart the server, between runs
 # system_prompt_tokens = 0  # a system prompt of this many tokens shared by every session
-# log = "replay.jsonl"      # one line per call: expected reuse, cached tokens, timings
+# log = "replay.jsonl"      # one line per call: prompt and cached tokens, timings
 
 # =============================================================================
 # Saturation Search Configuration (Optional)

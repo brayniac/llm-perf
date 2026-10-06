@@ -32,9 +32,6 @@ pub struct BuiltCall {
     pub messages: Vec<Message>,
     /// Tokens of the rendered prompt.
     pub prompt_tokens: usize,
-    /// Length of the shared token prefix with the previous call's rendered
-    /// prompt followed by its tokenized reply.
-    pub expected_reuse: usize,
     /// Tokens of the requested reuse beyond the previous rendered prompt plus
     /// reply.
     pub shortfall: usize,
@@ -66,7 +63,7 @@ impl SessionPrompt {
         pool: &FillerPool,
         rng: &mut StdRng,
     ) -> Result<BuiltCall> {
-        let (mut kept, reference, shortfall) = self.cut(renderer, reuse).await?;
+        let (mut kept, shortfall) = self.cut(renderer, reuse).await?;
 
         if let Some(sys) = system
             && kept
@@ -122,8 +119,6 @@ impl SessionPrompt {
             }
         }
 
-        let expected_reuse = common_prefix(&rendered, &reference);
-
         // Content tokens: reused for whole kept messages that were located in
         // the previous prompt, re-tokenized otherwise.
         let mut segments = Vec::with_capacity(messages.len());
@@ -143,7 +138,6 @@ impl SessionPrompt {
         let built = BuiltCall {
             messages,
             prompt_tokens: rendered.len(),
-            expected_reuse,
             shortfall,
             overshoot: rendered.len() > prompt,
         };
@@ -171,26 +165,22 @@ impl SessionPrompt {
 
     /// The previous call's messages and reply, cut to `reuse` tokens of the
     /// reference (previous rendered prompt followed by the tokenized reply).
-    async fn cut<R: Renderer>(
-        &self,
-        renderer: &R,
-        reuse: usize,
-    ) -> Result<(Vec<Segment>, Vec<u32>, usize)> {
+    async fn cut<R: Renderer>(&self, renderer: &R, reuse: usize) -> Result<(Vec<Segment>, usize)> {
         let mut list = self.segments.clone();
-        let mut reference = self.rendered.clone();
+        let reference_len =
+            self.rendered.len() + self.reply.as_ref().map_or(0, |_| self.reply_tokens.len());
         let reply_index = self.reply.as_ref().map(|reply| {
-            reference.extend(&self.reply_tokens);
             list.push(reply.clone());
             list.len() - 1
         });
-        let shortfall = reuse.saturating_sub(reference.len());
-        let reuse = reuse.min(reference.len());
+        let shortfall = reuse.saturating_sub(reference_len);
+        let reuse = reuse.min(reference_len);
 
         let Some(j) = list
             .iter()
             .rposition(|s| s.start.is_some_and(|start| start <= reuse))
         else {
-            return Ok((Vec::new(), reference, shortfall));
+            return Ok((Vec::new(), shortfall));
         };
         let k = reuse - list[j].start.unwrap();
         // Positions inside the reply count generated tokens.
@@ -213,7 +203,7 @@ impl SessionPrompt {
                 start: None,
             });
         }
-        Ok((kept, reference, shortfall))
+        Ok((kept, shortfall))
     }
 }
 
@@ -231,15 +221,26 @@ fn locate(rendered: &[u32], segments: &mut [Segment]) {
     }
 }
 
-fn common_prefix(a: &[u32], b: &[u32]) -> usize {
-    a.iter().zip(b).take_while(|(x, y)| x == y).count()
-}
-
 #[cfg(test)]
 mod tests {
     use super::super::filler::{FillerPool, call_rng};
     use super::super::render::fake::FakeRenderer;
     use super::*;
+
+    /// The previous call's rendered prompt followed by its tokenized reply.
+    fn reference_of(s: &SessionPrompt) -> Vec<u32> {
+        [s.rendered.clone(), s.reply_tokens.clone()].concat()
+    }
+
+    /// Tokens the rendered prompt of `b` shares with `reference`.
+    async fn shared(r: &FakeRenderer, reference: &[u32], b: &BuiltCall) -> usize {
+        let rendered = r.render(&b.messages).await.unwrap();
+        rendered
+            .iter()
+            .zip(reference)
+            .take_while(|(x, y)| x == y)
+            .count()
+    }
 
     fn pool() -> FillerPool {
         let words: Vec<String> = (0..500).map(|i| format!("w{i}")).collect();
@@ -259,7 +260,6 @@ mod tests {
         let mut s = SessionPrompt::default();
         let b = first(&r, &mut s, 50).await;
         assert_eq!(b.prompt_tokens, 50);
-        assert_eq!(b.expected_reuse, 0);
         assert!(!b.overshoot);
         // [bos, <user>, 46 words, <end>, <assistant>]
         assert_eq!(s.segments[0].start, Some(2));
@@ -272,11 +272,12 @@ mod tests {
         let mut s = SessionPrompt::default();
         first(&r, &mut s, 14).await; // bos <user> 10 words <end> <assistant>
         s.record_reply(&r, "r1 r2 r3".to_string()).await.unwrap();
+        let reference = reference_of(&s);
         let b = s
             .build(&r, None, 15, 25, &pool(), &mut call_rng(1, "s", 1))
             .await
             .unwrap();
-        assert_eq!(b.expected_reuse, 15);
+        assert_eq!(shared(&r, &reference, &b).await, 15);
         assert_eq!(b.prompt_tokens, 25);
         let roles: Vec<&str> = b.messages.iter().map(|m| m.role.as_str()).collect();
         assert_eq!(roles, vec!["user", "assistant", "user"]);
@@ -289,12 +290,13 @@ mod tests {
         let mut s = SessionPrompt::default();
         first(&r, &mut s, 14).await;
         s.record_reply(&r, "r1 r2 r3".to_string()).await.unwrap();
+        let reference = reference_of(&s);
         let b = s
             .build(&r, None, 7, 20, &pool(), &mut call_rng(1, "s", 1))
             .await
             .unwrap();
         assert_eq!(b.messages.len(), 1);
-        assert_eq!(b.expected_reuse, 7);
+        assert_eq!(shared(&r, &reference, &b).await, 7);
         assert_eq!(b.prompt_tokens, 20);
     }
 
@@ -304,13 +306,14 @@ mod tests {
         let mut s = SessionPrompt::default();
         first(&r, &mut s, 14).await;
         s.record_reply(&r, "r1 r2 r3".to_string()).await.unwrap();
+        let reference = reference_of(&s);
         // Reference is 14 + 3 = 17 tokens.
         let b = s
             .build(&r, None, 20, 30, &pool(), &mut call_rng(1, "s", 1))
             .await
             .unwrap();
         assert_eq!(b.shortfall, 3);
-        assert_eq!(b.expected_reuse, 17);
+        assert_eq!(shared(&r, &reference, &b).await, 17);
     }
 
     #[tokio::test]
@@ -319,6 +322,7 @@ mod tests {
         let mut s = SessionPrompt::default();
         first(&r, &mut s, 14).await;
         s.record_reply(&r, "r1 r2 r3".to_string()).await.unwrap();
+        let reference = reference_of(&s);
         // Keep everything (17) and ask for 17: the reply adds <end>, a new user
         // message adds <user> word <end>, and the generation prompt adds
         // <assistant>.
@@ -327,7 +331,7 @@ mod tests {
             .await
             .unwrap();
         assert!(b.overshoot);
-        assert_eq!(b.expected_reuse, 17);
+        assert_eq!(shared(&r, &reference, &b).await, 17);
         assert_eq!(b.prompt_tokens, 22);
     }
 
@@ -343,6 +347,7 @@ mod tests {
         s.record_reply(&r, reply.trim_start().to_string())
             .await
             .unwrap();
+        let reference = reference_of(&s);
         // Keep the whole previous prompt and reply: 14 + 400 words + the
         // trailing space token. History renders the reply trimmed, so the
         // space is not shared.
@@ -350,15 +355,16 @@ mod tests {
             .build(&r, None, 415, 430, &pool(), &mut call_rng(1, "s", 1))
             .await
             .unwrap();
-        assert_eq!(b.expected_reuse, 414);
+        assert_eq!(shared(&r, &reference, &b).await, 414);
         assert!(s.segments.iter().all(|seg| seg.start.is_some()));
         s.record_reply(&r, "x1 x2".to_string()).await.unwrap();
+        let reference = reference_of(&s);
         // 425 lands inside the third message (user filler after the reply).
         let b = s
             .build(&r, None, 425, 440, &pool(), &mut call_rng(1, "s", 2))
             .await
             .unwrap();
-        assert_eq!(b.expected_reuse, 425);
+        assert_eq!(shared(&r, &reference, &b).await, 425);
         let roles: Vec<&str> = b.messages.iter().map(|m| m.role.as_str()).collect();
         assert_eq!(roles, vec!["user", "assistant", "user"]);
     }
@@ -378,12 +384,13 @@ mod tests {
         assert_eq!(b.messages[0].content, "s1 s2 s3 s4");
         assert_eq!(b.prompt_tokens, 30);
         s.record_reply(&r, "r1".to_string()).await.unwrap();
+        let reference = reference_of(&s);
         // A reuse inside the system prompt still keeps it whole.
         let b = s
             .build(&r, Some(&sys), 3, 30, &pool(), &mut call_rng(1, "s", 1))
             .await
             .unwrap();
         assert_eq!(b.messages[0].content, "s1 s2 s3 s4");
-        assert!(b.expected_reuse >= 6);
+        assert!(shared(&r, &reference, &b).await >= 6);
     }
 }

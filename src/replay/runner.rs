@@ -6,13 +6,13 @@ use super::prompt::SessionPrompt;
 use super::render::ServerRenderer;
 use super::sample::selected;
 use super::schedule::{session_slots, session_start};
-use super::server::{cacheable, probe};
+use super::server::probe;
 use crate::benchmark::{classify_error, decode_tpot, effective_output_tokens};
 use crate::client::{ClientConfig, Message, OpenAIClient};
 use crate::config::{Config, OutputFormat, ReplayConfig, ReplayServer};
 use crate::metrics::{
-    ErrorType, InflightGuard, Metrics, Phase, REPLAY_REUSE, REPLAY_REUSE_CACHED,
-    REPLAY_REUSE_EXPECTED, REPLAY_REUSE_PERMILLE, REPLAY_SESSION_COMPLETED, REPLAY_SESSION_FAILED,
+    ErrorType, InflightGuard, Metrics, Phase, REPLAY_CACHED_PERMILLE, REPLAY_REUSE,
+    REPLAY_REUSE_CACHED, REPLAY_REUSE_PROMPT, REPLAY_SESSION_COMPLETED, REPLAY_SESSION_FAILED,
     REPLAY_SESSION_STARTED, REPLAY_SESSION_TRUNCATED, REPLAY_SESSIONS, RequestStatus,
 };
 use crate::trace::TraceSession;
@@ -52,10 +52,6 @@ pub struct CallRecord {
     /// From the trace.
     pub reuse: u64,
     pub reuse_inferred: bool,
-    pub expected_reuse: u64,
-    /// `expected_reuse` limited to what the server's prefix cache can serve:
-    /// whole cache blocks, and not the prompt's last token.
-    pub expected_cached: u64,
     pub shortfall: u64,
     pub cached_tokens: Option<u64>,
     pub max_tokens: u32,
@@ -77,8 +73,6 @@ pub struct ReplaySummary {
     /// Longest prompt plus completion one request may have: llama-server's
     /// per-slot context, or vLLM's `max_model_len`.
     pub server_n_ctx: u64,
-    /// Tokens per prefix cache block; 1 for llama-server.
-    pub server_cache_block: u64,
     pub sessions_in_trace: usize,
     pub sessions_selected: usize,
     pub sessions_completed: usize,
@@ -89,14 +83,14 @@ pub struct ReplaySummary {
     pub calls_overshoot: usize,
     pub calls_shortfall: usize,
     pub calls_eos_not_ignored: usize,
-    pub expected_reuse_tokens: u64,
-    pub expected_cached_tokens: u64,
+    pub prompt_tokens: u64,
     pub cached_tokens: u64,
+    /// `prompt_tokens - cached_tokens`.
     pub prefill_tokens: u64,
-    /// Percentiles of 1000 * cached / expected_cached over calls with
-    /// expected_cached > 0.
-    pub reuse_permille_p50: Option<f64>,
-    pub reuse_permille_p10: Option<f64>,
+    /// Percentiles of 1000 * cached_tokens / prompt_tokens over calls whose
+    /// traced reuse is > 0.
+    pub cached_permille_p50: Option<f64>,
+    pub cached_permille_p10: Option<f64>,
     pub lag_ms_p50: Option<f64>,
     pub lag_ms_p99: Option<f64>,
     pub lag_ms_max: Option<f64>,
@@ -112,8 +106,7 @@ struct Stats {
     calls_overshoot: usize,
     calls_shortfall: usize,
     calls_eos_not_ignored: usize,
-    expected_reuse_tokens: u64,
-    expected_cached_tokens: u64,
+    prompt_tokens: u64,
     cached_tokens: u64,
     prefill_tokens: u64,
     permille: Vec<f64>,
@@ -130,13 +123,12 @@ impl Stats {
         self.calls_eos_not_ignored +=
             r.completion_tokens.is_some_and(|c| c < r.max_tokens as u64) as usize;
         let cached = r.cached_tokens.unwrap_or(0);
-        self.expected_reuse_tokens += r.expected_reuse;
-        self.expected_cached_tokens += r.expected_cached;
+        let prompt = r.prompt_tokens.unwrap_or(0);
+        self.prompt_tokens += prompt;
         self.cached_tokens += cached;
-        self.prefill_tokens += r.prompt_tokens.unwrap_or(0).saturating_sub(cached);
-        if r.expected_cached > 0 {
-            self.permille
-                .push(1000.0 * cached as f64 / r.expected_cached as f64);
+        self.prefill_tokens += prompt.saturating_sub(cached);
+        if r.reuse > 0 && prompt > 0 {
+            self.permille.push(1000.0 * cached as f64 / prompt as f64);
         }
         self.lag_ms.push(r.lag_ms);
         if let Some(t) = r.ttft_ms {
@@ -154,8 +146,6 @@ enum Outcome {
 struct Shared {
     client: Arc<OpenAIClient>,
     renderer: ServerRenderer,
-    /// Tokens per prefix cache block.
-    cache_block: u64,
     pool: FillerPool,
     system: Option<Message>,
     replay: ReplayConfig,
@@ -308,9 +298,8 @@ pub async fn run(mut config: Config) -> Result<()> {
     let server = probe(&aux_client, replay.server, &model).await?;
     let n_ctx = server.n_ctx;
     info!(
-        "server build {}, per-request context {n_ctx}, cache block {} tokens",
-        server.build.as_deref().unwrap_or("unknown"),
-        server.cache_block
+        "server build {}, per-request context {n_ctx}",
+        server.build.as_deref().unwrap_or("unknown")
     );
     let too_long = sessions
         .iter()
@@ -363,7 +352,6 @@ pub async fn run(mut config: Config) -> Result<()> {
     let shared = Arc::new(Shared {
         client,
         renderer,
-        cache_block: server.cache_block,
         pool,
         system,
         start,
@@ -421,7 +409,6 @@ pub async fn run(mut config: Config) -> Result<()> {
         server: replay.server,
         server_build: server.build,
         server_n_ctx: n_ctx,
-        server_cache_block: server.cache_block,
         sessions_in_trace,
         sessions_selected: selected_count,
         sessions_completed: completed,
@@ -432,12 +419,11 @@ pub async fn run(mut config: Config) -> Result<()> {
         calls_overshoot: st.calls_overshoot,
         calls_shortfall: st.calls_shortfall,
         calls_eos_not_ignored: st.calls_eos_not_ignored,
-        expected_reuse_tokens: st.expected_reuse_tokens,
-        expected_cached_tokens: st.expected_cached_tokens,
+        prompt_tokens: st.prompt_tokens,
         cached_tokens: st.cached_tokens,
         prefill_tokens: st.prefill_tokens,
-        reuse_permille_p50: percentile(&mut st.permille, 50.0),
-        reuse_permille_p10: percentile(&mut st.permille, 10.0),
+        cached_permille_p50: percentile(&mut st.permille, 50.0),
+        cached_permille_p10: percentile(&mut st.permille, 10.0),
         lag_ms_p50: percentile(&mut st.lag_ms, 50.0),
         lag_ms_p99: percentile(&mut st.lag_ms, 99.0),
         lag_ms_max: percentile(&mut st.lag_ms, 100.0),
@@ -455,11 +441,11 @@ fn report(config: &Config, s: &ReplaySummary) -> Result<()> {
             let f = |v: Option<f64>| v.map_or("-".to_string(), |v| format!("{v:.1}"));
             format!(
                 "Trace replay\n\
-                 \x20 server: {} build {}, per-request context {} tokens, cache block {} tokens\n\
+                 \x20 server: {} build {}, per-request context {} tokens\n\
                  \x20 sessions: {} selected of {} ({} completed, {} failed, {} truncated)\n\
                  \x20 calls: {} sent, {} failed, {} overshoot, {} shortfall, {} EOS not ignored\n\
-                 \x20 reuse: expected {} tokens (expected_cached {}), cached {} tokens, prefill computed {} tokens\n\
-                 \x20 cached/expected_cached permille: p50 {}, p10 {}\n\
+                 \x20 tokens: prompt {}, cached {}, prefill computed {}\n\
+                 \x20 cached/prompt permille (calls with traced reuse): p50 {}, p10 {}\n\
                  \x20 lag ms: p50 {}, p99 {}, max {}\n\
                  \x20 ttft ms: p50 {}, p99 {}\n\
                  \x20 prompt size error (median): {}\n",
@@ -469,7 +455,6 @@ fn report(config: &Config, s: &ReplaySummary) -> Result<()> {
                 },
                 s.server_build.as_deref().unwrap_or("unknown"),
                 s.server_n_ctx,
-                s.server_cache_block,
                 s.sessions_selected,
                 s.sessions_in_trace,
                 s.sessions_completed,
@@ -480,12 +465,11 @@ fn report(config: &Config, s: &ReplaySummary) -> Result<()> {
                 s.calls_overshoot,
                 s.calls_shortfall,
                 s.calls_eos_not_ignored,
-                s.expected_reuse_tokens,
-                s.expected_cached_tokens,
+                s.prompt_tokens,
                 s.cached_tokens,
                 s.prefill_tokens,
-                f(s.reuse_permille_p50),
-                f(s.reuse_permille_p10),
+                f(s.cached_permille_p50),
+                f(s.cached_permille_p10),
                 f(s.lag_ms_p50),
                 f(s.lag_ms_p99),
                 f(s.lag_ms_max),
@@ -536,8 +520,6 @@ async fn run_session(sh: Arc<Shared>, s: TraceSession, offset: Duration) -> Outc
                 overshoot: false,
                 reuse: c.reuse,
                 reuse_inferred: c.reuse_inferred,
-                expected_reuse: 0,
-                expected_cached: 0,
                 shortfall: 0,
                 cached_tokens: None,
                 max_tokens: c.completion.clamp(1, u32::MAX as u64) as u32,
@@ -567,12 +549,6 @@ async fn run_session(sh: Arc<Shared>, s: TraceSession, offset: Duration) -> Outc
                     break 'calls Outcome::Failed;
                 }
             };
-            record.expected_reuse = built.expected_reuse as u64;
-            record.expected_cached = cacheable(
-                record.expected_reuse,
-                built.prompt_tokens as u64,
-                sh.cache_block,
-            );
             record.shortfall = built.shortfall as u64;
             record.overshoot = built.overshoot;
 
@@ -688,22 +664,17 @@ async fn send_call(sh: &Shared, messages: &[Message], record: &mut CallRecord) -
         {
             Metrics::record_tpot(tpot, Phase::Content);
         }
-        if record.expected_cached > 0 {
-            let cached = record.cached_tokens.unwrap_or(0);
-            REPLAY_REUSE.add(REPLAY_REUSE_EXPECTED, record.expected_cached);
-            REPLAY_REUSE.add(REPLAY_REUSE_CACHED, cached);
-            let _ = REPLAY_REUSE_PERMILLE.increment(1000 * cached / record.expected_cached);
+        let cached = record.cached_tokens.unwrap_or(0);
+        REPLAY_REUSE.add(REPLAY_REUSE_PROMPT, input);
+        REPLAY_REUSE.add(REPLAY_REUSE_CACHED, cached);
+        if record.reuse > 0 && input > 0 {
+            let _ = REPLAY_CACHED_PERMILLE.increment(1000 * cached / input);
         }
     }
     guard.complete(RequestStatus::Success);
     debug!(
-        "session {} call {}: prompt {:?} expected {} expected_cached {} cached {:?}",
-        record.session_id,
-        record.call,
-        record.prompt_tokens,
-        record.expected_reuse,
-        record.expected_cached,
-        record.cached_tokens
+        "session {} call {}: prompt {:?} cached {:?}",
+        record.session_id, record.call, record.prompt_tokens, record.cached_tokens
     );
     Some(content)
 }
@@ -774,8 +745,6 @@ mod tests {
             overshoot: false,
             reuse: 50,
             reuse_inferred: false,
-            expected_reuse: 50,
-            expected_cached: 50,
             shortfall: 0,
             cached_tokens: cached,
             max_tokens: 10,
@@ -788,22 +757,21 @@ mod tests {
     }
 
     #[test]
-    fn reuse_permille_is_measured_against_expected_cached() {
-        // The captured vLLM next turn: 7019 shared tokens, 6864 cacheable in
-        // 528-token blocks, 6864 cached.
+    fn cached_permille_is_cached_over_prompt_tokens() {
+        // The captured vLLM next turn: 7100 prompt tokens, 6864 cached.
         let mut r = record(Some(7100), Some(6864));
-        r.expected_reuse = 7019;
-        r.expected_cached = 6864;
         let mut st = Stats::default();
         st.add_measured(&r);
-        assert_eq!(st.permille, vec![1000.0]);
-        assert_eq!(st.expected_reuse_tokens, 7019);
-        assert_eq!(st.expected_cached_tokens, 6864);
+        assert_eq!(st.permille, vec![1000.0 * 6864.0 / 7100.0]);
+        assert_eq!(st.prompt_tokens, 7100);
+        assert_eq!(st.cached_tokens, 6864);
         assert_eq!(st.prefill_tokens, 7100 - 6864);
-        // A call with nothing cacheable is left out of the percentiles.
-        r.expected_cached = 0;
+        // A call the trace built with no reuse counts in the totals but not in
+        // the percentiles.
+        r.reuse = 0;
         st.add_measured(&r);
         assert_eq!(st.permille.len(), 1);
+        assert_eq!(st.prompt_tokens, 14200);
     }
 
     #[test]

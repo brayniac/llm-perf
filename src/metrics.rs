@@ -191,19 +191,17 @@ pub const CACHE_EXPECTED_MISS_IDX: usize = 1;
 #[metric(name = "ttft_by_cache", metadata = { unit = "nanoseconds" })]
 pub static TTFT_BY_CACHE: HistogramGroup = HistogramGroup::new(2, 7, 64);
 
-// Replay: each call's `expected_cached` (the shared prefix in whole cache
-// blocks, below the prompt length) and the cached prompt tokens the server
-// reported.
-pub const REPLAY_REUSE_EXPECTED: usize = 0;
+// Replay: prompt tokens and cached prompt tokens the server reported.
+pub const REPLAY_REUSE_PROMPT: usize = 0;
 pub const REPLAY_REUSE_CACHED: usize = 1;
 
 #[metric(name = "replay_reuse")]
 pub static REPLAY_REUSE: CounterGroup = CounterGroup::new(2);
 
-/// Per non-warmup call with `expected_cached` > 0: 1000 * cached /
-/// expected_cached. Exceeds 1000 when the server cached more than that.
-#[metric(name = "replay_reuse_permille")]
-pub static REPLAY_REUSE_PERMILLE: AtomicHistogram = AtomicHistogram::new(7, 64);
+/// Per non-warmup call whose traced reuse is > 0: 1000 * cached / prompt
+/// tokens, as the server reported them.
+#[metric(name = "replay_cached_permille")]
+pub static REPLAY_CACHED_PERMILLE: AtomicHistogram = AtomicHistogram::new(7, 64);
 
 pub const REPLAY_SESSION_STARTED: usize = 0;
 pub const REPLAY_SESSION_COMPLETED: usize = 1;
@@ -351,7 +349,7 @@ impl Metrics {
             );
         }
 
-        for (idx, kind) in ["expected", "cached"].iter().enumerate() {
+        for (idx, kind) in ["prompt", "cached"].iter().enumerate() {
             REPLAY_REUSE.set_metadata(idx, HashMap::from([("kind".to_string(), kind.to_string())]));
         }
         for (idx, status) in ["started", "completed", "failed", "truncated"]
