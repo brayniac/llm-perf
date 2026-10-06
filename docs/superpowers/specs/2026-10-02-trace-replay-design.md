@@ -103,6 +103,17 @@ those of `tests/fixtures/vllm/capture.sh`.
   version.
 - At `--gpu-memory-utilization 0.92` the KV cache is 264,714 tokens (2.02
   requests of 131,072).
+- A replay of one six-call session alone (cuts of 4 to 217 tokens before the
+  previous prompt's end) gave `cached_tokens == expected_cached` on all five
+  calls with reuse. A 30-minute replay at sample 0.004 and speedup 1.5 (seven
+  sessions with calls, at most three requests running) gave 134 of 177
+  measured calls equal, 36 short by 1 to 7 blocks and 7 short by 9 to 93
+  blocks. 28 of the 36 had no other session's call sent between the
+  session's previous call and this one. A short call's `cached_tokens` was
+  often 0 to 3 blocks past the previous call's `cached_tokens`, which fits
+  `align` mode saving the recurrent state only at the ends of scheduled
+  prefill chunks rather than at every block; vLLM's scheduler steps were not
+  logged, so this is not confirmed.
 
 ## Trace facts this design depends on
 

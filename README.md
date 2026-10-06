@@ -252,7 +252,13 @@ so `cached_tokens` can be below `expected_cached` without eviction.
 
 In a capture with vLLM 0.31.0 serving Qwen3.5 9B on an RTX 4090, the block size
 was 528 tokens; in a next turn the rendered prompts shared 7019 tokens and vLLM
-reported 6864 cached (13 blocks).
+reported 6864 cached (13 blocks). Replaying one six-call session alone,
+`cached_tokens` equalled `expected_cached` on every call. Under concurrent
+sessions, 36 of 177 calls were 1 to 7 blocks short, 28 of them with no other
+session's call sent since the session's previous call, so the shortfall is not
+eviction alone. For hybrid models, treat `cached_tokens / expected_cached` below
+1000 as including the server's state-saving granularity, and compare runs
+against a low-load run of the same model rather than against 1000.
 
 Replay requires `endpoint.max_retries = 0` and no `endpoint.max_tokens`, and
 accepts only `duration_seconds` and `warmup_duration` from `[load]`. Every
