@@ -308,7 +308,7 @@ Per call, appended to `replay.log` when set:
 Reuse is measured only by what the server reports: `prompt_tokens` and
 `cached_tokens`. Replay does not predict how many tokens should be cached.
 Loss of reuse under load shows as a lower cached/prompt ratio than in a
-low-load run of the same sessions.
+low-load run of the same sessions, compared on the calls both runs sent.
 
 Aggregates, named like the existing metrics in `src/metrics.rs`:
 

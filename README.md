@@ -225,7 +225,10 @@ cached tokens.
 Reuse is measured from what the server reports for each call: `prompt_tokens`
 and `cached_tokens`. Replay does not predict how many tokens should be cached.
 To see whether reuse survives load, compare the cached/prompt ratio of a run
-against a low-load run of the same sessions.
+against a low-load run of the same sessions, on the calls both runs sent (join
+the logs on `session_id` and `call`). An overloaded run falls behind and sends
+fewer of each session's later, longer calls, so the summaries of the two runs
+cover different calls.
 
 The per-call log (`replay.log`) records, among other fields:
 
