@@ -1,6 +1,7 @@
 //! Rendering and tokenization of chat messages, as the server does them.
 
 use crate::client::{Message, OpenAIClient, TokenPiece};
+use crate::config::ReplayServer;
 use anyhow::Result;
 use std::future::Future;
 use std::sync::Arc;
@@ -64,6 +65,94 @@ impl Renderer for LlamaServerRenderer {
 
     async fn tokenize_pieces(&self, text: &str) -> Result<Vec<TokenPiece>> {
         self.client.tokenize_pieces(text, false, false, true).await
+    }
+}
+
+/// `Renderer` backed by vLLM's `/tokenize` (with chat messages for `render`)
+/// and `/detokenize`. `chat_template_kwargs` must match the generation
+/// requests.
+pub struct VllmRenderer {
+    client: Arc<OpenAIClient>,
+    chat_template_kwargs: Option<serde_json::Value>,
+}
+
+impl VllmRenderer {
+    pub fn new(client: Arc<OpenAIClient>, chat_template_kwargs: Option<serde_json::Value>) -> Self {
+        Self {
+            client,
+            chat_template_kwargs,
+        }
+    }
+}
+
+impl Renderer for VllmRenderer {
+    async fn render(&self, messages: &[Message]) -> Result<Vec<u32>> {
+        self.client
+            .vllm_tokenize_messages(messages, self.chat_template_kwargs.as_ref())
+            .await
+    }
+
+    async fn tokenize(&self, text: &str) -> Result<Vec<u32>> {
+        Ok(ids(self.client.vllm_tokenize_text(text, false).await?))
+    }
+
+    async fn detokenize(&self, tokens: &[u32]) -> Result<String> {
+        self.client.vllm_detokenize(tokens).await
+    }
+
+    async fn tokenize_pieces(&self, text: &str) -> Result<Vec<TokenPiece>> {
+        self.client.vllm_tokenize_text(text, true).await
+    }
+}
+
+/// The renderer for the server type in `[replay] server`.
+pub enum ServerRenderer {
+    LlamaServer(LlamaServerRenderer),
+    Vllm(VllmRenderer),
+}
+
+impl ServerRenderer {
+    pub fn new(
+        server: ReplayServer,
+        client: Arc<OpenAIClient>,
+        chat_template_kwargs: Option<serde_json::Value>,
+    ) -> Self {
+        match server {
+            ReplayServer::LlamaServer => {
+                Self::LlamaServer(LlamaServerRenderer::new(client, chat_template_kwargs))
+            }
+            ReplayServer::Vllm => Self::Vllm(VllmRenderer::new(client, chat_template_kwargs)),
+        }
+    }
+}
+
+impl Renderer for ServerRenderer {
+    async fn render(&self, messages: &[Message]) -> Result<Vec<u32>> {
+        match self {
+            Self::LlamaServer(r) => r.render(messages).await,
+            Self::Vllm(r) => r.render(messages).await,
+        }
+    }
+
+    async fn tokenize(&self, text: &str) -> Result<Vec<u32>> {
+        match self {
+            Self::LlamaServer(r) => r.tokenize(text).await,
+            Self::Vllm(r) => r.tokenize(text).await,
+        }
+    }
+
+    async fn detokenize(&self, tokens: &[u32]) -> Result<String> {
+        match self {
+            Self::LlamaServer(r) => r.detokenize(tokens).await,
+            Self::Vllm(r) => r.detokenize(tokens).await,
+        }
+    }
+
+    async fn tokenize_pieces(&self, text: &str) -> Result<Vec<TokenPiece>> {
+        match self {
+            Self::LlamaServer(r) => r.tokenize_pieces(text).await,
+            Self::Vllm(r) => r.tokenize_pieces(text).await,
+        }
     }
 }
 

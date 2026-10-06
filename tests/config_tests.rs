@@ -1,4 +1,4 @@
-use llm_perf::config::Config;
+use llm_perf::config::{Config, ReplayServer};
 use std::path::PathBuf;
 
 fn base_toml() -> &'static str {
@@ -147,6 +147,16 @@ fn replay_parses_without_input_or_load() {
     assert_eq!(replay.speedup, 24.0);
     assert_eq!(replay.seed, 1);
     assert_eq!(replay.system_prompt_tokens, 0);
+    assert_eq!(replay.server, ReplayServer::LlamaServer);
+}
+
+#[test]
+fn replay_server_selects_vllm_and_rejects_unknown() {
+    let cfg = Config::from_toml(&replay_toml("server = \"vllm\"")).unwrap();
+    assert_eq!(cfg.replay.unwrap().server, ReplayServer::Vllm);
+    let cfg = Config::from_toml(&replay_toml("server = \"llama-server\"")).unwrap();
+    assert_eq!(cfg.replay.unwrap().server, ReplayServer::LlamaServer);
+    assert!(Config::from_toml(&replay_toml("server = \"sglang\"")).is_err());
 }
 
 #[test]

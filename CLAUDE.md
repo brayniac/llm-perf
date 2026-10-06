@@ -65,7 +65,7 @@ cargo clippy
 - `src/logprobs.rs` - Log probability collection and JSONL writer
 - `src/kl_divergence.rs` - KL divergence computation between logprob captures
 - `src/trace.rs` - `convert-trace`: coding-agent session dataset to per-session replay trace
-- `src/replay/` - Trace replay (`[replay]` config): session sampling, scaled schedule, filler, prompt construction against llama-server, runner
+- `src/replay/` - Trace replay (`[replay]` config): session sampling, scaled schedule, filler, prompt construction against llama-server or vLLM, server probing, runner
 - `src/mmlu_pro/` - MMLU-Pro accuracy evaluation (`mmlu-pro` subcommand)
 - `examples/config.example.toml` - Comprehensive configuration reference
 

@@ -3,12 +3,13 @@
 
 use super::filler::{FillerPool, call_rng};
 use super::prompt::SessionPrompt;
-use super::render::LlamaServerRenderer;
+use super::render::ServerRenderer;
 use super::sample::selected;
 use super::schedule::{session_slots, session_start};
+use super::server::{cacheable, probe};
 use crate::benchmark::{classify_error, decode_tpot, effective_output_tokens};
 use crate::client::{ClientConfig, Message, OpenAIClient};
-use crate::config::{Config, OutputFormat, ReplayConfig};
+use crate::config::{Config, OutputFormat, ReplayConfig, ReplayServer};
 use crate::metrics::{
     ErrorType, InflightGuard, Metrics, Phase, REPLAY_REUSE, REPLAY_REUSE_CACHED,
     REPLAY_REUSE_EXPECTED, REPLAY_REUSE_PERMILLE, REPLAY_SESSION_COMPLETED, REPLAY_SESSION_FAILED,
@@ -52,6 +53,9 @@ pub struct CallRecord {
     pub reuse: u64,
     pub reuse_inferred: bool,
     pub expected_reuse: u64,
+    /// `expected_reuse` limited to what the server's prefix cache can serve:
+    /// whole cache blocks, and not the prompt's last token.
+    pub expected_cached: u64,
     pub shortfall: u64,
     pub cached_tokens: Option<u64>,
     pub max_tokens: u32,
@@ -67,10 +71,14 @@ pub struct CallRecord {
 /// other total and percentile covers non-warmup calls that succeeded.
 #[derive(Debug, Default, Serialize)]
 pub struct ReplaySummary {
-    /// The server's `build_info` from `/props`.
+    pub server: ReplayServer,
+    /// llama-server's `build_info`, or "vllm" and vLLM's version.
     pub server_build: Option<String>,
-    /// The server's per-slot context from `/props`.
+    /// Longest prompt plus completion one request may have: llama-server's
+    /// per-slot context, or vLLM's `max_model_len`.
     pub server_n_ctx: u64,
+    /// Tokens per prefix cache block; 1 for llama-server.
+    pub server_cache_block: u64,
     pub sessions_in_trace: usize,
     pub sessions_selected: usize,
     pub sessions_completed: usize,
@@ -82,8 +90,11 @@ pub struct ReplaySummary {
     pub calls_shortfall: usize,
     pub calls_eos_not_ignored: usize,
     pub expected_reuse_tokens: u64,
+    pub expected_cached_tokens: u64,
     pub cached_tokens: u64,
     pub prefill_tokens: u64,
+    /// Percentiles of 1000 * cached / expected_cached over calls with
+    /// expected_cached > 0.
     pub reuse_permille_p50: Option<f64>,
     pub reuse_permille_p10: Option<f64>,
     pub lag_ms_p50: Option<f64>,
@@ -102,6 +113,7 @@ struct Stats {
     calls_shortfall: usize,
     calls_eos_not_ignored: usize,
     expected_reuse_tokens: u64,
+    expected_cached_tokens: u64,
     cached_tokens: u64,
     prefill_tokens: u64,
     permille: Vec<f64>,
@@ -118,7 +130,9 @@ enum Outcome {
 
 struct Shared {
     client: Arc<OpenAIClient>,
-    renderer: LlamaServerRenderer,
+    renderer: ServerRenderer,
+    /// Tokens per prefix cache block.
+    cache_block: u64,
     pool: FillerPool,
     system: Option<Message>,
     replay: ReplayConfig,
@@ -267,19 +281,13 @@ pub async fn run(mut config: Config) -> Result<()> {
     // Render, tokenize and detokenize requests are idempotent and may retry.
     let aux_client = Arc::new(OpenAIClient::new(client_config(3, 32))?);
 
-    // Every call must fit the server's per-slot context.
-    let props = client
-        .props()
-        .await
-        .context("reading the server's /props")?;
-    let n_ctx = props
-        .pointer("/default_generation_settings/n_ctx")
-        .and_then(|v| v.as_u64())
-        .context("/props has no default_generation_settings.n_ctx")?;
-    let build = server_build(&props);
+    // Every call must fit the server's per-request context.
+    let server = probe(&aux_client, replay.server, &model).await?;
+    let n_ctx = server.n_ctx;
     info!(
-        "server build {}, per-slot context {n_ctx}",
-        build.as_deref().unwrap_or("unknown")
+        "server build {}, per-request context {n_ctx}, cache block {} tokens",
+        server.build.as_deref().unwrap_or("unknown"),
+        server.cache_block
     );
     let too_long = sessions
         .iter()
@@ -287,11 +295,12 @@ pub async fn run(mut config: Config) -> Result<()> {
         .count();
     if too_long > 0 {
         bail!(
-            "{too_long} selected sessions have a call longer than the server's per-slot context ({n_ctx} tokens); convert the trace with --max-context {n_ctx}"
+            "{too_long} selected sessions have a call longer than the server's per-request context ({n_ctx} tokens); convert the trace with --max-context {n_ctx}"
         );
     }
 
-    let renderer = LlamaServerRenderer::new(
+    let renderer = ServerRenderer::new(
+        replay.server,
         aux_client.clone(),
         config.endpoint.chat_template_kwargs.clone(),
     );
@@ -331,6 +340,7 @@ pub async fn run(mut config: Config) -> Result<()> {
     let shared = Arc::new(Shared {
         client,
         renderer,
+        cache_block: server.cache_block,
         pool,
         system,
         start,
@@ -385,8 +395,10 @@ pub async fn run(mut config: Config) -> Result<()> {
 
     let mut st = shared.stats.into_inner().unwrap();
     let summary = ReplaySummary {
-        server_build: build,
+        server: replay.server,
+        server_build: server.build,
         server_n_ctx: n_ctx,
+        server_cache_block: server.cache_block,
         sessions_in_trace,
         sessions_selected: selected_count,
         sessions_completed: completed,
@@ -398,6 +410,7 @@ pub async fn run(mut config: Config) -> Result<()> {
         calls_shortfall: st.calls_shortfall,
         calls_eos_not_ignored: st.calls_eos_not_ignored,
         expected_reuse_tokens: st.expected_reuse_tokens,
+        expected_cached_tokens: st.expected_cached_tokens,
         cached_tokens: st.cached_tokens,
         prefill_tokens: st.prefill_tokens,
         reuse_permille_p50: percentile(&mut st.permille, 50.0),
@@ -419,16 +432,21 @@ fn report(config: &Config, s: &ReplaySummary) -> Result<()> {
             let f = |v: Option<f64>| v.map_or("-".to_string(), |v| format!("{v:.1}"));
             format!(
                 "Trace replay\n\
-                 \x20 server: build {}, per-slot context {} tokens\n\
+                 \x20 server: {} build {}, per-request context {} tokens, cache block {} tokens\n\
                  \x20 sessions: {} selected of {} ({} completed, {} failed, {} truncated)\n\
                  \x20 calls: {} sent, {} failed, {} overshoot, {} shortfall, {} EOS not ignored\n\
-                 \x20 reuse: expected {} tokens, cached {} tokens, prefill computed {} tokens\n\
-                 \x20 cached/expected permille: p50 {}, p10 {}\n\
+                 \x20 reuse: expected {} tokens ({} cacheable), cached {} tokens, prefill computed {} tokens\n\
+                 \x20 cached/cacheable permille: p50 {}, p10 {}\n\
                  \x20 lag ms: p50 {}, p99 {}, max {}\n\
                  \x20 ttft ms: p50 {}, p99 {}\n\
                  \x20 prompt size error (median): {}\n",
+                match s.server {
+                    ReplayServer::LlamaServer => "llama-server",
+                    ReplayServer::Vllm => "vllm",
+                },
                 s.server_build.as_deref().unwrap_or("unknown"),
                 s.server_n_ctx,
+                s.server_cache_block,
                 s.sessions_selected,
                 s.sessions_in_trace,
                 s.sessions_completed,
@@ -440,6 +458,7 @@ fn report(config: &Config, s: &ReplaySummary) -> Result<()> {
                 s.calls_shortfall,
                 s.calls_eos_not_ignored,
                 s.expected_reuse_tokens,
+                s.expected_cached_tokens,
                 s.cached_tokens,
                 s.prefill_tokens,
                 f(s.reuse_permille_p50),
@@ -495,6 +514,7 @@ async fn run_session(sh: Arc<Shared>, s: TraceSession, offset: Duration) -> Outc
                 reuse: c.reuse,
                 reuse_inferred: c.reuse_inferred,
                 expected_reuse: 0,
+                expected_cached: 0,
                 shortfall: 0,
                 cached_tokens: None,
                 max_tokens: c.completion.clamp(1, u32::MAX as u64) as u32,
@@ -525,6 +545,11 @@ async fn run_session(sh: Arc<Shared>, s: TraceSession, offset: Duration) -> Outc
                 }
             };
             record.expected_reuse = built.expected_reuse as u64;
+            record.expected_cached = cacheable(
+                record.expected_reuse,
+                built.prompt_tokens as u64,
+                sh.cache_block,
+            );
             record.shortfall = built.shortfall as u64;
             record.overshoot = built.overshoot;
 
@@ -640,20 +665,21 @@ async fn send_call(sh: &Shared, messages: &[Message], record: &mut CallRecord) -
         {
             Metrics::record_tpot(tpot, Phase::Content);
         }
-        if record.expected_reuse > 0 {
+        if record.expected_cached > 0 {
             let cached = record.cached_tokens.unwrap_or(0);
-            REPLAY_REUSE.add(REPLAY_REUSE_EXPECTED, record.expected_reuse);
+            REPLAY_REUSE.add(REPLAY_REUSE_EXPECTED, record.expected_cached);
             REPLAY_REUSE.add(REPLAY_REUSE_CACHED, cached);
-            let _ = REPLAY_REUSE_PERMILLE.increment(1000 * cached / record.expected_reuse);
+            let _ = REPLAY_REUSE_PERMILLE.increment(1000 * cached / record.expected_cached);
         }
     }
     guard.complete(RequestStatus::Success);
     debug!(
-        "session {} call {}: prompt {:?} expected {} cached {:?}",
+        "session {} call {}: prompt {:?} expected {} cacheable {} cached {:?}",
         record.session_id,
         record.call,
         record.prompt_tokens,
         record.expected_reuse,
+        record.expected_cached,
         record.cached_tokens
     );
     Some(content)
@@ -672,14 +698,6 @@ fn missing_usage(r: &CallRecord) -> Option<String> {
         "session {} call {}: the response has no {missing}; replay needs the server's prompt and cached token counts",
         r.session_id, r.call
     ))
-}
-
-/// The server's build from `/props` (`build_info`, for example "b1-4ebdf2c").
-fn server_build(props: &serde_json::Value) -> Option<String> {
-    props
-        .get("build_info")
-        .and_then(|b| b.as_str())
-        .map(str::to_string)
 }
 
 fn account(sh: &Shared, r: &CallRecord) {
@@ -705,11 +723,12 @@ fn account(sh: &Shared, r: &CallRecord) {
             r.completion_tokens.is_some_and(|c| c < r.max_tokens as u64) as usize;
         let cached = r.cached_tokens.unwrap_or(0);
         st.expected_reuse_tokens += r.expected_reuse;
+        st.expected_cached_tokens += r.expected_cached;
         st.cached_tokens += cached;
         st.prefill_tokens += r.prompt_tokens.unwrap_or(0).saturating_sub(cached);
-        if r.expected_reuse > 0 {
+        if r.expected_cached > 0 {
             st.permille
-                .push(1000.0 * cached as f64 / r.expected_reuse as f64);
+                .push(1000.0 * cached as f64 / r.expected_cached as f64);
         }
         st.lag_ms.push(r.lag_ms);
         if let Some(t) = r.ttft_ms {
@@ -749,6 +768,7 @@ mod tests {
             reuse: 50,
             reuse_inferred: false,
             expected_reuse: 50,
+            expected_cached: 50,
             shortfall: 0,
             cached_tokens: cached,
             max_tokens: 10,
@@ -771,16 +791,6 @@ mod tests {
         assert!(no_details.contains("session s call 3"), "{no_details}");
         let no_usage = missing_usage(&record(None, None)).unwrap();
         assert!(no_usage.contains("no usage;"), "{no_usage}");
-    }
-
-    #[test]
-    fn server_build_reads_captured_props() {
-        let props: serde_json::Value = serde_json::from_str(include_str!(
-            "../../tests/fixtures/llama-server/llama-3.1-8b-instruct-q8_0/props.json"
-        ))
-        .unwrap();
-        assert_eq!(server_build(&props).as_deref(), Some("b1-4ebdf2c"));
-        assert_eq!(server_build(&serde_json::json!({})), None);
     }
 
     #[tokio::test]

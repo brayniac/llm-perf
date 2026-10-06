@@ -1,6 +1,7 @@
 # Replay coding-agent sessions from `llm-perf convert-trace` against
-# llama-server. Convert with --max-context set to the server's per-slot
-# context: default_generation_settings.n_ctx in its /props.
+# llama-server or vLLM. Convert with --max-context set to the server's per-request
+# context: default_generation_settings.n_ctx in llama-server's /props, or
+# max_model_len in vLLM's /v1/models.
 
 [endpoint]
 base_url = "http://localhost:8080/v1"
@@ -19,6 +20,7 @@ format = "console"
 
 [replay]
 trace = "trace.jsonl"
+# server = "vllm"         # default "llama-server"; vLLM needs --enable-prefix-caching and --enable-prompt-tokens-details
 sample = 0.001            # fraction of sessions, chosen by session id; 1.0 replays all
 speedup = 24.0            # divides session start offsets, call durations and gaps
 # sample_seed = 0         # a different sample of the same size

@@ -195,8 +195,9 @@ day of input and 1.4 GB for three days.
 ### Trace replay
 
 A `[replay]` section in a bench config replays the sessions in a
-`convert-trace` file against llama-server, instead of drawing requests from
-`[input]`. See `examples/scenarios/trace-replay.toml`.
+`convert-trace` file against llama-server or vLLM, instead of drawing requests
+from `[input]`. `server` selects the server type: `"llama-server"` (the
+default) or `"vllm"`. See `examples/scenarios/trace-replay.toml`.
 
 ```bash
 llm-perf bench examples/scenarios/trace-replay.toml
@@ -208,13 +209,27 @@ previous call of the session has finished. Each prompt repeats the previous
 call's messages and the server's actual reply, cut to the traced `reuse` in
 tokens, and adds filler words to reach the traced `prompt` size. Each call asks
 for the traced `completion` length with `ignore_eos`. Sizes and cut points are
-measured with the server's `/apply-template`, `/tokenize` and `/detokenize`,
-and the context limit is read from `/props`, so replay needs llama-server.
+measured with the server's own chat template and tokenizer:
+
+| | llama-server | vLLM |
+|---|---|---|
+| Render chat messages | `/apply-template`, then `/tokenize` | `/tokenize` with `messages` |
+| Tokenize, detokenize | `/tokenize`, `/detokenize` | `/tokenize` with `prompt`, `/detokenize` |
+| Per-request context | `/props` `n_ctx` | `/v1/models` `max_model_len` |
+| Prefix cache block | 1 token | `/metrics` `vllm:cache_config_info` `block_size` |
+| Build | `/props` `build_info` | `/version` |
+
+vLLM must run with `--enable-prefix-caching` (replay fails if
+`vllm:cache_config_info` shows it disabled) and
+`--enable-prompt-tokens-details`, so responses report cached tokens.
 
 The per-call log (`replay.log`) records, among other fields:
 
 - `expected_reuse`: tokens the prompt shares with the previous rendered prompt
   followed by the tokenized reply
+- `expected_cached`: `expected_reuse` rounded down to whole prefix cache blocks
+  and at most the prompt length minus one, since the server computes at least
+  the last prompt token; the most the server can report as cached
 - `cached_tokens`: cached prompt tokens the server reported
 - `lag_ms`: how far the call was sent behind its scaled source time
 - `overshoot`: the prompt is longer than traced, because the call adds fewer
@@ -223,18 +238,23 @@ The per-call log (`replay.log`) records, among other fields:
   tokenized reply; a token or two when re-tokenizing the reply gives fewer
   tokens than were generated, more when the server stopped early
 
-With sessions replayed one at a time on Llama 3.1 8B (nine sessions measured),
-`expected_reuse - cached_tokens` was 0, or 1 when the whole previous reply was
-kept: the server never runs the last generated token through the model, so it
-has no KV entry. With concurrent sessions, the difference also includes
-prefixes the server evicted.
+The summary's reuse permille percentiles are of `cached_tokens /
+expected_cached`.
+
+With sessions replayed one at a time on Llama 3.1 8B against llama-server (nine
+sessions measured), `expected_reuse - cached_tokens` was 0, or 1 when the whole
+previous reply was kept: the server never runs the last generated token through
+the model, so it has no KV entry. With concurrent sessions, the difference also
+includes prefixes the server evicted. vLLM serving Qwen3.5 9B uses 528-token
+blocks; in a captured next turn, the rendered prompts shared 7019 tokens and
+vLLM reported 6864 cached, 13 whole blocks.
 
 Replay requires `endpoint.max_retries = 0` and no `endpoint.max_tokens`, and
 accepts only `duration_seconds` and `warmup_duration` from `[load]`. Every
-selected call must fit the server's per-slot context, read from `/props`. The
-run fails if a response reports no `usage.prompt_tokens_details`, since reuse
-cannot be measured without the server's cached token count. The summary
-reports the server's `build_info`.
+selected call must fit the server's per-request context. The run fails if a
+response reports no `usage.prompt_tokens_details`, since reuse cannot be
+measured without the server's cached token count. The summary reports the
+server type, build, per-request context and cache block size.
 Filler is fixed by `seed`, the session id and the call index, so a second run
 against a server that still holds the first run's prompts gets cache hits on
 first calls; restart the server or change `seed` between runs.

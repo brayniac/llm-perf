@@ -7,3 +7,4 @@ pub mod render;
 pub mod runner;
 pub mod sample;
 pub mod schedule;
+pub mod server;

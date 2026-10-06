@@ -19,7 +19,9 @@ target-model token counts; the source's models and tokenizers are unknown.
 First target: llama-server (llama.cpp), with Llama 3.1 8B as the
 dense-attention control and Qwen3.5 9B as the realistic target.
 
-Out of scope for this spec: sending token IDs instead of text, vLLM and SGLang
+Second target: vLLM, with Qwen3.5 9B (see "vLLM capture findings").
+
+Out of scope for this spec: sending token IDs instead of text, SGLang
 specifics, tool-call message shapes, and multimodal content.
 
 ---
@@ -69,6 +71,38 @@ requests with `/apply-template` and tokenizing them.
 - From the server log: with `-np 2` given explicitly, `kv_unified = 'false'`
   and each slot holds `-c / -np` tokens. The default `--cache-ram` is 8192 MiB,
   which holds about 65,536 tokens of Llama 3.1 8B KV (128 KiB per token).
+
+### vLLM capture findings
+
+Captured 2026-10-06 against vLLM 0.31.0 serving Qwen3.5 9B (bf16 weights
+quantized at load with `--quantization fp8_per_tensor`) on an RTX 4090, with
+`--enable-prefix-caching --enable-prompt-tokens-details --max-model-len
+131072`. Fixtures are in `tests/fixtures/vllm/qwen3.5-9b-fp8/`; the calls are
+those of `tests/fixtures/vllm/capture.sh`.
+
+| Call | Prompt | Shared prefix with call 1 | Cached |
+|---|---|---|---|
+| 1: system + long user message | 7,023 | | 0 |
+| 2: call 1 again | 7,023 | 7,023 | 6,864 |
+| 3: call 1 + reply + new user message | 7,100 | 7,019 | 6,864 |
+
+- `/tokenize` with `messages`, `add_generation_prompt` and
+  `chat_template_kwargs` returns the tokens `/v1/chat/completions` generates
+  from (7,023 for call 1 both ways). With `prompt` and `add_special_tokens:
+  false` it tokenizes plain text. `return_token_strs` adds each token's
+  vocabulary string (`Ġworld`), not its text; replay decodes these with
+  GPT-2's byte-to-character table. `/detokenize` takes `tokens` and returns
+  `prompt`.
+- For Qwen3.5 with prefix caching, vLLM sets `mamba_cache_mode` to `align` and
+  the attention block size to 528 tokens, so the cache serves whole 528-token
+  blocks: 6,864 is 13 blocks. The block size is a label on the
+  `vllm:cache_config_info` metric, with `enable_prefix_caching`.
+- `usage.prompt_tokens_details` has `cached_tokens` and `created_cache_tokens`
+  in the final streamed chunk.
+- `/v1/models` gives the served model's `max_model_len`, and `/version` the
+  version.
+- At `--gpu-memory-utilization 0.92` the KV cache is 264,714 tokens (2.02
+  requests of 131,072).
 
 ## Trace facts this design depends on
 
@@ -142,9 +176,11 @@ not reproduce.
 Runs use 131,072 tokens per slot for both models (Llama 3.1's maximum), with
 the trace converted using `convert-trace --max-context 131072`, so the Llama
 and Qwen runs replay the same sessions: 83.9% of sessions and 64.1% of calls on
-2026-06-03. At startup the replay reads the per-slot context from `/props`
-(`default_generation_settings.n_ctx`) and fails if any selected call's
-`prompt + completion` exceeds it.
+2026-06-03. At startup the replay reads the per-request context, from
+llama-server's `/props` (`default_generation_settings.n_ctx`) or vLLM's
+`/v1/models` (`max_model_len`), and fails if any selected call's
+`prompt + completion` exceeds it. It also reads the prefix cache block size:
+1 for llama-server, `block_size` from vLLM's `vllm:cache_config_info`.
 
 Sessions with several model labels are replayed against the one configured
 model; the labels are anonymised.
@@ -258,23 +294,30 @@ Per call, appended to `replay.log` when set:
 
 `session_id`, `call`, `model` (trace label), `scheduled_ms`, `sent_ms`,
 `lag_ms`, `gap_capped`, `warmup`, `target_prompt`, `prompt_tokens`,
-`overshoot`, `reuse` (trace), `reuse_inferred`, `expected_reuse`, `shortfall`,
-`cached_tokens`, `max_tokens`, `completion_tokens`, `finish_reason`,
-`ttft_ms`, `e2e_ms`, `error`.
+`overshoot`, `reuse` (trace), `reuse_inferred`, `expected_reuse`,
+`expected_cached`, `shortfall`, `cached_tokens`, `max_tokens`,
+`completion_tokens`, `finish_reason`, `ttft_ms`, `e2e_ms`, `error`.
+
+`expected_cached` is `min(expected_reuse, prompt_tokens - 1)` rounded down to
+a whole number of cache blocks: the most the server can report cached when
+it has evicted nothing.
 
 Aggregates, named like the existing metrics in `src/metrics.rs`:
 
-- `replay_reuse` counter group, `kind` = `expected` or `cached`;
-- `replay_reuse_permille` histogram of `1000 * cached / expected` for calls
-  with `expected_reuse > 0`;
+- `replay_reuse` counter group, `kind` = `expected` (summing
+  `expected_cached`) or `cached`;
+- `replay_reuse_permille` histogram of `1000 * cached / expected_cached` for
+  calls with `expected_cached > 0`;
 - `replay_sessions` counter group, `status` = `started`, `completed`,
   `failed` or `truncated`;
 - `schedule_slip` records `lag_ms` for successful non-warmup calls;
 - the existing request, token, TTFT, ITL, TPOT and latency metrics.
 
 The run ends with a summary (console or JSON per `output.format`): the
-server's `build_info` and per-slot context from `/props`, session outcomes, call counts, expected and cached reuse totals, prefill tokens
-computed (`prompt_tokens - cached_tokens`), percentiles of cached/expected,
+server type, build, per-request context and cache block size, session
+outcomes, call counts, expected, cacheable and cached reuse totals, prefill
+tokens computed (`prompt_tokens - cached_tokens`), percentiles of
+cached/expected_cached,
 `lag_ms` and TTFT, and the median prompt size error.
 
 A successful call whose response has no `usage` or no
