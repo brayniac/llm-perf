@@ -249,20 +249,29 @@ The per-call log (`replay.log`) records, among other fields:
   tokens than were generated, more when the server stopped early
 
 The summary counts calls whose `prompt_tokens` differ from `rendered_tokens`
-(`calls_render_mismatch`, warmup included) and the largest difference
-(`render_mismatch_max_tokens`), and replay logs the first one as a warning. A
-nonzero count means the server built a different prompt from the one replay
-rendered:
+(`calls_render_mismatch`) and records the largest difference
+(`render_mismatch_max_tokens`); both include warmup. Replay logs the first
+mismatched call as a warning. A mismatch means the server built a different
+prompt from the one replay rendered. Replay cuts in its own rendered tokens and
+sends text, so:
 
-- a constant difference at the start (a start token) moves every cut position
-  by that many tokens;
-- a constant difference at the end (a generation-prompt suffix) changes only
-  the prompt length;
+- a constant difference at the start (a start token) makes every prompt, and
+  the prefix it shares with the previous call, that many tokens longer in the
+  server's tokens; the cut falls at the same text;
+- a constant difference at the end (a generation-prompt suffix) makes the
+  prompt that many tokens longer, and when the cut falls inside the previous
+  reply the server can share fewer tokens with the previous call than the
+  traced reuse, because the suffix sat between that prompt and the reply;
 - a difference in how earlier messages render can move cut positions by more
   than the length difference shows.
 
-A mismatch does not fail the run; the prompt size check fails it when the
-median size error exceeds 1%.
+The per-call log shows whether the difference is the same on every call; it
+does not show whether it is at the start or the end.
+
+A mismatch does not fail the run. Each time another 100 calls have reported
+`prompt_tokens`, warmup included, the run fails if the median of
+`|prompt_tokens - target_prompt| / target_prompt` over all of them exceeds
+0.01.
 
 The summary also reports prompt, cached and prefill-computed token totals, and
 percentiles of `1000 * cached_tokens / prompt_tokens` over successful
