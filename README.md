@@ -253,17 +253,19 @@ The summary counts calls whose `prompt_tokens` differ from `rendered_tokens`
 (`render_mismatch_max_tokens`); both include warmup. Replay logs the first
 mismatched call as a warning. A mismatch means the server built a different
 prompt from the one replay rendered. Replay cuts in its own rendered tokens and
-sends text, so:
+sends text. The list below describes a server prompt longer than replay's; a
+shorter one changes the lengths the other way.
 
 - a constant difference at the start (a start token) makes every prompt, and
   the prefix it shares with the previous call, that many tokens longer in the
   server's tokens; the cut falls at the same text;
 - a constant difference at the end (a generation-prompt suffix) makes the
-  prompt that many tokens longer, and when the cut falls inside the previous
-  reply the server can share fewer tokens with the previous call than the
+  prompt that many tokens longer. When the cut falls inside the previous
+  reply, the server can share fewer tokens with the previous call than the
   traced reuse, because the suffix sat between that prompt and the reply;
-- a difference in how earlier messages render can move cut positions by more
-  than the length difference shows.
+- a difference in how earlier messages render can change the prefix the
+  server shares with the previous call by more than the length difference
+  shows.
 
 The per-call log shows whether the difference is the same on every call; it
 does not show whether it is at the start or the end.
