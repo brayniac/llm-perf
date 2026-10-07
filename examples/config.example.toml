@@ -343,20 +343,21 @@ level = "info"
 # =============================================================================
 # Trace Replay Configuration (Optional)
 # =============================================================================
-# Replays `llm-perf convert-trace` sessions against llama-server instead of
+# Replays `llm-perf convert-trace` sessions against llama-server or vLLM instead of
 # drawing requests from [input]. With [replay], omit [input], and of [load]
 # use only duration_seconds and warmup_duration. Requires max_retries = 0 and
 # no endpoint.max_tokens. See examples/scenarios/trace-replay.toml.
 #
 # [replay]
 # trace = "trace.jsonl"     # output of convert-trace
+# server = "llama-server"   # or "vllm" (needs --enable-prefix-caching and --enable-prompt-tokens-details)
 # sample = 0.001            # fraction of sessions, chosen by session id; 1.0 replays all
 # sample_seed = 0           # a different sample of the same size
 # speedup = 24.0            # divides session start offsets, call durations and gaps
 # max_gap_ms = 300000       # cap each gap after speedup; capped calls are flagged in the log
 # seed = 1                  # filler text; change it, or restart the server, between runs
 # system_prompt_tokens = 0  # a system prompt of this many tokens shared by every session
-# log = "replay.jsonl"      # one line per call: expected reuse, cached tokens, timings
+# log = "replay.jsonl"      # one line per call: prompt and cached tokens, timings
 
 # =============================================================================
 # Saturation Search Configuration (Optional)

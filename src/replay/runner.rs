@@ -3,15 +3,16 @@
 
 use super::filler::{FillerPool, call_rng};
 use super::prompt::SessionPrompt;
-use super::render::LlamaServerRenderer;
+use super::render::ServerRenderer;
 use super::sample::selected;
 use super::schedule::{session_slots, session_start};
+use super::server::probe;
 use crate::benchmark::{classify_error, decode_tpot, effective_output_tokens};
 use crate::client::{ClientConfig, Message, OpenAIClient};
-use crate::config::{Config, OutputFormat, ReplayConfig};
+use crate::config::{Config, OutputFormat, ReplayConfig, ReplayServer};
 use crate::metrics::{
-    ErrorType, InflightGuard, Metrics, Phase, REPLAY_REUSE, REPLAY_REUSE_CACHED,
-    REPLAY_REUSE_EXPECTED, REPLAY_REUSE_PERMILLE, REPLAY_SESSION_COMPLETED, REPLAY_SESSION_FAILED,
+    ErrorType, InflightGuard, Metrics, Phase, REPLAY_CACHED_PERMILLE, REPLAY_REUSE,
+    REPLAY_REUSE_CACHED, REPLAY_REUSE_PROMPT, REPLAY_SESSION_COMPLETED, REPLAY_SESSION_FAILED,
     REPLAY_SESSION_STARTED, REPLAY_SESSION_TRUNCATED, REPLAY_SESSIONS, RequestStatus,
 };
 use crate::trace::TraceSession;
@@ -46,12 +47,14 @@ pub struct CallRecord {
     pub gap_capped: bool,
     pub warmup: bool,
     pub target_prompt: u64,
+    /// Length of the prompt as replay rendered it with the server's
+    /// tokenize endpoint; `None` when building the prompt failed.
+    pub rendered_tokens: Option<u64>,
     pub prompt_tokens: Option<u64>,
     pub overshoot: bool,
     /// From the trace.
     pub reuse: u64,
     pub reuse_inferred: bool,
-    pub expected_reuse: u64,
     pub shortfall: u64,
     pub cached_tokens: Option<u64>,
     pub max_tokens: u32,
@@ -63,13 +66,16 @@ pub struct CallRecord {
 }
 
 /// Totals printed or written at the end of a run. `calls_sent`,
-/// `calls_failed` and `prompt_size_error_median` include warmup calls; every
-/// other total and percentile covers non-warmup calls that succeeded.
+/// `calls_failed`, `calls_render_mismatch`, `render_mismatch_max_tokens` and
+/// `prompt_size_error_median` include warmup calls; every other total and
+/// percentile covers non-warmup calls that succeeded.
 #[derive(Debug, Default, Serialize)]
 pub struct ReplaySummary {
-    /// The server's `build_info` from `/props`.
+    pub server: ReplayServer,
+    /// llama-server's `build_info`, or vLLM's version.
     pub server_build: Option<String>,
-    /// The server's per-slot context from `/props`.
+    /// Longest prompt plus completion one request may have: llama-server's
+    /// per-slot context, or vLLM's `max_model_len`.
     pub server_n_ctx: u64,
     pub sessions_in_trace: usize,
     pub sessions_selected: usize,
@@ -81,11 +87,23 @@ pub struct ReplaySummary {
     pub calls_overshoot: usize,
     pub calls_shortfall: usize,
     pub calls_eos_not_ignored: usize,
-    pub expected_reuse_tokens: u64,
+    /// Calls whose reported `prompt_tokens` differ from `rendered_tokens`:
+    /// the server built a different prompt from the one replay rendered.
+    pub calls_render_mismatch: usize,
+    /// Largest `|prompt_tokens - rendered_tokens|` over those calls; 0 when
+    /// there are none.
+    pub render_mismatch_max_tokens: u64,
+    pub prompt_tokens: u64,
     pub cached_tokens: u64,
+    /// `prompt_tokens - cached_tokens`.
     pub prefill_tokens: u64,
-    pub reuse_permille_p50: Option<f64>,
-    pub reuse_permille_p10: Option<f64>,
+    /// Calls the cached permille percentiles cover.
+    pub calls_measured: usize,
+    /// Percentiles of 1000 * cached_tokens / prompt_tokens over calls whose
+    /// traced reuse is > 0. A call's value is about `1000 * reuse /
+    /// prompt_tokens` at most, and this bound differs between calls.
+    pub cached_permille_p50: Option<f64>,
+    pub cached_permille_p10: Option<f64>,
     pub lag_ms_p50: Option<f64>,
     pub lag_ms_p99: Option<f64>,
     pub lag_ms_max: Option<f64>,
@@ -101,13 +119,54 @@ struct Stats {
     calls_overshoot: usize,
     calls_shortfall: usize,
     calls_eos_not_ignored: usize,
-    expected_reuse_tokens: u64,
+    calls_render_mismatch: usize,
+    render_mismatch_max_tokens: u64,
+    prompt_tokens: u64,
     cached_tokens: u64,
     prefill_tokens: u64,
     permille: Vec<f64>,
     lag_ms: Vec<f64>,
     ttft_ms: Vec<f64>,
     size_errors: Vec<f64>,
+}
+
+impl Stats {
+    /// Count a successful call whose reported prompt length differs from the
+    /// rendered one. Returns both lengths for the first such call, so the
+    /// caller can log it.
+    fn add_render(&mut self, r: &CallRecord) -> Option<(u64, u64)> {
+        let (Some(reported), Some(rendered)) = (r.prompt_tokens, r.rendered_tokens) else {
+            return None;
+        };
+        if reported == rendered {
+            return None;
+        }
+        self.calls_render_mismatch += 1;
+        self.render_mismatch_max_tokens = self
+            .render_mismatch_max_tokens
+            .max(reported.abs_diff(rendered));
+        (self.calls_render_mismatch == 1).then_some((reported, rendered))
+    }
+
+    /// Add a successful non-warmup call to the measured totals.
+    fn add_measured(&mut self, r: &CallRecord) {
+        self.calls_overshoot += r.overshoot as usize;
+        self.calls_shortfall += (r.shortfall > 0) as usize;
+        self.calls_eos_not_ignored +=
+            r.completion_tokens.is_some_and(|c| c < r.max_tokens as u64) as usize;
+        let cached = r.cached_tokens.unwrap_or(0);
+        let prompt = r.prompt_tokens.unwrap_or(0);
+        self.prompt_tokens += prompt;
+        self.cached_tokens += cached;
+        self.prefill_tokens += prompt.saturating_sub(cached);
+        if r.reuse > 0 && prompt > 0 {
+            self.permille.push(1000.0 * cached as f64 / prompt as f64);
+        }
+        self.lag_ms.push(r.lag_ms);
+        if let Some(t) = r.ttft_ms {
+            self.ttft_ms.push(t);
+        }
+    }
 }
 
 enum Outcome {
@@ -118,7 +177,7 @@ enum Outcome {
 
 struct Shared {
     client: Arc<OpenAIClient>,
-    renderer: LlamaServerRenderer,
+    renderer: ServerRenderer,
     pool: FillerPool,
     system: Option<Message>,
     replay: ReplayConfig,
@@ -267,19 +326,12 @@ pub async fn run(mut config: Config) -> Result<()> {
     // Render, tokenize and detokenize requests are idempotent and may retry.
     let aux_client = Arc::new(OpenAIClient::new(client_config(3, 32))?);
 
-    // Every call must fit the server's per-slot context.
-    let props = client
-        .props()
-        .await
-        .context("reading the server's /props")?;
-    let n_ctx = props
-        .pointer("/default_generation_settings/n_ctx")
-        .and_then(|v| v.as_u64())
-        .context("/props has no default_generation_settings.n_ctx")?;
-    let build = server_build(&props);
+    // Every call must fit the server's per-request context.
+    let server = probe(&aux_client, replay.server, &model).await?;
+    let n_ctx = server.n_ctx;
     info!(
-        "server build {}, per-slot context {n_ctx}",
-        build.as_deref().unwrap_or("unknown")
+        "server build {}, per-request context {n_ctx}",
+        server.build.as_deref().unwrap_or("unknown")
     );
     let too_long = sessions
         .iter()
@@ -287,11 +339,12 @@ pub async fn run(mut config: Config) -> Result<()> {
         .count();
     if too_long > 0 {
         bail!(
-            "{too_long} selected sessions have a call longer than the server's per-slot context ({n_ctx} tokens); convert the trace with --max-context {n_ctx}"
+            "{too_long} selected sessions have a call longer than the server's per-request context ({n_ctx} tokens); convert the trace with --max-context {n_ctx}"
         );
     }
 
-    let renderer = LlamaServerRenderer::new(
+    let renderer = ServerRenderer::new(
+        replay.server,
         aux_client.clone(),
         config.endpoint.chat_template_kwargs.clone(),
     );
@@ -385,7 +438,8 @@ pub async fn run(mut config: Config) -> Result<()> {
 
     let mut st = shared.stats.into_inner().unwrap();
     let summary = ReplaySummary {
-        server_build: build,
+        server: replay.server,
+        server_build: server.build,
         server_n_ctx: n_ctx,
         sessions_in_trace,
         sessions_selected: selected_count,
@@ -397,11 +451,14 @@ pub async fn run(mut config: Config) -> Result<()> {
         calls_overshoot: st.calls_overshoot,
         calls_shortfall: st.calls_shortfall,
         calls_eos_not_ignored: st.calls_eos_not_ignored,
-        expected_reuse_tokens: st.expected_reuse_tokens,
+        calls_render_mismatch: st.calls_render_mismatch,
+        render_mismatch_max_tokens: st.render_mismatch_max_tokens,
+        prompt_tokens: st.prompt_tokens,
         cached_tokens: st.cached_tokens,
         prefill_tokens: st.prefill_tokens,
-        reuse_permille_p50: percentile(&mut st.permille, 50.0),
-        reuse_permille_p10: percentile(&mut st.permille, 10.0),
+        calls_measured: st.permille.len(),
+        cached_permille_p50: percentile(&mut st.permille, 50.0),
+        cached_permille_p10: percentile(&mut st.permille, 10.0),
         lag_ms_p50: percentile(&mut st.lag_ms, 50.0),
         lag_ms_p99: percentile(&mut st.lag_ms, 99.0),
         lag_ms_max: percentile(&mut st.lag_ms, 100.0),
@@ -419,14 +476,18 @@ fn report(config: &Config, s: &ReplaySummary) -> Result<()> {
             let f = |v: Option<f64>| v.map_or("-".to_string(), |v| format!("{v:.1}"));
             format!(
                 "Trace replay\n\
-                 \x20 server: build {}, per-slot context {} tokens\n\
+                 \x20 server: {} build {}, per-request context {} tokens\n\
                  \x20 sessions: {} selected of {} ({} completed, {} failed, {} truncated)\n\
-                 \x20 calls: {} sent, {} failed, {} overshoot, {} shortfall, {} EOS not ignored\n\
-                 \x20 reuse: expected {} tokens, cached {} tokens, prefill computed {} tokens\n\
-                 \x20 cached/expected permille: p50 {}, p10 {}\n\
+                 \x20 calls: {} sent, {} failed, {} overshoot, {} shortfall, {} EOS not ignored, {} render mismatch (max {} tokens)\n\
+                 \x20 tokens: prompt {}, cached {}, prefill computed {}\n\
+                 \x20 cached/prompt permille ({} calls with traced reuse): p50 {}, p10 {}\n\
                  \x20 lag ms: p50 {}, p99 {}, max {}\n\
                  \x20 ttft ms: p50 {}, p99 {}\n\
                  \x20 prompt size error (median): {}\n",
+                match s.server {
+                    ReplayServer::LlamaServer => "llama-server",
+                    ReplayServer::Vllm => "vllm",
+                },
                 s.server_build.as_deref().unwrap_or("unknown"),
                 s.server_n_ctx,
                 s.sessions_selected,
@@ -439,11 +500,14 @@ fn report(config: &Config, s: &ReplaySummary) -> Result<()> {
                 s.calls_overshoot,
                 s.calls_shortfall,
                 s.calls_eos_not_ignored,
-                s.expected_reuse_tokens,
+                s.calls_render_mismatch,
+                s.render_mismatch_max_tokens,
+                s.prompt_tokens,
                 s.cached_tokens,
                 s.prefill_tokens,
-                f(s.reuse_permille_p50),
-                f(s.reuse_permille_p10),
+                s.calls_measured,
+                f(s.cached_permille_p50),
+                f(s.cached_permille_p10),
                 f(s.lag_ms_p50),
                 f(s.lag_ms_p99),
                 f(s.lag_ms_max),
@@ -490,11 +554,11 @@ async fn run_session(sh: Arc<Shared>, s: TraceSession, offset: Duration) -> Outc
                 gap_capped: slots[i].gap_capped,
                 warmup: false,
                 target_prompt: c.prompt,
+                rendered_tokens: None,
                 prompt_tokens: None,
                 overshoot: false,
                 reuse: c.reuse,
                 reuse_inferred: c.reuse_inferred,
-                expected_reuse: 0,
                 shortfall: 0,
                 cached_tokens: None,
                 max_tokens: c.completion.clamp(1, u32::MAX as u64) as u32,
@@ -524,7 +588,7 @@ async fn run_session(sh: Arc<Shared>, s: TraceSession, offset: Duration) -> Outc
                     break 'calls Outcome::Failed;
                 }
             };
-            record.expected_reuse = built.expected_reuse as u64;
+            record.rendered_tokens = Some(built.prompt_tokens as u64);
             record.shortfall = built.shortfall as u64;
             record.overshoot = built.overshoot;
 
@@ -640,26 +704,21 @@ async fn send_call(sh: &Shared, messages: &[Message], record: &mut CallRecord) -
         {
             Metrics::record_tpot(tpot, Phase::Content);
         }
-        if record.expected_reuse > 0 {
-            let cached = record.cached_tokens.unwrap_or(0);
-            REPLAY_REUSE.add(REPLAY_REUSE_EXPECTED, record.expected_reuse);
-            REPLAY_REUSE.add(REPLAY_REUSE_CACHED, cached);
-            let _ = REPLAY_REUSE_PERMILLE.increment(1000 * cached / record.expected_reuse);
+        let cached = record.cached_tokens.unwrap_or(0);
+        REPLAY_REUSE.add(REPLAY_REUSE_PROMPT, input);
+        REPLAY_REUSE.add(REPLAY_REUSE_CACHED, cached);
+        if record.reuse > 0 && input > 0 {
+            let _ = REPLAY_CACHED_PERMILLE.increment(1000 * cached / input);
         }
     }
     guard.complete(RequestStatus::Success);
     debug!(
-        "session {} call {}: prompt {:?} expected {} cached {:?}",
-        record.session_id,
-        record.call,
-        record.prompt_tokens,
-        record.expected_reuse,
-        record.cached_tokens
+        "session {} call {}: prompt {:?} cached {:?}",
+        record.session_id, record.call, record.prompt_tokens, record.cached_tokens
     );
     Some(content)
 }
 
-/// Add a finished call to the run totals and apply the prompt-size check.
 /// Why a successful call cannot be used to measure reuse, if it cannot: the
 /// server did not report prompt or cached token counts.
 fn missing_usage(r: &CallRecord) -> Option<String> {
@@ -674,14 +733,7 @@ fn missing_usage(r: &CallRecord) -> Option<String> {
     ))
 }
 
-/// The server's build from `/props` (`build_info`, for example "b1-4ebdf2c").
-fn server_build(props: &serde_json::Value) -> Option<String> {
-    props
-        .get("build_info")
-        .and_then(|b| b.as_str())
-        .map(str::to_string)
-}
-
+/// Add a finished call to the run totals and apply the prompt-size check.
 fn account(sh: &Shared, r: &CallRecord) {
     let mut st = sh.stats.lock().unwrap();
     st.calls_sent += 1;
@@ -698,23 +750,14 @@ fn account(sh: &Shared, r: &CallRecord) {
         st.size_errors
             .push((p as f64 - r.target_prompt as f64).abs() / r.target_prompt.max(1) as f64);
     }
+    if let Some((reported, rendered)) = st.add_render(r) {
+        warn!(
+            "session {} call {}: the server reported {reported} prompt tokens, replay rendered {rendered}; the server built a different prompt from the one replay rendered",
+            r.session_id, r.call
+        );
+    }
     if !r.warmup {
-        st.calls_overshoot += r.overshoot as usize;
-        st.calls_shortfall += (r.shortfall > 0) as usize;
-        st.calls_eos_not_ignored +=
-            r.completion_tokens.is_some_and(|c| c < r.max_tokens as u64) as usize;
-        let cached = r.cached_tokens.unwrap_or(0);
-        st.expected_reuse_tokens += r.expected_reuse;
-        st.cached_tokens += cached;
-        st.prefill_tokens += r.prompt_tokens.unwrap_or(0).saturating_sub(cached);
-        if r.expected_reuse > 0 {
-            st.permille
-                .push(1000.0 * cached as f64 / r.expected_reuse as f64);
-        }
-        st.lag_ms.push(r.lag_ms);
-        if let Some(t) = r.ttft_ms {
-            st.ttft_ms.push(t);
-        }
+        st.add_measured(r);
     }
     let n = st.size_errors.len();
     if n > 0 && n.is_multiple_of(SIZE_CHECK_EVERY) {
@@ -744,11 +787,11 @@ mod tests {
             gap_capped: false,
             warmup: false,
             target_prompt: 100,
+            rendered_tokens: Some(100),
             prompt_tokens: prompt,
             overshoot: false,
             reuse: 50,
             reuse_inferred: false,
-            expected_reuse: 50,
             shortfall: 0,
             cached_tokens: cached,
             max_tokens: 10,
@@ -758,6 +801,49 @@ mod tests {
             e2e_ms: None,
             error: None,
         }
+    }
+
+    #[test]
+    fn cached_permille_is_cached_over_prompt_tokens() {
+        // The captured vLLM next turn: 7100 prompt tokens, 6864 cached.
+        let mut r = record(Some(7100), Some(6864));
+        let mut st = Stats::default();
+        st.add_measured(&r);
+        assert_eq!(st.permille, vec![1000.0 * 6864.0 / 7100.0]);
+        assert_eq!(st.prompt_tokens, 7100);
+        assert_eq!(st.cached_tokens, 6864);
+        assert_eq!(st.prefill_tokens, 7100 - 6864);
+        // A call the trace built with no reuse counts in the totals but not in
+        // the percentiles.
+        r.reuse = 0;
+        st.add_measured(&r);
+        assert_eq!(st.permille.len(), 1);
+        assert_eq!(st.prompt_tokens, 14200);
+    }
+
+    #[test]
+    fn render_mismatch_is_counted_and_the_first_returned() {
+        let mut st = Stats::default();
+        let mut r = record(Some(100), Some(0));
+        assert_eq!(st.add_render(&r), None);
+        r.rendered_tokens = Some(99);
+        assert_eq!(st.add_render(&r), Some((100, 99)));
+        assert_eq!(st.add_render(&r), None);
+        assert_eq!(st.calls_render_mismatch, 2);
+        assert_eq!(st.render_mismatch_max_tokens, 1);
+        // The largest difference in either direction is kept.
+        r.rendered_tokens = Some(130);
+        st.add_render(&r);
+        r.rendered_tokens = Some(90);
+        st.add_render(&r);
+        assert_eq!(st.render_mismatch_max_tokens, 30);
+        assert_eq!(st.calls_render_mismatch, 4);
+        // No reported count is a missing-usage failure, and no rendered count
+        // a build failure; neither is a mismatch.
+        assert_eq!(st.add_render(&record(None, None)), None);
+        r.rendered_tokens = None;
+        assert_eq!(st.add_render(&r), None);
+        assert_eq!(st.calls_render_mismatch, 4);
     }
 
     #[test]
@@ -771,16 +857,6 @@ mod tests {
         assert!(no_details.contains("session s call 3"), "{no_details}");
         let no_usage = missing_usage(&record(None, None)).unwrap();
         assert!(no_usage.contains("no usage;"), "{no_usage}");
-    }
-
-    #[test]
-    fn server_build_reads_captured_props() {
-        let props: serde_json::Value = serde_json::from_str(include_str!(
-            "../../tests/fixtures/llama-server/llama-3.1-8b-instruct-q8_0/props.json"
-        ))
-        .unwrap();
-        assert_eq!(server_build(&props).as_deref(), Some("b1-4ebdf2c"));
-        assert_eq!(server_build(&serde_json::json!({})), None);
     }
 
     #[tokio::test]

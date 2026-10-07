@@ -195,8 +195,9 @@ day of input and 1.4 GB for three days.
 ### Trace replay
 
 A `[replay]` section in a bench config replays the sessions in a
-`convert-trace` file against llama-server, instead of drawing requests from
-`[input]`. See `examples/scenarios/trace-replay.toml`.
+`convert-trace` file against llama-server or vLLM, instead of drawing requests
+from `[input]`. `server` selects the server type: `"llama-server"` (the
+default) or `"vllm"`. See `examples/scenarios/trace-replay.toml`.
 
 ```bash
 llm-perf bench examples/scenarios/trace-replay.toml
@@ -208,14 +209,38 @@ previous call of the session has finished. Each prompt repeats the previous
 call's messages and the server's actual reply, cut to the traced `reuse` in
 tokens, and adds filler words to reach the traced `prompt` size. Each call asks
 for the traced `completion` length with `ignore_eos`. Sizes and cut points are
-measured with the server's `/apply-template`, `/tokenize` and `/detokenize`,
-and the context limit is read from `/props`, so replay needs llama-server.
+measured with the server's own chat template and tokenizer:
+
+| | llama-server | vLLM |
+|---|---|---|
+| Render chat messages | `/apply-template`, then `/tokenize` | `/tokenize` with `messages` |
+| Tokenize, detokenize | `/tokenize`, `/detokenize` | `/tokenize` with `prompt`, `/detokenize` |
+| Per-request context | `/props` `n_ctx` | `/v1/models` `max_model_len` |
+| Build | `/props` `build_info` | `/version` |
+
+vLLM must run with `--enable-prefix-caching` and
+`--enable-prompt-tokens-details`; without the second, responses do not report
+cached tokens. Replay does not check that prefix caching is on; without it
+every call reports 0 cached tokens.
+
+Reuse is measured from what the server reports for each call: `prompt_tokens`
+and `cached_tokens`. Replay does not predict how many tokens should be cached.
+To see how much reuse a run lost to load, compare its cached/prompt ratio
+against a low-load run of the same sessions, on the calls both runs sent (join
+the logs on `session_id` and `call`). An overloaded run sends fewer of each
+session's later, longer calls when `duration_seconds` ends the run or failed
+calls end their sessions. Its summary then covers different calls from the
+low-load run's. `calls_measured` is the number of calls the cached/prompt
+percentiles cover.
 
 The per-call log (`replay.log`) records, among other fields:
 
-- `expected_reuse`: tokens the prompt shares with the previous rendered prompt
-  followed by the tokenized reply
-- `cached_tokens`: cached prompt tokens the server reported
+- `prompt_tokens`, `cached_tokens`: as the server reported them
+- `rendered_tokens`: the prompt length replay rendered with the server's
+  tokenize endpoint, or null when building the prompt failed; it equals
+  `prompt_tokens` unless the server built a different prompt from the one
+  replay rendered
+- `reuse`: the traced reuse the call was built with
 - `lag_ms`: how far the call was sent behind its scaled source time
 - `overshoot`: the prompt is longer than traced, because the call adds fewer
   tokens than a new message needs
@@ -223,18 +248,43 @@ The per-call log (`replay.log`) records, among other fields:
   tokenized reply; a token or two when re-tokenizing the reply gives fewer
   tokens than were generated, more when the server stopped early
 
-With sessions replayed one at a time on Llama 3.1 8B (nine sessions measured),
-`expected_reuse - cached_tokens` was 0, or 1 when the whole previous reply was
-kept: the server never runs the last generated token through the model, so it
-has no KV entry. With concurrent sessions, the difference also includes
-prefixes the server evicted.
+The summary counts calls whose `prompt_tokens` differ from `rendered_tokens`
+(`calls_render_mismatch`) and records the largest difference
+(`render_mismatch_max_tokens`); both include warmup. Replay logs the first
+mismatched call as a warning. A mismatch means the server built a different
+prompt from the one replay rendered. Replay cuts in its own rendered tokens and
+sends text. The list below describes a server prompt longer than replay's; a
+shorter one changes the lengths the other way.
+
+- a constant difference at the start (a start token) makes every prompt, and
+  the prefix it shares with the previous call, that many tokens longer in the
+  server's tokens; the cut falls at the same text;
+- a constant difference at the end (a generation-prompt suffix) makes the
+  prompt that many tokens longer. When the cut falls inside the previous
+  reply, the server can share fewer tokens with the previous call than the
+  traced reuse, because the suffix sat between that prompt and the reply;
+- a difference in how earlier messages render can change the prefix the
+  server shares with the previous call by more than the length difference
+  shows.
+
+The per-call log shows whether the difference is the same on every call; it
+does not show whether it is at the start or the end.
+
+A mismatch does not fail the run. Each time another 100 calls have reported
+`prompt_tokens`, warmup included, the run fails if the median of
+`|prompt_tokens - target_prompt| / target_prompt` over all of them exceeds
+0.01.
+
+The summary also reports prompt, cached and prefill-computed token totals, and
+percentiles of `1000 * cached_tokens / prompt_tokens` over successful
+non-warmup calls whose traced `reuse` is above 0.
 
 Replay requires `endpoint.max_retries = 0` and no `endpoint.max_tokens`, and
 accepts only `duration_seconds` and `warmup_duration` from `[load]`. Every
-selected call must fit the server's per-slot context, read from `/props`. The
-run fails if a response reports no `usage.prompt_tokens_details`, since reuse
-cannot be measured without the server's cached token count. The summary
-reports the server's `build_info`.
+selected call must fit the server's per-request context. The run fails if a
+response reports no `usage.prompt_tokens_details`, since reuse cannot be
+measured without the server's cached token count. The summary reports the
+server type, build and per-request context.
 Filler is fixed by `seed`, the session id and the call index, so a second run
 against a server that still holds the first run's prompts gets cache hits on
 first calls; restart the server or change `seed` between runs.

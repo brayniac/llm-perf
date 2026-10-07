@@ -1,0 +1,6 @@
+{
+  "model": "qwen3.5-9b",
+  "prompt": "Hello world, this is a test.",
+  "add_special_tokens": false,
+  "return_token_strs": true
+}

@@ -127,9 +127,10 @@ struct TokenizeResponse {
     tokens: Vec<serde_json::Value>,
 }
 
-/// One token from llama-server `POST /tokenize`. `piece` is the token's text
-/// when the request set `with_pieces` and the piece is valid UTF-8 on its own;
-/// the server sends other pieces as byte arrays, which are left as `None`.
+/// One token from a `/tokenize` response. `piece` is the token's text when
+/// pieces were requested and the token is valid UTF-8 on its own, and `None`
+/// otherwise. On vLLM it is decoded from the vocabulary string by
+/// `vocab_piece_text`.
 #[derive(Debug, Clone, PartialEq)]
 pub struct TokenPiece {
     pub id: u32,
@@ -167,6 +168,125 @@ pub(crate) fn parse_token_pieces(v: &serde_json::Value) -> Result<Vec<TokenPiece
 #[derive(Debug, Clone, Deserialize)]
 struct DetokenizeResponse {
     content: String,
+}
+
+/// Body of a vLLM `POST /tokenize` that renders chat `messages` with the
+/// generation prompt.
+fn vllm_tokenize_messages_body(
+    model: &str,
+    messages: &[Message],
+    chat_template_kwargs: Option<&serde_json::Value>,
+) -> serde_json::Value {
+    let mut body = serde_json::json!({
+        "model": model,
+        "messages": messages,
+        "add_generation_prompt": true,
+    });
+    if let Some(kwargs) = chat_template_kwargs {
+        body["chat_template_kwargs"] = kwargs.clone();
+    }
+    body
+}
+
+/// Body of a vLLM `POST /tokenize` for plain text with no special tokens
+/// added.
+fn vllm_tokenize_text_body(model: &str, text: &str, with_pieces: bool) -> serde_json::Value {
+    serde_json::json!({
+        "model": model,
+        "prompt": text,
+        "add_special_tokens": false,
+        "return_token_strs": with_pieces,
+    })
+}
+
+/// vLLM `POST /detokenize` response.
+#[derive(Debug, Clone, Deserialize)]
+struct VllmDetokenizeResponse {
+    prompt: String,
+}
+
+/// Parse a vLLM `/tokenize` response: `tokens` are ids and, when the request
+/// set `return_token_strs`, `token_strs` holds each token's vocabulary string.
+/// With `with_pieces`, each string is decoded to the token's text with
+/// [`vocab_piece_text`].
+pub(crate) fn parse_vllm_tokenize(
+    v: &serde_json::Value,
+    with_pieces: bool,
+) -> Result<Vec<TokenPiece>> {
+    let tokens = v
+        .get("tokens")
+        .and_then(|t| t.as_array())
+        .ok_or_else(|| anyhow::anyhow!("/tokenize response missing `tokens`"))?;
+    let strs = if with_pieces {
+        let strs = v
+            .get("token_strs")
+            .and_then(|t| t.as_array())
+            .ok_or_else(|| anyhow::anyhow!("/tokenize response missing `token_strs`"))?;
+        if strs.len() != tokens.len() {
+            anyhow::bail!(
+                "/tokenize returned {} tokens and {} token_strs",
+                tokens.len(),
+                strs.len()
+            );
+        }
+        Some(strs)
+    } else {
+        None
+    };
+    tokens
+        .iter()
+        .enumerate()
+        .map(|(i, t)| {
+            let id = t
+                .as_u64()
+                .ok_or_else(|| anyhow::anyhow!("/tokenize token is not an id: {t}"))?;
+            let piece = strs.and_then(|s| s[i].as_str()).and_then(vocab_piece_text);
+            Ok(TokenPiece {
+                id: u32::try_from(id)?,
+                piece,
+            })
+        })
+        .collect()
+}
+
+/// The text of a token from its vocabulary string, or `None` if the token is
+/// not valid UTF-8 on its own.
+///
+/// Byte-level BPE vocabularies (GPT-2, Llama 3, Qwen) write each byte as one
+/// character from GPT-2's `bytes_to_unicode` table, for example `Ġ` for a
+/// space. SentencePiece vocabularies write a space as `▁` and a raw byte as
+/// `<0xNN>`. A `<0xNN>` string is a single byte and returns `None`. Otherwise
+/// a string that uses only characters from the byte-level table is decoded as
+/// byte-level, and any other is treated as SentencePiece. A SentencePiece
+/// token made only of characters in U+0021 to U+007E, U+00A1 to U+00AC and
+/// U+00AE to U+0143, at least one above U+007E, is therefore decoded as
+/// byte-level and returns `None` or wrong text.
+pub(crate) fn vocab_piece_text(s: &str) -> Option<String> {
+    if s.len() == 6 && s.starts_with("<0x") && s.ends_with('>') {
+        return None;
+    }
+    let bytes: Option<Vec<u8>> = s.chars().map(byte_level_byte).collect();
+    match bytes {
+        Some(b) => String::from_utf8(b).ok(),
+        None => Some(s.replace('\u{2581}', " ")),
+    }
+}
+
+/// The byte GPT-2's `bytes_to_unicode` maps to `c`, if any. Bytes 33-126,
+/// 161-172 and 174-255 map to themselves; the other 68 bytes, in order, map
+/// to U+0100 onwards.
+fn byte_level_byte(c: char) -> Option<u8> {
+    let printable =
+        |b: u32| (33..=126).contains(&b) || (161..=172).contains(&b) || (174..=255).contains(&b);
+    let c = c as u32;
+    if printable(c) {
+        return Some(c as u8);
+    }
+    let n = c.checked_sub(256)?;
+    (0u32..=255)
+        .filter(|b| !printable(*b))
+        .nth(n as usize)
+        .map(|b| b as u8)
 }
 
 /// llama-server `POST /apply-template` response.
@@ -476,16 +596,7 @@ impl OpenAIClient {
     /// llama-server's `GET /props`: server settings, including the per-slot
     /// context at `default_generation_settings.n_ctx`. llama-server only.
     pub async fn props(&self) -> Result<serde_json::Value> {
-        let url = format!("{}/props", self.server_root());
-        let mut req = self.client.get(&url).timeout(self.timeout);
-        if let Some(api_key) = &self.api_key {
-            req = req.header("Authorization", format!("Bearer {}", api_key));
-        }
-        let resp = req.send().await?;
-        if !resp.status().is_success() {
-            anyhow::bail!("/props returned HTTP {}", resp.status());
-        }
-        Ok(resp.json().await?)
+        Ok(serde_json::from_str(&self.get_root_text("/props").await?)?)
     }
 
     /// Text for `tokens` via llama-server's `/detokenize`. llama-server only.
@@ -513,6 +624,63 @@ impl OpenAIClient {
         }
         let resp: ApplyTemplateResponse = self.post_with_retry(&url, &body).await?;
         Ok(resp.prompt)
+    }
+
+    /// Tokens of the prompt vLLM builds from chat `messages`, via `POST
+    /// /tokenize` with `messages` and `add_generation_prompt`. vLLM renders
+    /// these with the chat template `/v1/chat/completions` uses.
+    /// `chat_template_kwargs` must match the generation request. vLLM only.
+    pub async fn vllm_tokenize_messages(
+        &self,
+        messages: &[Message],
+        chat_template_kwargs: Option<&serde_json::Value>,
+    ) -> Result<Vec<u32>> {
+        let url = format!("{}/tokenize", self.server_root());
+        let body = vllm_tokenize_messages_body(&self.model, messages, chat_template_kwargs);
+        let resp: serde_json::Value = self.post_with_retry(&url, &body).await?;
+        Ok(parse_vllm_tokenize(&resp, false)?
+            .into_iter()
+            .map(|p| p.id)
+            .collect())
+    }
+
+    /// Tokens of `text` with no special tokens added, via vLLM's `POST
+    /// /tokenize` with `prompt`. vLLM's tokenizer still turns special-token
+    /// text in `text` (for example `<|im_end|>`) into the special token. With
+    /// `with_pieces`, each token's text is decoded from vLLM's `token_strs`
+    /// as a byte-level BPE or SentencePiece vocabulary string. vLLM only.
+    pub async fn vllm_tokenize_text(
+        &self,
+        text: &str,
+        with_pieces: bool,
+    ) -> Result<Vec<TokenPiece>> {
+        let url = format!("{}/tokenize", self.server_root());
+        let body = vllm_tokenize_text_body(&self.model, text, with_pieces);
+        let resp: serde_json::Value = self.post_with_retry(&url, &body).await?;
+        parse_vllm_tokenize(&resp, with_pieces)
+    }
+
+    /// Text for `tokens` via vLLM's `POST /detokenize`. vLLM only.
+    pub async fn vllm_detokenize(&self, tokens: &[u32]) -> Result<String> {
+        let url = format!("{}/detokenize", self.server_root());
+        let body = serde_json::json!({ "model": self.model, "tokens": tokens });
+        let resp: VllmDetokenizeResponse = self.post_with_retry(&url, &body).await?;
+        Ok(resp.prompt)
+    }
+
+    /// `GET` `path` at the server root (without `/v1`) and return the body as
+    /// text.
+    pub async fn get_root_text(&self, path: &str) -> Result<String> {
+        let url = format!("{}{path}", self.server_root());
+        let mut req = self.client.get(&url).timeout(self.timeout);
+        if let Some(api_key) = &self.api_key {
+            req = req.header("Authorization", format!("Bearer {}", api_key));
+        }
+        let resp = req.send().await?;
+        if !resp.status().is_success() {
+            anyhow::bail!("{path} returned HTTP {}", resp.status());
+        }
+        Ok(resp.text().await?)
     }
 
     /// POST `request` as JSON to `url` and decode the response, retrying
@@ -1777,6 +1945,99 @@ mod tests {
     }
 
     #[test]
+    fn vllm_tokenize_parses_captured_text_response() {
+        let v: serde_json::Value = serde_json::from_str(include_str!(
+            "../tests/fixtures/vllm/qwen3.5-9b-fp8/tokenize-text.response.json"
+        ))
+        .unwrap();
+        let pieces = parse_vllm_tokenize(&v, true).unwrap();
+        let ids: Vec<u32> = pieces.iter().map(|p| p.id).collect();
+        assert_eq!(ids, vec![9419, 1814, 11, 411, 369, 264, 1228, 13]);
+        let text: String = pieces.iter().map(|p| p.piece.as_deref().unwrap()).collect();
+        // The captured /detokenize of the same ids.
+        let detok: serde_json::Value = serde_json::from_str(include_str!(
+            "../tests/fixtures/vllm/qwen3.5-9b-fp8/detokenize.response.json"
+        ))
+        .unwrap();
+        assert_eq!(text, detok["prompt"].as_str().unwrap());
+        assert_eq!(pieces[1].piece.as_deref(), Some(" world"));
+        assert!(
+            parse_vllm_tokenize(&v, false)
+                .unwrap()
+                .iter()
+                .all(|p| p.piece.is_none())
+        );
+    }
+
+    #[test]
+    fn vllm_tokenize_parses_captured_chat_response() {
+        let v: serde_json::Value = serde_json::from_str(include_str!(
+            "../tests/fixtures/vllm/qwen3.5-9b-fp8/tokenize-chat.response.json"
+        ))
+        .unwrap();
+        let pieces = parse_vllm_tokenize(&v, true).unwrap();
+        assert_eq!(pieces.len(), 7023);
+        assert_eq!(pieces[0].piece.as_deref(), Some("<|im_start|>"));
+        assert_eq!(pieces[2].piece.as_deref(), Some("\n"));
+        let mismatched = serde_json::json!({"tokens": [1, 2], "token_strs": ["a"]});
+        assert!(parse_vllm_tokenize(&mismatched, true).is_err());
+        assert!(parse_vllm_tokenize(&mismatched, false).is_ok());
+    }
+
+    fn fixture_json(s: &str) -> serde_json::Value {
+        serde_json::from_str(s).unwrap()
+    }
+
+    #[test]
+    fn vllm_tokenize_bodies_match_captured_requests() {
+        // tokenize-chat3 was sent with exactly the fields render sends.
+        let captured = fixture_json(include_str!(
+            "../tests/fixtures/vllm/qwen3.5-9b-fp8/tokenize-chat3.request.json"
+        ));
+        let messages: Vec<Message> = serde_json::from_value(captured["messages"].clone()).unwrap();
+        let kwargs = serde_json::json!({"enable_thinking": false});
+        assert_eq!(
+            vllm_tokenize_messages_body("qwen3.5-9b", &messages, Some(&kwargs)),
+            captured
+        );
+        let captured = fixture_json(include_str!(
+            "../tests/fixtures/vllm/qwen3.5-9b-fp8/tokenize-text.request.json"
+        ));
+        assert_eq!(
+            vllm_tokenize_text_body("qwen3.5-9b", "Hello world, this is a test.", true),
+            captured
+        );
+    }
+
+    #[test]
+    fn vocab_piece_text_decodes_byte_level_and_sentencepiece() {
+        assert_eq!(vocab_piece_text("Ġworld").as_deref(), Some(" world"));
+        assert_eq!(vocab_piece_text("Ċ").as_deref(), Some("\n"));
+        assert_eq!(vocab_piece_text("ĉ").as_deref(), Some("\t"));
+        // "é" is bytes C3 A9, written as Ã and ©.
+        assert_eq!(vocab_piece_text("ĠcafÃ©").as_deref(), Some(" café"));
+        // The first byte of a two-byte character alone.
+        assert_eq!(vocab_piece_text("Ã"), None);
+        assert_eq!(vocab_piece_text("▁world").as_deref(), Some(" world"));
+        assert_eq!(vocab_piece_text("<0x0A>"), None);
+        // GPT-2's table: byte 0 is U+0100, space U+0120, 127 U+0121, 173 U+0143.
+        assert_eq!(byte_level_byte('\u{100}'), Some(0));
+        assert_eq!(byte_level_byte('\u{120}'), Some(b' '));
+        assert_eq!(byte_level_byte('\u{121}'), Some(127));
+        assert_eq!(byte_level_byte('\u{143}'), Some(173));
+        assert_eq!(byte_level_byte('\u{144}'), None);
+        // Exactly 256 characters map to a byte, and they map to 256 distinct
+        // bytes.
+        let bytes: Vec<u8> = (0u32..0x200)
+            .filter_map(char::from_u32)
+            .filter_map(byte_level_byte)
+            .collect();
+        assert_eq!(bytes.len(), 256);
+        let distinct: std::collections::HashSet<u8> = bytes.into_iter().collect();
+        assert_eq!(distinct.len(), 256);
+    }
+
+    #[test]
     fn completion_response_parses_llama_server_shape() {
         let json = r#"{
             "choices": [{"text": " The answer is (B).", "index": 0, "logprobs": null, "finish_reason": "stop"}],
@@ -1880,6 +2141,24 @@ mod tests {
         ));
         let valid = br#"data: {"id":"1","object":"chat.completion.chunk","created":0,"model":"m","choices":[{"index":0,"delta":{"content":"hi"}}]}"#;
         assert!(matches!(parse_sse_line(valid), SseEvent::Chunk(_)));
+    }
+
+    #[test]
+    fn vllm_stream_usage_parses_from_captured_final_chunk() {
+        // vLLM's usage chunk has empty `choices` and an extra
+        // `created_cache_tokens` field.
+        let sse = include_str!("../tests/fixtures/vllm/qwen3.5-9b-fp8/call3.response.sse");
+        let mut usage = None;
+        for l in sse.lines() {
+            match parse_sse_line(l.as_bytes()) {
+                SseEvent::Chunk(c) if c.usage.is_some() => usage = c.usage,
+                SseEvent::Malformed => panic!("malformed line: {l}"),
+                _ => {}
+            }
+        }
+        let usage = usage.expect("a chunk with usage");
+        assert_eq!(usage.prompt_tokens, 7100);
+        assert_eq!(usage.prompt_tokens_details.unwrap().cached_tokens, 6864);
     }
 
     #[test]

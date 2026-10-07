@@ -19,7 +19,9 @@ target-model token counts; the source's models and tokenizers are unknown.
 First target: llama-server (llama.cpp), with Llama 3.1 8B as the
 dense-attention control and Qwen3.5 9B as the realistic target.
 
-Out of scope for this spec: sending token IDs instead of text, vLLM and SGLang
+Second target: vLLM, with Qwen3.5 9B (see "vLLM capture findings").
+
+Out of scope for this spec: sending token IDs instead of text, SGLang
 specifics, tool-call message shapes, and multimodal content.
 
 ---
@@ -69,6 +71,52 @@ requests with `/apply-template` and tokenizing them.
 - From the server log: with `-np 2` given explicitly, `kv_unified = 'false'`
   and each slot holds `-c / -np` tokens. The default `--cache-ram` is 8192 MiB,
   which holds about 65,536 tokens of Llama 3.1 8B KV (128 KiB per token).
+
+### vLLM capture findings
+
+Captured 2026-10-06 UTC against vLLM 0.31.0 serving Qwen3.5 9B (bf16 weights
+quantized at load with `--quantization fp8_per_tensor`) on an RTX 4090, with
+`--enable-prefix-caching --enable-prompt-tokens-details --max-model-len
+131072`. Fixtures are in `tests/fixtures/vllm/qwen3.5-9b-fp8/`; the calls are
+those of `tests/fixtures/vllm/capture.sh`.
+
+| Call | Prompt | Shared prefix with call 1 | Cached |
+|---|---|---|---|
+| 1: system + long user message | 7,023 | | 0 |
+| 2: call 1 again | 7,023 | 7,023 | 6,864 |
+| 3: call 1 + reply + new user message | 7,100 | 7,019 | 6,864 |
+
+- `/tokenize` with `messages`, `add_generation_prompt` and
+  `chat_template_kwargs` returns as many tokens as `usage.prompt_tokens`
+  reports for the same request (7,023 for call 1, 7,100 for call 3). With `prompt` and
+  `add_special_tokens: false` it tokenizes plain text. `return_token_strs`
+  adds each token's vocabulary string (`Ġworld`), not its text; replay
+  decodes these with the inverse of GPT-2's byte-to-character table.
+  `/detokenize` takes `tokens` and returns `prompt`.
+- For Qwen3.5 with prefix caching, vLLM sets `mamba_cache_mode` to `align` and
+  the attention block size to 528 tokens. Cached counts are whole blocks:
+  6,864 is 13 blocks. The server log reports the block size at startup.
+- `usage.prompt_tokens_details` has `cached_tokens` and `created_cache_tokens`
+  in the final streamed chunk.
+- `/v1/models` gives the served model's `max_model_len`, and `/version` the
+  version.
+- At `--gpu-memory-utilization 0.92` the KV cache is 264,714 tokens (2.02
+  requests of 131,072).
+- Two replays recorded, per call, the common token prefix of the rendered
+  prompt with the previous prompt and reply. Replay no longer records it.
+  - One six-call session replayed alone (cuts of 4 to 217 tokens before the
+    previous prompt's end): on all five calls with reuse, `cached_tokens` was
+    that prefix rounded down to whole 528-token blocks.
+  - A 30-minute replay at sample 0.004 and speedup 1.5 (seven sessions with
+    calls, at most three requests running): 134 of 177 measured calls
+    had `cached_tokens` equal to that prefix rounded down to whole blocks, 36
+    were short by 1 to 7 blocks, and 7 by 9 to 93 blocks. 28 of
+    the 36 had no other session's call sent between the session's previous
+    call and this one.
+  - In a call that fell short, `cached_tokens` was often 0 to 3 blocks past
+    the previous call's `cached_tokens`. This is consistent with `align` mode
+    saving the recurrent state only at the ends of scheduled prefill chunks.
+    vLLM's scheduler steps were not logged, so this is not confirmed.
 
 ## Trace facts this design depends on
 
@@ -142,8 +190,9 @@ not reproduce.
 Runs use 131,072 tokens per slot for both models (Llama 3.1's maximum), with
 the trace converted using `convert-trace --max-context 131072`, so the Llama
 and Qwen runs replay the same sessions: 83.9% of sessions and 64.1% of calls on
-2026-06-03. At startup the replay reads the per-slot context from `/props`
-(`default_generation_settings.n_ctx`) and fails if any selected call's
+2026-06-03. At startup the replay reads the per-request context, from
+llama-server's `/props` (`default_generation_settings.n_ctx`) or vLLM's
+`/v1/models` (`max_model_len`), and fails if any selected call's
 `prompt + completion` exceeds it.
 
 Sessions with several model labels are replayed against the one configured
@@ -188,9 +237,10 @@ Requests go to `/v1/chat/completions`, streamed with
 
 Each session keeps the message list and rendered token sequence of its
 previous call, and the tokenized reply. The rendered token sequence of a
-message list is the `/apply-template` output for it (with
-`endpoint.chat_template_kwargs`) tokenized with `add_special` and
-`parse_special`.
+message list is what the server's chat template produces for it with
+`endpoint.chat_template_kwargs`: on llama-server, the `/apply-template` output
+tokenized with `add_special` and `parse_special`; on vLLM, the tokens from
+`/tokenize` with `messages` and `add_generation_prompt`.
 
 For call `n`:
 
@@ -209,9 +259,7 @@ For call `n`:
    message already exceeds `prompt` (12% of non-first calls have
    `prompt == reuse`, and most of those end on the previous reply), the prompt
    overshoots and the call is flagged `overshoot` in the log.
-4. Render and tokenize the result. `expected_reuse` is the length of its
-   common token prefix with call `n-1`'s rendered prompt followed by the
-   tokenized reply.
+4. Render and tokenize the result.
 
 If `reuse` exceeds call `n-1`'s rendered prompt plus the tokenized reply, all
 of it is kept and the difference is logged as `shortfall`. Re-tokenizing a
@@ -219,11 +267,10 @@ reply's text can give fewer tokens than were generated (91 for a 92-token
 reply in one Llama 3.1 call), so a call that keeps the whole reply can show a
 shortfall of a token or two.
 
-After a session's first call, `expected_reuse` never falls below the
-template's fixed preamble. On Llama 3.1
-without a system message that is 30 tokens (BOS, the system header and its
-date lines), so a call whose traced `reuse` is 0 still shares and has cached
-those 30 tokens.
+After a session's first call, every prompt shares at least the template's
+fixed preamble with the previous one. On Llama 3.1 without a system message
+that is 30 tokens (BOS, the system header and its date lines), so on
+llama-server a call whose traced `reuse` is 0 still has those 30 tokens cached.
 
 The first call of a session is the optional shared system prompt plus one user
 message of filler. The system prompt is kept whole in every call.
@@ -257,25 +304,38 @@ calls exceeds 0.01.
 Per call, appended to `replay.log` when set:
 
 `session_id`, `call`, `model` (trace label), `scheduled_ms`, `sent_ms`,
-`lag_ms`, `gap_capped`, `warmup`, `target_prompt`, `prompt_tokens`,
-`overshoot`, `reuse` (trace), `reuse_inferred`, `expected_reuse`, `shortfall`,
+`lag_ms`, `gap_capped`, `warmup`, `target_prompt`, `rendered_tokens`,
+`prompt_tokens`, `overshoot`, `reuse` (trace), `reuse_inferred`, `shortfall`,
 `cached_tokens`, `max_tokens`, `completion_tokens`, `finish_reason`,
 `ttft_ms`, `e2e_ms`, `error`.
 
+`rendered_tokens` is the length of the prompt replay rendered with the
+server's tokenize endpoint. A call whose reported `prompt_tokens` differs from
+it was built from a different prompt from the one replay rendered. The summary
+counts these calls, warmup included, and records the largest difference. The
+first is logged as a warning. A mismatch does not fail the run.
+
+Reuse is measured only by what the server reports: `prompt_tokens` and
+`cached_tokens`. Replay does not predict how many tokens should be cached.
+Loss of reuse under load shows as a lower cached/prompt ratio than in a
+low-load run of the same sessions, compared on the calls both runs sent.
+
 Aggregates, named like the existing metrics in `src/metrics.rs`:
 
-- `replay_reuse` counter group, `kind` = `expected` or `cached`;
-- `replay_reuse_permille` histogram of `1000 * cached / expected` for calls
-  with `expected_reuse > 0`;
+- `replay_reuse` counter group, `kind` = `prompt` or `cached`;
+- `replay_cached_permille` histogram of `1000 * cached / prompt_tokens` for
+  calls whose traced `reuse` is > 0;
 - `replay_sessions` counter group, `status` = `started`, `completed`,
   `failed` or `truncated`;
 - `schedule_slip` records `lag_ms` for successful non-warmup calls;
 - the existing request, token, TTFT, ITL, TPOT and latency metrics.
 
 The run ends with a summary (console or JSON per `output.format`): the
-server's `build_info` and per-slot context from `/props`, session outcomes, call counts, expected and cached reuse totals, prefill tokens
-computed (`prompt_tokens - cached_tokens`), percentiles of cached/expected,
-`lag_ms` and TTFT, and the median prompt size error.
+server type, build and per-request context, session outcomes, call counts
+(including calls whose `prompt_tokens` differ from `rendered_tokens`),
+prompt, cached and prefill (`prompt_tokens - cached_tokens`) token totals,
+percentiles of cached/prompt over calls whose traced `reuse` is > 0, `lag_ms`
+and TTFT, and the median prompt size error.
 
 A successful call whose response has no `usage` or no
 `usage.prompt_tokens_details` fails the run: reuse cannot be measured without
@@ -305,11 +365,17 @@ aggregates; the log still records them.
 
 1. Unit tests with no server: sampling, time scaling, cutting message lists at
    token boundaries, filler determinism.
-2. Fixture tests: parse the captured responses in `tests/fixtures/llama-server/`.
-3. Llama 3.1 8B, sessions replayed one at a time: `expected_reuse - cached` is
-   0, or 1 when the whole previous reply is kept. Any other value is a replay
-   bug. With several sessions, the RAM prompt cache evicts and larger
-   differences are expected.
-4. Qwen3.5 9B, same sample: `cached` is the largest checkpoint position at or
-   below `min(expected_reuse, previous prompt - 4)`. This prediction depends on
-   the replay sending each call's new content as one user message.
+2. Fixture tests: parse the captured llama-server `/tokenize` and `/props`
+   responses, and the vLLM `/tokenize`, `/detokenize`, `/version`,
+   `/v1/models` and streamed call 3 responses, and compare the vLLM
+   `/tokenize` request bodies with the captured ones.
+3. Llama 3.1 8B on llama-server, sessions replayed one at a time: the common
+   token prefix of each rendered prompt with the previous rendered prompt and
+   reply, minus `cached`, was 0, or 1 when the whole previous reply was kept.
+4. Qwen3.5 9B, same sample: `cached` was the largest checkpoint position at or
+   below `min(common prefix, previous prompt - 4)`.
+
+Checks 3 and 4 were made with 0.1.19, whose per-call log recorded the common
+prefix as `expected_reuse`. The log does not record it, so repeating them
+needs the rendered prompts captured separately. The prompt unit tests cover
+prefix construction.

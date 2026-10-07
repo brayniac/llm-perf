@@ -198,6 +198,10 @@ pub const REPLAY_LOAD_KEYS: &[&str] = &["duration_seconds", "warmup_duration"];
 pub struct ReplayConfig {
     /// JSONL written by `llm-perf convert-trace`.
     pub trace: PathBuf,
+    /// Server type: selects the endpoints replay uses to render and tokenize
+    /// prompts and to read the context limit.
+    #[serde(default)]
+    pub server: ReplayServer,
     /// Fraction of sessions to replay, in (0, 1].
     #[serde(default = "default_replay_sample")]
     pub sample: f64,
@@ -219,6 +223,18 @@ pub struct ReplayConfig {
     /// Per-call JSONL log.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub log: Option<PathBuf>,
+}
+
+/// Server types replay can render and tokenize prompts against.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum ReplayServer {
+    /// llama-server: `/apply-template`, `/tokenize`, `/detokenize`, `/props`.
+    #[default]
+    LlamaServer,
+    /// vLLM: `/tokenize` with chat messages or a prompt, `/detokenize`,
+    /// `/v1/models` and `/version`.
+    Vllm,
 }
 
 fn default_replay_sample() -> f64 {

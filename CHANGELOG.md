@@ -4,6 +4,20 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+### Features
+
+- Trace replay against vLLM — `[replay] server = "vllm"` renders and tokenizes prompts with vLLM's `/tokenize` and `/detokenize`, and reads the per-request context from `/v1/models` and the version from `/version`. The default is `"llama-server"`. The summary adds `server`.
+
+### Changes
+
+- Trace replay reports reuse only as the server reported it, without a predicted value. Measuring reuse lost to load now takes a low-load run of the same sessions, compared per call on `session_id` and `call`.
+  - Per-call log: `expected_reuse` is removed.
+  - Summary: `expected_reuse_tokens` and `reuse_permille_p50`/`p10` (cached over expected) are replaced by `prompt_tokens`, `calls_measured` and `cached_permille_p50`/`p10` (cached over prompt tokens, for calls whose traced reuse is above 0).
+  - Metrics: the `replay_reuse` counter's `expected` kind becomes `prompt`, and the `replay_reuse_permille` histogram becomes `replay_cached_permille`. Both `replay_reuse` kinds now count every successful non-warmup call; in 0.1.19 they counted only calls with expected reuse above 0.
+  - Console: `per-slot context` becomes `per-request context` and the server line names the server type; `reuse: expected …` becomes `tokens: prompt …`; `cached/expected permille` becomes `cached/prompt permille (N calls with traced reuse)`.
+  - Per-call log and summary: `rendered_tokens` is the prompt length replay rendered, or null when building the prompt failed. `calls_render_mismatch` counts calls whose reported `prompt_tokens` differ from it, and `render_mismatch_max_tokens` is the largest difference; both include warmup. A mismatch means the server built a different prompt from the one replay rendered. The first mismatched call is logged as a warning, and a mismatch does not fail the run. The console `calls` line adds `N render mismatch (max M tokens)`.
+  - Library: `BuiltCall.expected_reuse` and `CallRecord.expected_reuse` are removed, and `REPLAY_REUSE_EXPECTED`/`REPLAY_REUSE_PERMILLE` are renamed `REPLAY_REUSE_PROMPT`/`REPLAY_CACHED_PERMILLE`. `CallRecord` gains `rendered_tokens`, and `ReplaySummary` gains `calls_measured`, `calls_render_mismatch` and `render_mismatch_max_tokens`; code that builds either with a struct literal must set them.
+
 ## [0.1.19] - 2026-10-03
 
 ### Features
