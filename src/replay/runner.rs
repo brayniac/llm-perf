@@ -66,9 +66,9 @@ pub struct CallRecord {
 }
 
 /// Totals printed or written at the end of a run. `calls_sent`,
-/// `calls_failed`, `calls_render_mismatch` and `prompt_size_error_median`
-/// include warmup calls; every other total and percentile covers non-warmup
-/// calls that succeeded.
+/// `calls_failed`, `calls_render_mismatch`, `render_mismatch_max_tokens` and
+/// `prompt_size_error_median` include warmup calls; every other total and
+/// percentile covers non-warmup calls that succeeded.
 #[derive(Debug, Default, Serialize)]
 pub struct ReplaySummary {
     pub server: ReplayServer,
@@ -90,6 +90,9 @@ pub struct ReplaySummary {
     /// Calls whose reported `prompt_tokens` differ from `rendered_tokens`:
     /// the server built a different prompt from the one replay rendered.
     pub calls_render_mismatch: usize,
+    /// Largest `|prompt_tokens - rendered_tokens|` over those calls; 0 when
+    /// there are none.
+    pub render_mismatch_max_tokens: u64,
     pub prompt_tokens: u64,
     pub cached_tokens: u64,
     /// `prompt_tokens - cached_tokens`.
@@ -117,6 +120,7 @@ struct Stats {
     calls_shortfall: usize,
     calls_eos_not_ignored: usize,
     calls_render_mismatch: usize,
+    render_mismatch_max_tokens: u64,
     prompt_tokens: u64,
     cached_tokens: u64,
     prefill_tokens: u64,
@@ -138,6 +142,9 @@ impl Stats {
             return None;
         }
         self.calls_render_mismatch += 1;
+        self.render_mismatch_max_tokens = self
+            .render_mismatch_max_tokens
+            .max(reported.abs_diff(rendered));
         (self.calls_render_mismatch == 1).then_some((reported, rendered))
     }
 
@@ -445,6 +452,7 @@ pub async fn run(mut config: Config) -> Result<()> {
         calls_shortfall: st.calls_shortfall,
         calls_eos_not_ignored: st.calls_eos_not_ignored,
         calls_render_mismatch: st.calls_render_mismatch,
+        render_mismatch_max_tokens: st.render_mismatch_max_tokens,
         prompt_tokens: st.prompt_tokens,
         cached_tokens: st.cached_tokens,
         prefill_tokens: st.prefill_tokens,
@@ -470,7 +478,7 @@ fn report(config: &Config, s: &ReplaySummary) -> Result<()> {
                 "Trace replay\n\
                  \x20 server: {} build {}, per-request context {} tokens\n\
                  \x20 sessions: {} selected of {} ({} completed, {} failed, {} truncated)\n\
-                 \x20 calls: {} sent, {} failed, {} overshoot, {} shortfall, {} EOS not ignored, {} render mismatch\n\
+                 \x20 calls: {} sent, {} failed, {} overshoot, {} shortfall, {} EOS not ignored, {} render mismatch (max {} tokens)\n\
                  \x20 tokens: prompt {}, cached {}, prefill computed {}\n\
                  \x20 cached/prompt permille ({} calls with traced reuse): p50 {}, p10 {}\n\
                  \x20 lag ms: p50 {}, p99 {}, max {}\n\
@@ -493,6 +501,7 @@ fn report(config: &Config, s: &ReplaySummary) -> Result<()> {
                 s.calls_shortfall,
                 s.calls_eos_not_ignored,
                 s.calls_render_mismatch,
+                s.render_mismatch_max_tokens,
                 s.prompt_tokens,
                 s.cached_tokens,
                 s.prefill_tokens,
@@ -821,12 +830,20 @@ mod tests {
         assert_eq!(st.add_render(&r), Some((100, 99)));
         assert_eq!(st.add_render(&r), None);
         assert_eq!(st.calls_render_mismatch, 2);
+        assert_eq!(st.render_mismatch_max_tokens, 1);
+        // The largest difference in either direction is kept.
+        r.rendered_tokens = Some(130);
+        st.add_render(&r);
+        r.rendered_tokens = Some(90);
+        st.add_render(&r);
+        assert_eq!(st.render_mismatch_max_tokens, 30);
+        assert_eq!(st.calls_render_mismatch, 4);
         // No reported count is a missing-usage failure, and no rendered count
         // a build failure; neither is a mismatch.
         assert_eq!(st.add_render(&record(None, None)), None);
         r.rendered_tokens = None;
         assert_eq!(st.add_render(&r), None);
-        assert_eq!(st.calls_render_mismatch, 2);
+        assert_eq!(st.calls_render_mismatch, 4);
     }
 
     #[test]

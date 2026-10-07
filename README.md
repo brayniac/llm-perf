@@ -249,10 +249,22 @@ The per-call log (`replay.log`) records, among other fields:
   tokens than were generated, more when the server stopped early
 
 The summary counts calls whose `prompt_tokens` differ from `rendered_tokens`
-(`calls_render_mismatch`, warmup included), and replay logs the first one as a
-warning. A nonzero count means the server built a different prompt from the one
-replay rendered, so cut positions and prompt sizes may not match it. The
-summary also reports prompt, cached and prefill-computed token totals, and
+(`calls_render_mismatch`, warmup included) and the largest difference
+(`render_mismatch_max_tokens`), and replay logs the first one as a warning. A
+nonzero count means the server built a different prompt from the one replay
+rendered:
+
+- a constant difference at the start (a start token) moves every cut position
+  by that many tokens;
+- a constant difference at the end (a generation-prompt suffix) changes only
+  the prompt length;
+- a difference in how earlier messages render can move cut positions by more
+  than the length difference shows.
+
+A mismatch does not fail the run; the prompt size check fails it when the
+median size error exceeds 1%.
+
+The summary also reports prompt, cached and prefill-computed token totals, and
 percentiles of `1000 * cached_tokens / prompt_tokens` over successful
 non-warmup calls whose traced `reuse` is above 0.
 

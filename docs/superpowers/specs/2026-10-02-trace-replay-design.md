@@ -312,7 +312,8 @@ Per call, appended to `replay.log` when set:
 `rendered_tokens` is the length of the prompt replay rendered with the
 server's tokenize endpoint. A call whose reported `prompt_tokens` differs from
 it was built from a different prompt from the one replay rendered. The summary
-counts these calls, warmup included. The first is logged as a warning.
+counts these calls, warmup included, and records the largest difference. The
+first is logged as a warning. A mismatch does not fail the run.
 
 Reuse is measured only by what the server reports: `prompt_tokens` and
 `cached_tokens`. Replay does not predict how many tokens should be cached.
