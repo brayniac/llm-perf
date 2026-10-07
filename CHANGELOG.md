@@ -15,6 +15,7 @@ All notable changes to this project will be documented in this file.
   - Summary: `expected_reuse_tokens` and `reuse_permille_p50`/`p10` (cached over expected) are replaced by `prompt_tokens`, `calls_measured` and `cached_permille_p50`/`p10` (cached over prompt tokens, for calls whose traced reuse is above 0).
   - Metrics: the `replay_reuse` counter's `expected` kind becomes `prompt`, and the `replay_reuse_permille` histogram becomes `replay_cached_permille`. Both `replay_reuse` kinds now count every successful non-warmup call; in 0.1.19 they counted only calls with expected reuse above 0.
   - Console: `per-slot context` becomes `per-request context` and the server line names the server type; `reuse: expected …` becomes `tokens: prompt …`; `cached/expected permille` becomes `cached/prompt permille (N calls with traced reuse)`.
+  - Per-call log and summary: `rendered_tokens` is the prompt length replay rendered, and `calls_render_mismatch` counts calls whose reported `prompt_tokens` differ from it, warmup included. A mismatch means the server built a different prompt from the one replay sized and cut; the first is logged as a warning. The console `calls` line adds `N render mismatch`.
   - Library: `BuiltCall.expected_reuse` and `CallRecord.expected_reuse` are removed, and `REPLAY_REUSE_EXPECTED`/`REPLAY_REUSE_PERMILLE` are renamed `REPLAY_REUSE_PROMPT`/`REPLAY_CACHED_PERMILLE`.
 
 ## [0.1.19] - 2026-10-03

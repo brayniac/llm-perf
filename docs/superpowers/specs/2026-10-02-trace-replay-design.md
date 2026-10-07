@@ -303,10 +303,16 @@ calls exceeds 0.01.
 Per call, appended to `replay.log` when set:
 
 `session_id`, `call`, `model` (trace label), `scheduled_ms`, `sent_ms`,
-`lag_ms`, `gap_capped`, `warmup`, `target_prompt`, `prompt_tokens`,
-`overshoot`, `reuse` (trace), `reuse_inferred`, `shortfall`, `cached_tokens`,
-`max_tokens`, `completion_tokens`, `finish_reason`, `ttft_ms`, `e2e_ms`,
-`error`.
+`lag_ms`, `gap_capped`, `warmup`, `target_prompt`, `rendered_tokens`,
+`prompt_tokens`, `overshoot`, `reuse` (trace), `reuse_inferred`, `shortfall`,
+`cached_tokens`, `max_tokens`, `completion_tokens`, `finish_reason`,
+`ttft_ms`, `e2e_ms`, `error`.
+
+`rendered_tokens` is the length of the prompt replay rendered with the
+server's tokenize endpoint. A call whose reported `prompt_tokens` differs from
+it was built by the server from a different prompt than the one replay sized
+and cut; the summary counts these, warmup included, and the first is logged
+as a warning.
 
 Reuse is measured only by what the server reports: `prompt_tokens` and
 `cached_tokens`. Replay does not predict how many tokens should be cached.
@@ -324,7 +330,8 @@ Aggregates, named like the existing metrics in `src/metrics.rs`:
 - the existing request, token, TTFT, ITL, TPOT and latency metrics.
 
 The run ends with a summary (console or JSON per `output.format`): the
-server type, build and per-request context, session outcomes, call counts,
+server type, build and per-request context, session outcomes, call counts
+(including calls whose `prompt_tokens` differ from `rendered_tokens`),
 prompt, cached and prefill (`prompt_tokens - cached_tokens`) token totals,
 percentiles of cached/prompt over calls whose traced `reuse` is > 0, `lag_ms`
 and TTFT, and the median prompt size error.

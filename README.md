@@ -235,6 +235,9 @@ low-load run's; `calls_measured` gives the count.
 The per-call log (`replay.log`) records, among other fields:
 
 - `prompt_tokens`, `cached_tokens`: as the server reported them
+- `rendered_tokens`: the prompt length replay rendered with the server's
+  tokenize endpoint; it equals `prompt_tokens` unless the server built a
+  different prompt from the one replay sized and cut
 - `reuse`: the traced reuse the call was built with
 - `lag_ms`: how far the call was sent behind its scaled source time
 - `overshoot`: the prompt is longer than traced, because the call adds fewer
@@ -243,7 +246,10 @@ The per-call log (`replay.log`) records, among other fields:
   tokenized reply; a token or two when re-tokenizing the reply gives fewer
   tokens than were generated, more when the server stopped early
 
-The summary reports prompt, cached and prefill-computed token totals, and
+The summary counts calls whose `prompt_tokens` differ from `rendered_tokens`
+(`calls_render_mismatch`, warmup included) and logs the first one; a nonzero
+count means cut positions do not match the server's prompt. It also reports
+prompt, cached and prefill-computed token totals, and
 percentiles of `1000 * cached_tokens / prompt_tokens` over successful
 non-warmup calls whose traced `reuse` is above 0.
 

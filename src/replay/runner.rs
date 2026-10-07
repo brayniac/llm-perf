@@ -47,6 +47,9 @@ pub struct CallRecord {
     pub gap_capped: bool,
     pub warmup: bool,
     pub target_prompt: u64,
+    /// Length of the prompt as replay rendered it with the server's
+    /// tokenize endpoint.
+    pub rendered_tokens: u64,
     pub prompt_tokens: Option<u64>,
     pub overshoot: bool,
     /// From the trace.
@@ -63,7 +66,8 @@ pub struct CallRecord {
 }
 
 /// Totals printed or written at the end of a run. `calls_sent`,
-/// `calls_failed` and `prompt_size_error_median` include warmup calls; every
+/// `calls_failed`, `calls_render_mismatch` and `prompt_size_error_median`
+/// include warmup calls; every
 /// other total and percentile covers non-warmup calls that succeeded.
 #[derive(Debug, Default, Serialize)]
 pub struct ReplaySummary {
@@ -83,6 +87,9 @@ pub struct ReplaySummary {
     pub calls_overshoot: usize,
     pub calls_shortfall: usize,
     pub calls_eos_not_ignored: usize,
+    /// Calls whose reported `prompt_tokens` differ from `rendered_tokens`:
+    /// the server built a different prompt from the one replay sized and cut.
+    pub calls_render_mismatch: usize,
     pub prompt_tokens: u64,
     pub cached_tokens: u64,
     /// `prompt_tokens - cached_tokens`.
@@ -109,6 +116,7 @@ struct Stats {
     calls_overshoot: usize,
     calls_shortfall: usize,
     calls_eos_not_ignored: usize,
+    calls_render_mismatch: usize,
     prompt_tokens: u64,
     cached_tokens: u64,
     prefill_tokens: u64,
@@ -422,6 +430,7 @@ pub async fn run(mut config: Config) -> Result<()> {
         calls_overshoot: st.calls_overshoot,
         calls_shortfall: st.calls_shortfall,
         calls_eos_not_ignored: st.calls_eos_not_ignored,
+        calls_render_mismatch: st.calls_render_mismatch,
         prompt_tokens: st.prompt_tokens,
         cached_tokens: st.cached_tokens,
         prefill_tokens: st.prefill_tokens,
@@ -447,7 +456,7 @@ fn report(config: &Config, s: &ReplaySummary) -> Result<()> {
                 "Trace replay\n\
                  \x20 server: {} build {}, per-request context {} tokens\n\
                  \x20 sessions: {} selected of {} ({} completed, {} failed, {} truncated)\n\
-                 \x20 calls: {} sent, {} failed, {} overshoot, {} shortfall, {} EOS not ignored\n\
+                 \x20 calls: {} sent, {} failed, {} overshoot, {} shortfall, {} EOS not ignored, {} render mismatch\n\
                  \x20 tokens: prompt {}, cached {}, prefill computed {}\n\
                  \x20 cached/prompt permille ({} calls with traced reuse): p50 {}, p10 {}\n\
                  \x20 lag ms: p50 {}, p99 {}, max {}\n\
@@ -469,6 +478,7 @@ fn report(config: &Config, s: &ReplaySummary) -> Result<()> {
                 s.calls_overshoot,
                 s.calls_shortfall,
                 s.calls_eos_not_ignored,
+                s.calls_render_mismatch,
                 s.prompt_tokens,
                 s.cached_tokens,
                 s.prefill_tokens,
@@ -521,6 +531,7 @@ async fn run_session(sh: Arc<Shared>, s: TraceSession, offset: Duration) -> Outc
                 gap_capped: slots[i].gap_capped,
                 warmup: false,
                 target_prompt: c.prompt,
+                rendered_tokens: 0,
                 prompt_tokens: None,
                 overshoot: false,
                 reuse: c.reuse,
@@ -554,6 +565,7 @@ async fn run_session(sh: Arc<Shared>, s: TraceSession, offset: Duration) -> Outc
                     break 'calls Outcome::Failed;
                 }
             };
+            record.rendered_tokens = built.prompt_tokens as u64;
             record.shortfall = built.shortfall as u64;
             record.overshoot = built.overshoot;
 
@@ -698,6 +710,12 @@ fn missing_usage(r: &CallRecord) -> Option<String> {
     ))
 }
 
+/// Whether the server reported a prompt length other than the one replay
+/// rendered for a call.
+fn render_mismatch(r: &CallRecord) -> bool {
+    r.prompt_tokens.is_some_and(|p| p != r.rendered_tokens)
+}
+
 /// Add a finished call to the run totals and apply the prompt-size check.
 fn account(sh: &Shared, r: &CallRecord) {
     let mut st = sh.stats.lock().unwrap();
@@ -714,6 +732,15 @@ fn account(sh: &Shared, r: &CallRecord) {
     if let Some(p) = r.prompt_tokens {
         st.size_errors
             .push((p as f64 - r.target_prompt as f64).abs() / r.target_prompt.max(1) as f64);
+    }
+    if render_mismatch(r) {
+        st.calls_render_mismatch += 1;
+        if st.calls_render_mismatch == 1 {
+            warn!(
+                "session {} call {}: the server reported {:?} prompt tokens, replay rendered {}; reuse cuts may not match the server's prompt",
+                r.session_id, r.call, r.prompt_tokens, r.rendered_tokens
+            );
+        }
     }
     if !r.warmup {
         st.add_measured(r);
@@ -746,6 +773,7 @@ mod tests {
             gap_capped: false,
             warmup: false,
             target_prompt: 100,
+            rendered_tokens: 100,
             prompt_tokens: prompt,
             overshoot: false,
             reuse: 50,
@@ -777,6 +805,16 @@ mod tests {
         st.add_measured(&r);
         assert_eq!(st.permille.len(), 1);
         assert_eq!(st.prompt_tokens, 14200);
+    }
+
+    #[test]
+    fn render_mismatch_compares_reported_and_rendered_prompt_tokens() {
+        let mut r = record(Some(100), Some(0));
+        assert!(!render_mismatch(&r));
+        r.rendered_tokens = 99;
+        assert!(render_mismatch(&r));
+        // No reported count is a missing-usage failure, not a mismatch.
+        assert!(!render_mismatch(&record(None, None)));
     }
 
     #[test]
