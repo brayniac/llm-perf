@@ -232,8 +232,8 @@ pub enum ReplayServer {
     /// llama-server: `/apply-template`, `/tokenize`, `/detokenize`, `/props`.
     #[default]
     LlamaServer,
-    /// vLLM: `/tokenize` with chat messages, `/detokenize`, `/v1/models`,
-    /// `/version` and `/metrics`.
+    /// vLLM: `/tokenize` with chat messages or a prompt, `/detokenize`,
+    /// `/v1/models` and `/version`.
     Vllm,
 }
 

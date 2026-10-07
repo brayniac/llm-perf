@@ -87,8 +87,11 @@ pub struct ReplaySummary {
     pub cached_tokens: u64,
     /// `prompt_tokens - cached_tokens`.
     pub prefill_tokens: u64,
+    /// Calls the cached permille percentiles cover.
+    pub calls_measured: usize,
     /// Percentiles of 1000 * cached_tokens / prompt_tokens over calls whose
-    /// traced reuse is > 0.
+    /// traced reuse is > 0. Each call's value is at most about its traced
+    /// reuse / prompt, so compare runs only on the same calls.
     pub cached_permille_p50: Option<f64>,
     pub cached_permille_p10: Option<f64>,
     pub lag_ms_p50: Option<f64>,
@@ -422,6 +425,7 @@ pub async fn run(mut config: Config) -> Result<()> {
         prompt_tokens: st.prompt_tokens,
         cached_tokens: st.cached_tokens,
         prefill_tokens: st.prefill_tokens,
+        calls_measured: st.permille.len(),
         cached_permille_p50: percentile(&mut st.permille, 50.0),
         cached_permille_p10: percentile(&mut st.permille, 10.0),
         lag_ms_p50: percentile(&mut st.lag_ms, 50.0),
@@ -445,7 +449,7 @@ fn report(config: &Config, s: &ReplaySummary) -> Result<()> {
                  \x20 sessions: {} selected of {} ({} completed, {} failed, {} truncated)\n\
                  \x20 calls: {} sent, {} failed, {} overshoot, {} shortfall, {} EOS not ignored\n\
                  \x20 tokens: prompt {}, cached {}, prefill computed {}\n\
-                 \x20 cached/prompt permille (calls with traced reuse): p50 {}, p10 {}\n\
+                 \x20 cached/prompt permille ({} calls with traced reuse): p50 {}, p10 {}\n\
                  \x20 lag ms: p50 {}, p99 {}, max {}\n\
                  \x20 ttft ms: p50 {}, p99 {}\n\
                  \x20 prompt size error (median): {}\n",
@@ -468,6 +472,7 @@ fn report(config: &Config, s: &ReplaySummary) -> Result<()> {
                 s.prompt_tokens,
                 s.cached_tokens,
                 s.prefill_tokens,
+                s.calls_measured,
                 f(s.cached_permille_p50),
                 f(s.cached_permille_p10),
                 f(s.lag_ms_p50),

@@ -88,11 +88,11 @@ those of `tests/fixtures/vllm/capture.sh`.
 
 - `/tokenize` with `messages`, `add_generation_prompt` and
   `chat_template_kwargs` returns the tokens `/v1/chat/completions` generates
-  from (7,023 for call 1 both ways). With `prompt` and `add_special_tokens:
-  false` it tokenizes plain text. `return_token_strs` adds each token's
-  vocabulary string (`Ġworld`), not its text; replay decodes these with the
-  inverse of GPT-2's byte-to-character table. `/detokenize` takes `tokens`
-  and returns `prompt`.
+  from (7,023 for call 1 and 7,100 for call 3, both ways). With `prompt` and
+  `add_special_tokens: false` it tokenizes plain text. `return_token_strs`
+  adds each token's vocabulary string (`Ġworld`), not its text; replay
+  decodes these with the inverse of GPT-2's byte-to-character table.
+  `/detokenize` takes `tokens` and returns `prompt`.
 - For Qwen3.5 with prefix caching, vLLM sets `mamba_cache_mode` to `align` and
   the attention block size to 528 tokens. Cached counts are whole blocks:
   6,864 is 13 blocks. The server log reports the block size at startup.
@@ -102,18 +102,20 @@ those of `tests/fixtures/vllm/capture.sh`.
   version.
 - At `--gpu-memory-utilization 0.92` the KV cache is 264,714 tokens (2.02
   requests of 131,072).
-- A replay of one six-call session alone (cuts of 4 to 217 tokens before the
-  previous prompt's end) reported as cached, on all five calls with reuse,
-  the common token prefix with the previous prompt and reply rounded down to
-  whole 528-token blocks. A 30-minute replay at sample 0.004 and speedup 1.5
-  (seven sessions with calls, at most three requests running) gave 134 of 177
-  measured calls at that value, 36 short by 1 to 7 blocks and 7 short by 9 to 93
-  blocks. 28 of the 36 had no other session's call sent between the
-  session's previous call and this one. A short call's `cached_tokens` was
-  often 0 to 3 blocks past the previous call's `cached_tokens`, which fits
-  `align` mode saving the recurrent state only at the ends of scheduled
-  prefill chunks rather than at every block; vLLM's scheduler steps were not
-  logged, so this is not confirmed.
+- Two replays used the first build of vLLM replay, which logged the common
+  token prefix with the previous prompt and reply as `expected_reuse`.
+  - One six-call session replayed alone (cuts of 4 to 217 tokens before the
+    previous prompt's end): on all five calls with reuse, `cached_tokens` was
+    that prefix rounded down to whole 528-token blocks.
+  - A 30-minute replay at sample 0.004 and speedup 1.5 (seven sessions with
+    calls, at most three requests running): 134 of 177 measured calls
+    matched, 36 were short by 1 to 7 blocks, and 7 by 9 to 93 blocks. 28 of
+    the 36 had no other session's call sent between the session's previous
+    call and this one.
+  - In a call that fell short, `cached_tokens` was often 0 to 3 blocks past
+    the previous call's `cached_tokens`. This is consistent with `align` mode
+    saving the recurrent state only at the ends of scheduled prefill chunks.
+    vLLM's scheduler steps were not logged, so this is not confirmed.
 
 ## Trace facts this design depends on
 
@@ -234,9 +236,10 @@ Requests go to `/v1/chat/completions`, streamed with
 
 Each session keeps the message list and rendered token sequence of its
 previous call, and the tokenized reply. The rendered token sequence of a
-message list is the `/apply-template` output for it (with
-`endpoint.chat_template_kwargs`) tokenized with `add_special` and
-`parse_special`.
+message list is what the server's chat template produces for it with
+`endpoint.chat_template_kwargs`: on llama-server, the `/apply-template` output
+tokenized with `add_special` and `parse_special`; on vLLM, the tokens from
+`/tokenize` with `messages` and `add_generation_prompt`.
 
 For call `n`:
 
@@ -354,14 +357,17 @@ aggregates; the log still records them.
 
 1. Unit tests with no server: sampling, time scaling, cutting message lists at
    token boundaries, filler determinism.
-2. Fixture tests: parse the captured responses in `tests/fixtures/llama-server/`.
+2. Fixture tests: parse the captured `/tokenize`, `/props`, `/version`,
+   `/v1/models` and streamed chat responses in `tests/fixtures/llama-server/`
+   and `tests/fixtures/vllm/`, and compare the vLLM `/tokenize` request bodies
+   with the captured ones.
 3. Llama 3.1 8B on llama-server, sessions replayed one at a time: the common
    token prefix of each rendered prompt with the previous rendered prompt and
    reply, minus `cached`, was 0, or 1 when the whole previous reply was kept.
 4. Qwen3.5 9B, same sample: `cached` was the largest checkpoint position at or
    below `min(common prefix, previous prompt - 4)`.
 
-Checks 3 and 4 were made with versions before 214c271, which logged the
-common prefix. Replay no longer records it, so repeating them needs the
-rendered prompts captured separately. Prefix construction is covered by the
-prompt unit tests.
+Checks 3 and 4 were made with 0.1.19, whose per-call log recorded the common
+prefix as `expected_reuse`. The log does not record it, so repeating them
+needs the rendered prompts captured separately. The prompt unit tests cover
+prefix construction.

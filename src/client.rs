@@ -127,9 +127,9 @@ struct TokenizeResponse {
     tokens: Vec<serde_json::Value>,
 }
 
-/// One token from llama-server `POST /tokenize`. `piece` is the token's text
-/// when the request set `with_pieces` and the piece is valid UTF-8 on its own;
-/// the server sends other pieces as byte arrays, which are left as `None`.
+/// One token from a `/tokenize` response. `piece` is the token's text when
+/// pieces were requested and the token is valid UTF-8 on its own, and `None`
+/// otherwise.
 #[derive(Debug, Clone, PartialEq)]
 pub struct TokenPiece {
     pub id: u32,
@@ -257,8 +257,8 @@ pub(crate) fn parse_vllm_tokenize(
 /// `<0xNN>`. A `<0xNN>` string is a single byte and returns `None`. Otherwise
 /// a string that uses only characters from the byte-level table is decoded as
 /// byte-level, and any other is treated as SentencePiece. A SentencePiece
-/// token with no `▁` and characters in U+0080 to U+0143 is therefore decoded
-/// as byte-level and returns `None` or wrong text.
+/// token with no `▁` and characters in U+00A1 to U+0143 other than U+00AD is
+/// therefore decoded as byte-level and returns `None` or wrong text.
 pub(crate) fn vocab_piece_text(s: &str) -> Option<String> {
     if s.len() == 6 && s.starts_with("<0x") && s.ends_with('>') {
         return None;
@@ -594,16 +594,7 @@ impl OpenAIClient {
     /// llama-server's `GET /props`: server settings, including the per-slot
     /// context at `default_generation_settings.n_ctx`. llama-server only.
     pub async fn props(&self) -> Result<serde_json::Value> {
-        let url = format!("{}/props", self.server_root());
-        let mut req = self.client.get(&url).timeout(self.timeout);
-        if let Some(api_key) = &self.api_key {
-            req = req.header("Authorization", format!("Bearer {}", api_key));
-        }
-        let resp = req.send().await?;
-        if !resp.status().is_success() {
-            anyhow::bail!("/props returned HTTP {}", resp.status());
-        }
-        Ok(resp.json().await?)
+        Ok(serde_json::from_str(&self.get_root_text("/props").await?)?)
     }
 
     /// Text for `tokens` via llama-server's `/detokenize`. llama-server only.
@@ -635,8 +626,9 @@ impl OpenAIClient {
 
     /// Tokens of the prompt vLLM builds from chat `messages`, via `POST
     /// /tokenize` with `messages` and `add_generation_prompt`. vLLM renders
-    /// these with the same template and arguments as `/v1/chat/completions`,
-    /// so `chat_template_kwargs` must match the generation request. vLLM only.
+    /// these with the chat template `/v1/chat/completions` uses; the captured
+    /// Qwen3.5 9B requests give the same prompt token count both ways.
+    /// `chat_template_kwargs` must match the generation request. vLLM only.
     pub async fn vllm_tokenize_messages(
         &self,
         messages: &[Message],
@@ -655,7 +647,7 @@ impl OpenAIClient {
     /// /tokenize` with `prompt`. vLLM's tokenizer still turns special-token
     /// text in `text` (for example `<|im_end|>`) into the special token. With
     /// `with_pieces`, each token's text is decoded from vLLM's `token_strs`
-    /// by inverting GPT-2's byte-to-character table. vLLM only.
+    /// as a byte-level BPE or SentencePiece vocabulary string. vLLM only.
     pub async fn vllm_tokenize_text(
         &self,
         text: &str,
@@ -1962,7 +1954,11 @@ mod tests {
         assert_eq!(ids, vec![9419, 1814, 11, 411, 369, 264, 1228, 13]);
         let text: String = pieces.iter().map(|p| p.piece.as_deref().unwrap()).collect();
         // The captured /detokenize of the same ids.
-        assert_eq!(text, "Hello world, this is a test.");
+        let detok: serde_json::Value = serde_json::from_str(include_str!(
+            "../tests/fixtures/vllm/qwen3.5-9b-fp8/detokenize.response.json"
+        ))
+        .unwrap();
+        assert_eq!(text, detok["prompt"].as_str().unwrap());
         assert_eq!(pieces[1].piece.as_deref(), Some(" world"));
         assert!(
             parse_vllm_tokenize(&v, false)
@@ -2029,12 +2025,15 @@ mod tests {
         assert_eq!(byte_level_byte('\u{121}'), Some(127));
         assert_eq!(byte_level_byte('\u{143}'), Some(173));
         assert_eq!(byte_level_byte('\u{144}'), None);
-        // Every byte has a distinct character.
-        let chars: std::collections::HashSet<u8> = (0u32..0x200)
+        // Exactly 256 characters map to a byte, and they map to 256 distinct
+        // bytes.
+        let bytes: Vec<u8> = (0u32..0x200)
             .filter_map(char::from_u32)
             .filter_map(byte_level_byte)
             .collect();
-        assert_eq!(chars.len(), 256);
+        assert_eq!(bytes.len(), 256);
+        let distinct: std::collections::HashSet<u8> = bytes.into_iter().collect();
+        assert_eq!(distinct.len(), 256);
     }
 
     #[test]
@@ -2141,6 +2140,24 @@ mod tests {
         ));
         let valid = br#"data: {"id":"1","object":"chat.completion.chunk","created":0,"model":"m","choices":[{"index":0,"delta":{"content":"hi"}}]}"#;
         assert!(matches!(parse_sse_line(valid), SseEvent::Chunk(_)));
+    }
+
+    #[test]
+    fn vllm_stream_usage_parses_from_captured_final_chunk() {
+        // vLLM's usage chunk has empty `choices` and an extra
+        // `created_cache_tokens` field.
+        let sse = include_str!("../tests/fixtures/vllm/qwen3.5-9b-fp8/call3.response.sse");
+        let mut usage = None;
+        for l in sse.lines() {
+            match parse_sse_line(l.as_bytes()) {
+                SseEvent::Chunk(c) if c.usage.is_some() => usage = c.usage,
+                SseEvent::Malformed => panic!("malformed line: {l}"),
+                _ => {}
+            }
+        }
+        let usage = usage.expect("a chunk with usage");
+        assert_eq!(usage.prompt_tokens, 7100);
+        assert_eq!(usage.prompt_tokens_details.unwrap().cached_tokens, 6864);
     }
 
     #[test]

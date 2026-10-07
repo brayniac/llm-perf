@@ -1,11 +1,13 @@
 #!/bin/sh
-# Capture vLLM responses for a three-call session into a directory.
+# Capture vLLM's /v1/models, /version, /tokenize and /detokenize responses and
+# a three-call session into a directory.
 #
 #   capture.sh <base-url> <model> <out-dir>
 #
 # The server must run with --enable-prefix-caching and
 # --enable-prompt-tokens-details, freshly started so call1 finds an empty
-# cache. Calls are streamed with usage, 64 tokens, thinking disabled.
+# cache. Calls are streamed with usage, max_tokens 64 with ignore_eos, thinking
+# disabled.
 #
 # call1: system + long user message.
 # call2: call1 again.
