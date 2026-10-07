@@ -48,8 +48,8 @@ pub struct CallRecord {
     pub warmup: bool,
     pub target_prompt: u64,
     /// Length of the prompt as replay rendered it with the server's
-    /// tokenize endpoint.
-    pub rendered_tokens: u64,
+    /// tokenize endpoint; `None` when building the prompt failed.
+    pub rendered_tokens: Option<u64>,
     pub prompt_tokens: Option<u64>,
     pub overshoot: bool,
     /// From the trace.
@@ -67,8 +67,8 @@ pub struct CallRecord {
 
 /// Totals printed or written at the end of a run. `calls_sent`,
 /// `calls_failed`, `calls_render_mismatch` and `prompt_size_error_median`
-/// include warmup calls; every
-/// other total and percentile covers non-warmup calls that succeeded.
+/// include warmup calls; every other total and percentile covers non-warmup
+/// calls that succeeded.
 #[derive(Debug, Default, Serialize)]
 pub struct ReplaySummary {
     pub server: ReplayServer,
@@ -88,7 +88,7 @@ pub struct ReplaySummary {
     pub calls_shortfall: usize,
     pub calls_eos_not_ignored: usize,
     /// Calls whose reported `prompt_tokens` differ from `rendered_tokens`:
-    /// the server built a different prompt from the one replay sized and cut.
+    /// the server built a different prompt from the one replay rendered.
     pub calls_render_mismatch: usize,
     pub prompt_tokens: u64,
     pub cached_tokens: u64,
@@ -97,8 +97,8 @@ pub struct ReplaySummary {
     /// Calls the cached permille percentiles cover.
     pub calls_measured: usize,
     /// Percentiles of 1000 * cached_tokens / prompt_tokens over calls whose
-    /// traced reuse is > 0. Each call's value is at most about its traced
-    /// reuse / prompt, so compare runs only on the same calls.
+    /// traced reuse is > 0. A call's value is about `1000 * reuse /
+    /// prompt_tokens` at most, and this bound differs between calls.
     pub cached_permille_p50: Option<f64>,
     pub cached_permille_p10: Option<f64>,
     pub lag_ms_p50: Option<f64>,
@@ -127,6 +127,20 @@ struct Stats {
 }
 
 impl Stats {
+    /// Count a successful call whose reported prompt length differs from the
+    /// rendered one. Returns both lengths for the first such call, so the
+    /// caller can log it.
+    fn add_render(&mut self, r: &CallRecord) -> Option<(u64, u64)> {
+        let (Some(reported), Some(rendered)) = (r.prompt_tokens, r.rendered_tokens) else {
+            return None;
+        };
+        if reported == rendered {
+            return None;
+        }
+        self.calls_render_mismatch += 1;
+        (self.calls_render_mismatch == 1).then_some((reported, rendered))
+    }
+
     /// Add a successful non-warmup call to the measured totals.
     fn add_measured(&mut self, r: &CallRecord) {
         self.calls_overshoot += r.overshoot as usize;
@@ -531,7 +545,7 @@ async fn run_session(sh: Arc<Shared>, s: TraceSession, offset: Duration) -> Outc
                 gap_capped: slots[i].gap_capped,
                 warmup: false,
                 target_prompt: c.prompt,
-                rendered_tokens: 0,
+                rendered_tokens: None,
                 prompt_tokens: None,
                 overshoot: false,
                 reuse: c.reuse,
@@ -565,7 +579,7 @@ async fn run_session(sh: Arc<Shared>, s: TraceSession, offset: Duration) -> Outc
                     break 'calls Outcome::Failed;
                 }
             };
-            record.rendered_tokens = built.prompt_tokens as u64;
+            record.rendered_tokens = Some(built.prompt_tokens as u64);
             record.shortfall = built.shortfall as u64;
             record.overshoot = built.overshoot;
 
@@ -710,12 +724,6 @@ fn missing_usage(r: &CallRecord) -> Option<String> {
     ))
 }
 
-/// Whether the server reported a prompt length other than the one replay
-/// rendered for a call.
-fn render_mismatch(r: &CallRecord) -> bool {
-    r.prompt_tokens.is_some_and(|p| p != r.rendered_tokens)
-}
-
 /// Add a finished call to the run totals and apply the prompt-size check.
 fn account(sh: &Shared, r: &CallRecord) {
     let mut st = sh.stats.lock().unwrap();
@@ -733,14 +741,11 @@ fn account(sh: &Shared, r: &CallRecord) {
         st.size_errors
             .push((p as f64 - r.target_prompt as f64).abs() / r.target_prompt.max(1) as f64);
     }
-    if render_mismatch(r) {
-        st.calls_render_mismatch += 1;
-        if st.calls_render_mismatch == 1 {
-            warn!(
-                "session {} call {}: the server reported {:?} prompt tokens, replay rendered {}; reuse cuts may not match the server's prompt",
-                r.session_id, r.call, r.prompt_tokens, r.rendered_tokens
-            );
-        }
+    if let Some((reported, rendered)) = st.add_render(r) {
+        warn!(
+            "session {} call {}: the server reported {reported} prompt tokens, replay rendered {rendered}; the server built a different prompt from the one replay rendered",
+            r.session_id, r.call
+        );
     }
     if !r.warmup {
         st.add_measured(r);
@@ -773,7 +778,7 @@ mod tests {
             gap_capped: false,
             warmup: false,
             target_prompt: 100,
-            rendered_tokens: 100,
+            rendered_tokens: Some(100),
             prompt_tokens: prompt,
             overshoot: false,
             reuse: 50,
@@ -808,13 +813,20 @@ mod tests {
     }
 
     #[test]
-    fn render_mismatch_compares_reported_and_rendered_prompt_tokens() {
+    fn render_mismatch_is_counted_and_the_first_returned() {
+        let mut st = Stats::default();
         let mut r = record(Some(100), Some(0));
-        assert!(!render_mismatch(&r));
-        r.rendered_tokens = 99;
-        assert!(render_mismatch(&r));
-        // No reported count is a missing-usage failure, not a mismatch.
-        assert!(!render_mismatch(&record(None, None)));
+        assert_eq!(st.add_render(&r), None);
+        r.rendered_tokens = Some(99);
+        assert_eq!(st.add_render(&r), Some((100, 99)));
+        assert_eq!(st.add_render(&r), None);
+        assert_eq!(st.calls_render_mismatch, 2);
+        // No reported count is a missing-usage failure, and no rendered count
+        // a build failure; neither is a mismatch.
+        assert_eq!(st.add_render(&record(None, None)), None);
+        r.rendered_tokens = None;
+        assert_eq!(st.add_render(&r), None);
+        assert_eq!(st.calls_render_mismatch, 2);
     }
 
     #[test]

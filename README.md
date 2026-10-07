@@ -230,14 +230,16 @@ against a low-load run of the same sessions, on the calls both runs sent (join
 the logs on `session_id` and `call`). An overloaded run sends fewer of each
 session's later, longer calls when `duration_seconds` ends the run or failed
 calls end their sessions. Its summary then covers different calls from the
-low-load run's; `calls_measured` gives the count.
+low-load run's. `calls_measured` is the number of calls the cached/prompt
+percentiles cover.
 
 The per-call log (`replay.log`) records, among other fields:
 
 - `prompt_tokens`, `cached_tokens`: as the server reported them
 - `rendered_tokens`: the prompt length replay rendered with the server's
-  tokenize endpoint; it equals `prompt_tokens` unless the server built a
-  different prompt from the one replay sized and cut
+  tokenize endpoint, or null when building the prompt failed; it equals
+  `prompt_tokens` unless the server built a different prompt from the one
+  replay rendered
 - `reuse`: the traced reuse the call was built with
 - `lag_ms`: how far the call was sent behind its scaled source time
 - `overshoot`: the prompt is longer than traced, because the call adds fewer
@@ -247,9 +249,10 @@ The per-call log (`replay.log`) records, among other fields:
   tokens than were generated, more when the server stopped early
 
 The summary counts calls whose `prompt_tokens` differ from `rendered_tokens`
-(`calls_render_mismatch`, warmup included) and logs the first one; a nonzero
-count means cut positions do not match the server's prompt. It also reports
-prompt, cached and prefill-computed token totals, and
+(`calls_render_mismatch`, warmup included), and replay logs the first one as a
+warning. A nonzero count means the server built a different prompt from the one
+replay rendered, so cut positions and prompt sizes may not match it. The
+summary also reports prompt, cached and prefill-computed token totals, and
 percentiles of `1000 * cached_tokens / prompt_tokens` over successful
 non-warmup calls whose traced `reuse` is above 0.
 

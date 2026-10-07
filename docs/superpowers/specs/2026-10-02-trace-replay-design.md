@@ -87,8 +87,8 @@ those of `tests/fixtures/vllm/capture.sh`.
 | 3: call 1 + reply + new user message | 7,100 | 7,019 | 6,864 |
 
 - `/tokenize` with `messages`, `add_generation_prompt` and
-  `chat_template_kwargs` returns the tokens `/v1/chat/completions` generates
-  from (7,023 for call 1 and 7,100 for call 3, both ways). With `prompt` and
+  `chat_template_kwargs` returns as many tokens as `usage.prompt_tokens`
+  reports for the same request (7,023 for call 1, 7,100 for call 3). With `prompt` and
   `add_special_tokens: false` it tokenizes plain text. `return_token_strs`
   adds each token's vocabulary string (`Ġworld`), not its text; replay
   decodes these with the inverse of GPT-2's byte-to-character table.
@@ -102,14 +102,15 @@ those of `tests/fixtures/vllm/capture.sh`.
   version.
 - At `--gpu-memory-utilization 0.92` the KV cache is 264,714 tokens (2.02
   requests of 131,072).
-- Two replays used the first build of vLLM replay, which logged the common
-  token prefix with the previous prompt and reply as `expected_reuse`.
+- Two replays recorded, per call, the common token prefix of the rendered
+  prompt with the previous prompt and reply. Replay no longer records it.
   - One six-call session replayed alone (cuts of 4 to 217 tokens before the
     previous prompt's end): on all five calls with reuse, `cached_tokens` was
     that prefix rounded down to whole 528-token blocks.
   - A 30-minute replay at sample 0.004 and speedup 1.5 (seven sessions with
     calls, at most three requests running): 134 of 177 measured calls
-    matched, 36 were short by 1 to 7 blocks, and 7 by 9 to 93 blocks. 28 of
+    had `cached_tokens` equal to that prefix rounded down to whole blocks, 36
+    were short by 1 to 7 blocks, and 7 by 9 to 93 blocks. 28 of
     the 36 had no other session's call sent between the session's previous
     call and this one.
   - In a call that fell short, `cached_tokens` was often 0 to 3 blocks past
@@ -310,9 +311,8 @@ Per call, appended to `replay.log` when set:
 
 `rendered_tokens` is the length of the prompt replay rendered with the
 server's tokenize endpoint. A call whose reported `prompt_tokens` differs from
-it was built by the server from a different prompt than the one replay sized
-and cut; the summary counts these, warmup included, and the first is logged
-as a warning.
+it was built from a different prompt from the one replay rendered. The summary
+counts these calls, warmup included. The first is logged as a warning.
 
 Reuse is measured only by what the server reports: `prompt_tokens` and
 `cached_tokens`. Replay does not predict how many tokens should be cached.
@@ -364,10 +364,10 @@ aggregates; the log still records them.
 
 1. Unit tests with no server: sampling, time scaling, cutting message lists at
    token boundaries, filler determinism.
-2. Fixture tests: parse the captured `/tokenize`, `/props`, `/version`,
-   `/v1/models` and streamed chat responses in `tests/fixtures/llama-server/`
-   and `tests/fixtures/vllm/`, and compare the vLLM `/tokenize` request bodies
-   with the captured ones.
+2. Fixture tests: parse the captured llama-server `/tokenize` and `/props`
+   responses, and the vLLM `/tokenize`, `/detokenize`, `/version`,
+   `/v1/models` and streamed call 3 responses, and compare the vLLM
+   `/tokenize` request bodies with the captured ones.
 3. Llama 3.1 8B on llama-server, sessions replayed one at a time: the common
    token prefix of each rendered prompt with the previous rendered prompt and
    reply, minus `cached`, was 0, or 1 when the whole previous reply was kept.

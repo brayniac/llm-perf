@@ -129,7 +129,8 @@ struct TokenizeResponse {
 
 /// One token from a `/tokenize` response. `piece` is the token's text when
 /// pieces were requested and the token is valid UTF-8 on its own, and `None`
-/// otherwise.
+/// otherwise. On vLLM it is decoded from the vocabulary string by
+/// `vocab_piece_text`.
 #[derive(Debug, Clone, PartialEq)]
 pub struct TokenPiece {
     pub id: u32,
@@ -257,8 +258,9 @@ pub(crate) fn parse_vllm_tokenize(
 /// `<0xNN>`. A `<0xNN>` string is a single byte and returns `None`. Otherwise
 /// a string that uses only characters from the byte-level table is decoded as
 /// byte-level, and any other is treated as SentencePiece. A SentencePiece
-/// token with no `▁` and characters in U+00A1 to U+0143 other than U+00AD is
-/// therefore decoded as byte-level and returns `None` or wrong text.
+/// token made only of characters in U+0021 to U+007E, U+00A1 to U+00AC and
+/// U+00AE to U+0143, at least one above U+007E, is therefore decoded as
+/// byte-level and returns `None` or wrong text.
 pub(crate) fn vocab_piece_text(s: &str) -> Option<String> {
     if s.len() == 6 && s.starts_with("<0x") && s.ends_with('>') {
         return None;
@@ -626,8 +628,7 @@ impl OpenAIClient {
 
     /// Tokens of the prompt vLLM builds from chat `messages`, via `POST
     /// /tokenize` with `messages` and `add_generation_prompt`. vLLM renders
-    /// these with the chat template `/v1/chat/completions` uses; the captured
-    /// Qwen3.5 9B requests give the same prompt token count both ways.
+    /// these with the chat template `/v1/chat/completions` uses.
     /// `chat_template_kwargs` must match the generation request. vLLM only.
     pub async fn vllm_tokenize_messages(
         &self,
