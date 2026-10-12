@@ -88,7 +88,7 @@ Automatically categorizes TTFT and ITL by input context size:
 - **Log File Support**: Automatic rotation at 10MB with backup file preservation
 - **Periodic Stats**: Windowed metrics output during benchmark runs
 - **Quiet Mode**: Suppress periodic stats for CI/CD or JSON piping
-- **Admin Metrics Server**: Optional HTTP endpoint exposing Prometheus/JSON metrics during runs
+- **Admin Metrics Server**: Optional HTTP server exposing metrics during runs as Prometheus text, JSON, a msgpack snapshot, and a replication stream that `rezolus record` writes into a `.dendro` (see [Admin server](#admin-server))
 
 ### Metrics Capture
 
@@ -334,6 +334,73 @@ level = "info"
 # batch_size = 10000
 ```
 
+### Admin server
+
+`[admin] enabled = true` starts an HTTP server on `listen` (default
+`127.0.0.1:9090`) for the length of a `bench` run:
+
+| Path | Body |
+|------|------|
+| `/metrics` | Prometheus text; histograms as p50/p90/p95/p99/p99.9 gauges |
+| `/metrics.json`, `/vars.json` | JSON, histograms as `<name>/p<permille>` keys |
+| `/vars` | the same, one `name: value` line each |
+| `/metrics/binary` | one msgpack snapshot of every metric (`application/msgpack`) |
+| `/metrics/stream` | dendro replication frames (`application/vnd.metriken.replication.v1+dendro`) |
+
+`/metrics/stream` takes `interval` (default `1s`) and `layout` (`wide`, the
+default, or `long`). It sends a handshake naming `source=llm-perf` and then one
+frame per interval, each carrying every metric recorded so far, histograms with their buckets,
+until the client disconnects. An interval below 10 ms, a zero or malformed
+interval, and an unknown layout are refused with 400 and the reason. The
+response headers `x-metriken-frame-interval`, `x-metriken-update-floor` and
+`x-metriken-layout` state what is served.
+
+`rezolus record` given the admin server's base URL probes `/metrics/binary`,
+recognizes llm-perf as a metriken source, and records it into a `.dendro`.
+rezolus at or after 6.0.0-alpha.45 records the stream; until 6.0.0 is
+released, that is a build of rezolus main at or after ab24b072. rezolus 5.23
+to 5.26 scrape `/metrics/binary` into the `.dendro` instead (measured with
+5.26.0). 6.0 alphas before alpha.45 refuse the stream's content type, and
+rezolus before 5.23.0 writes parquet to a path ending in `.dendro`.
+
+```bash
+rezolus record --endpoint http://127.0.0.1:9090,source=llm-perf -o run.dendro
+```
+
+With `[metrics] server_metrics_url` set and `server_metrics_output` ending in
+`.dendro`, llm-perf runs that `rezolus record` itself, with the server under
+test as a second endpoint, so one archive holds both:
+
+```toml
+[metrics]
+output = "run.parquet"
+server_metrics_url = "http://localhost:8080/metrics"
+server_metrics_output = "run.dendro"
+
+[admin]
+enabled = true
+```
+
+Before adding llm-perf's endpoint, llm-perf runs `<rezolus_bin> --version`.
+For a version that cannot record it (a 6.0 alpha before alpha.45, anything
+before 5.23.0, or output it cannot parse), or a `--version` that has not
+exited after 5 s, it logs a warning naming the
+version (or the timeout) and the reason, and the `.dendro` holds the server under test only.
+Without `[admin]`, the `.dendro` also holds the server under test only. With
+any other `server_metrics_output` extension (the match is exact: `.dendro`,
+not `.DENDRO`) the server is recorded alone, as before. If `rezolus record`
+exits non-zero, llm-perf logs an error with the exit status and repeats it as
+a warning in the console summary.
+
+At the default `[log] level = "info"`, llm-perf hides `warp::server` events,
+so the `server connection error: hyper::Error(IncompleteMessage)` that warp
+logs when `rezolus record` closes `/metrics/stream` at the end of a run does
+not appear. The same filter hides the admin server's other connection errors
+and its accept errors, such as `accept error` when llm-perf runs out of file
+descriptors. `level = "debug"` shows them, as does
+`filter = ["warp::server=error"]`. A failure to bind the admin address still
+shows: warp panics with `failed to bind to address`.
+
 ### Input Format
 
 Create a JSONL file with prompts:
@@ -511,7 +578,7 @@ llm-perf/
 │   ├── report.rs         # Report generation (console and JSON)
 │   ├── stats.rs          # Periodic windowed stats during runs
 │   ├── snapshot.rs       # Metrics snapshot to parquet pipeline
-│   ├── admin.rs          # HTTP admin server (Prometheus/JSON metrics)
+│   ├── admin.rs          # HTTP admin server (Prometheus/JSON/msgpack metrics, /metrics/stream)
 │   ├── distribution.rs   # Request arrival distributions (uniform, poisson)
 │   ├── tokenizer.rs      # Token counting via tiktoken
 │   ├── logprobs.rs       # Log probability collection and JSONL writer

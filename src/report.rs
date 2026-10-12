@@ -227,6 +227,9 @@ pub struct ReportBuilder {
     /// Actual resolved tokenizer (label, is_estimate). Overrides the name-based
     /// guess when the runtime cascade picked an exact/calibrated tokenizer.
     tokenizer_info: Option<(String, bool)>,
+    /// Why the `rezolus record` child for server metrics failed, if it did.
+    /// Printed in the console summary; not part of the JSON report.
+    server_metrics_failure: Option<String>,
 }
 
 impl Default for ReportBuilder {
@@ -256,6 +259,7 @@ impl ReportBuilder {
             duration: None,
             saturation_results: None,
             tokenizer_info: None,
+            server_metrics_failure: None,
         }
     }
 
@@ -269,6 +273,17 @@ impl ReportBuilder {
     pub fn with_tokenizer_info(mut self, label: String, estimated: bool) -> Self {
         self.tokenizer_info = Some((label, estimated));
         self
+    }
+
+    /// Record why the server metrics recorder failed (see
+    /// `ServerMetricsRecorder::finish`), for the console summary.
+    pub fn with_server_metrics_failure(mut self, failure: Option<String>) -> Self {
+        self.server_metrics_failure = failure;
+        self
+    }
+
+    pub fn server_metrics_failure(&self) -> Option<&str> {
+        self.server_metrics_failure.as_deref()
     }
 
     pub fn with_duration(mut self, duration: Duration) -> Self {
@@ -783,6 +798,9 @@ impl ReportBuilder {
                 "{} Canceled: {}",
                 timestamp, report.summary.requests_canceled
             );
+        }
+        if let Some(failure) = &self.server_metrics_failure {
+            println!("{} Warning: {}", timestamp, failure);
         }
         if report.summary.malformed_chunks > 0 {
             println!(

@@ -24,7 +24,9 @@ log = "0.4"
 # metriken-core declares `links`, so the build holds one metriken-core: every
 # metriken crate moves together (core 0.3 here).
 metriken = "0.11.3"
-metriken-exposition = { version = "0.22.0", features = ["json", "msgpack"] }
+# `stream-tokio`: the `/metrics/stream` route and its body as a tokio stream
+# (src/admin.rs).
+metriken-exposition = { version = "0.22.0", features = ["json", "msgpack", "stream", "stream-tokio"] }
 # The msgpack-to-parquet conversion behind `[metrics] output` (src/snapshot.rs).
 metriken-storage = { version = "0.2.0", default-features = false, features = ["convert"] }
 libc = "0.2"
@@ -55,6 +57,11 @@ flate2 = "1.1.10"
 tar = "0.4.46"
 
 [dev-dependencies]
+# Decode `/metrics/stream` in the admin tests: dendro's frame reader, and the
+# group row payload the frames carry. Both are already in the graph through
+# metriken-exposition's `stream` feature.
+dendro = { version = "0.4", default-features = false }
+metriken-model = "0.1.1"
 mockito = "1.2"
 pretty_assertions = "1.4"
 

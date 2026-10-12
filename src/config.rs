@@ -418,6 +418,37 @@ impl LogLevel {
     }
 }
 
+/// The directive that hides warp's server events below `debug`.
+///
+/// `warp::server` logs at debug and at error only. Its error events are the
+/// admin server's connection errors and accept errors. `rezolus record`
+/// closing `/metrics/stream` at the end of a run logs `server connection
+/// error: hyper::Error(IncompleteMessage)`. An accept that fails, for example
+/// because the process ran out of file descriptors, logs `accept error: ...`
+/// (warp 0.4.3 `server.rs:477`). Both are hidden unless `level` is `debug` or
+/// `trace`, and a `filter` directive for `warp::server` replaces this one. A
+/// bind failure is not a log event and still shows: warp panics with `failed
+/// to bind to address`.
+const WARP_SERVER_QUIET: &str = "warp::server=off";
+
+impl LogConfig {
+    /// The tracing filter: `level`, then `warp::server=off` when `level`
+    /// is `error`, `warn` or `info`, then each `filter` directive in order.
+    pub fn env_filter(&self) -> anyhow::Result<tracing_subscriber::EnvFilter> {
+        let mut filter = tracing_subscriber::EnvFilter::new(self.level.as_str());
+        if matches!(
+            self.level,
+            LogLevel::Error | LogLevel::Warn | LogLevel::Info
+        ) {
+            filter = filter.add_directive(WARP_SERVER_QUIET.parse()?);
+        }
+        for directive in &self.filter {
+            filter = filter.add_directive(directive.parse()?);
+        }
+        Ok(filter)
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum OutputFormat {
@@ -987,6 +1018,39 @@ impl Config {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Whether `config`'s filter lets an error event from `warp::server`
+    /// through, and an info event from llm-perf.
+    fn enabled(config: &LogConfig) -> (bool, bool) {
+        use tracing_subscriber::prelude::*;
+        let subscriber = tracing_subscriber::registry().with(config.env_filter().unwrap());
+        tracing::subscriber::with_default(subscriber, || {
+            (
+                tracing::enabled!(target: "warp::server", tracing::Level::ERROR),
+                tracing::enabled!(target: "llm_perf::admin", tracing::Level::INFO),
+            )
+        })
+    }
+
+    #[test]
+    fn warp_server_errors_show_only_at_debug_or_when_asked_for() {
+        let log = |level, filter: &[&str]| LogConfig {
+            level,
+            filter: filter.iter().map(|f| f.to_string()).collect(),
+        };
+        assert_eq!(enabled(&log(LogLevel::Info, &[])), (false, true));
+        assert!(!enabled(&log(LogLevel::Error, &[])).0);
+        assert_eq!(enabled(&log(LogLevel::Debug, &[])), (true, true));
+        assert!(enabled(&log(LogLevel::Trace, &[])).0);
+        assert_eq!(
+            enabled(&log(LogLevel::Info, &["warp::server=error"])),
+            (true, true)
+        );
+        assert_eq!(
+            enabled(&log(LogLevel::Info, &["hyper=warn"])),
+            (false, true)
+        );
+    }
 
     #[test]
     fn endpoint_max_tokens_overrides_workload_value() {

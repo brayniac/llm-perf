@@ -19,4 +19,4 @@ Conventions:
 
 | Date | Effort | Status |
 |------|--------|--------|
-| 2026-10-08 | [Recording llm-perf and the server under test into one `.dendro`](2026-10-08-dendro-recording.md) | OPEN — step 3 built (published metriken 0.11). One `rezolus record` run with two endpoints in place of two parquet files; histograms as Prometheus buckets; published metriken 0.11 in place of the git dependency; then serve `/metrics/stream`, record in process with `metriken-recorder` in place of running `rezolus record`, own the dashboard template, and retire parquet-at-exit |
+| 2026-10-08 | [Recording llm-perf and the server under test into one `.dendro`](2026-10-08-dendro-recording.md) | OPEN — steps 3 and 4 built (published metriken 0.11; `/metrics/stream`). One `rezolus record` run with two endpoints in place of two parquet files; histograms as Prometheus buckets; published metriken 0.11 in place of the git dependency; then serve `/metrics/stream`, record in process with `metriken-recorder` in place of running `rezolus record`, own the dashboard template, and retire parquet-at-exit |

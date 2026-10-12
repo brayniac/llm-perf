@@ -1,7 +1,7 @@
 # Recording llm-perf and the server under test into one `.dendro`
 
-**Status:** OPEN. Plan opened 2026-10-08; step 3 built 2026-10-11 (branch
-`deps/metriken-0.11`, see "As built").
+**Status:** OPEN. Plan opened 2026-10-08; steps 3 and 4 built 2026-10-11
+(branches `deps/metriken-0.11` and `feat/metrics-stream`, see "As built").
 
 Related entries opened the same day: rezolus
 `docs/journal/2026-10-08-6-0-release-readiness.md`, metriken
@@ -124,3 +124,133 @@ step 5 for path step 4 (`metriken-recorder`), and step 6 for path step 5
   walk labeled slots only. With the label, the same run adds a
   `requests{status="dropped"}` series and column (124 on `/metrics` at 7 s). A
   test now checks every slot of every group has labels.
+
+### Step 4: `/metrics/stream` (branch `feat/metrics-stream`)
+
+- `src/admin.rs` serves `GET /metrics/stream` through metriken-exposition's
+  stream route (features `stream`, `stream-tokio`): one shared
+  `RegistryPasses<DefaultRouter>` over `GroupBuilder::new(DefaultRouter::new("llm-perf"))`
+  with a 10 ms floor, `StreamRequest::parse` on the raw query, a 400 for an
+  interval below the floor (cachecannon's refusal message), and
+  `StreamSubscription::into_stream` as the warp body with the subscription's
+  headers set on the response. Handshake labels `source=llm-perf`, metadata
+  `version`. Every metric lands in one windowless group, `llm-perf/main`.
+- It also serves `GET /metrics/binary`, a msgpack `Snapshot` from a
+  `Snapshotter` (metadata `source`, `version`). rezolus's recorder classifies a
+  base URL by probing `/metrics/binary` first (`probe_endpoint`, rezolus
+  `src/recorder/mod.rs`), and only a source classified as msgpack is streamed
+  into a `.dendro`; without the route llm-perf is scraped as Prometheus.
+- `record_args` (`src/server_metrics.rs`): when `server_metrics_output` ends in
+  `.dendro`, it builds `rezolus record --endpoint <server_metrics_url>
+  [--endpoint http://<admin>,source=llm-perf] -o <output> --interval <i>`. The
+  admin endpoint is added only when `[admin]` is enabled; a listen address on
+  `0.0.0.0`/`::` becomes loopback. Any other extension keeps the positional
+  form, so step 1's two-endpoint archive is opt-in by extension and the
+  default output stays `<stem>.server.parquet`. The server endpoint gets no
+  `source=`: there is no config key naming the service, and rezolus infers one
+  from host and port (with a warning, as on the positional path). The
+  extension match is exact (`dendro`), as rezolus's `Format` match is.
+- Version gate (`admin_endpoint_support`, `ServerMetricsRecorder::spawn`):
+  for a `.dendro` with `[admin]` enabled, llm-perf runs `<rezolus_bin>
+  --version` and adds its own endpoint only for 6.0.0-alpha.45 or later
+  (alpha.45 is the version ab24b072 set, the commit that made `record` accept
+  the metriken stream's content type), or for 5.23.0 or a later 5.x. 5.23.0
+  is the first 5.x tag whose recorder has a `Format::Dendro`; before it a
+  `.dendro` output is written as parquet (the reviewer saw this with
+  5.21.1-alpha.1). `src/recorder/` differs by one line between v5.23.0 and
+  v5.26.0, so 5.24 and 5.25 are taken to scrape `/metrics/binary` into the
+  archive as 5.23.0 and 5.26.0 do; 5.23.0 and 5.26.0 were run end to end (a
+  reviewer ran v5.23.0: the archive held the server scrape and
+  `source=llm-perf` as an `unattributed` table, exit 0). Anything else (a
+  6.0 alpha before alpha.45, older than 5.23.0, unparseable, or a
+  `--version` still running after 5 s, which is then killed) logs a
+  warning with the version or the timeout and the reason, and the server
+  under test is recorded alone. No
+  `semver` dependency: the parser handles `X.Y.Z[-pre][+build]`, with `beta`
+  and `rc` pre-releases of 6.0.0 accepted.
+- `ServerMetricsRecorder::finish` returns the failure when rezolus exits
+  non-zero, is killed 30 s after SIGINT, or cannot be waited on; it is logged
+  at error and printed as a `Warning:` line in the console report and the
+  brief summary (not in the JSON report).
+- `[log]`: at `error`, `warn` and `info`, `LogConfig::env_filter` adds
+  `warp::server=off` before the configured `filter` directives, which can
+  replace it. warp's server module logs at debug and error only, and its
+  error is `server connection error: hyper::Error(IncompleteMessage)` when
+  rezolus closes `/metrics/stream` at the end of a run. The filter also
+  hides warp's other connection errors and its accept errors (`accept
+  error`, for example on running out of file descriptors; warp 0.4.3
+  `server.rs:477`). A bind failure still shows, since warp panics with
+  `failed to bind to address` rather than logging it. An EnvFilter cannot
+  lower an event's level, so "debug or more verbose" is approximated by
+  showing these events only when `level` is `debug` or `trace`.
+- Tests (`admin::tests`): the stream over a socket (content type, the three
+  `x-metriken-*` headers, handshake `source=llm-perf`, three rows frames with
+  advancing `seq`, the first carrying a `ttft` member labeled
+  `context_size=small` with count >= 1, decoded with dendro 0.4's
+  `FrameReader` and metriken-model's `decode_wal_group_row`); refusal of `0s`
+  and `1ms`; acceptance at `10ms`; defaults with no query string;
+  `/metrics/binary` decoding as a `Snapshot` with that member; the old routes
+  still answering. The stream test was seen red with the pass fetch returning
+  `None` and with `record_ttft` not recording.
+- `metrics_stream_long_layout_serves_ttft_rows`: `layout=long`, as rezolus's
+  recorder asks; the header says `long`, and the first rows frame carries
+  exactly one stream, `llm-perf/main`, which decodes as a wide
+  `WalGroupRow` with a `ttft` member. The mutation `passes.pass(layout, now)`
+  to `passes.pass(Layout::Wide, now)` does not turn it red, and cannot: a
+  group is long only when every metric in it is a counter, gauge or histogram
+  group (`GroupBuilder::build_stream`), and `llm-perf/main` also holds plain
+  counters, gauges and histograms, so both layouts send the same row. What
+  catches the mutation is the unused `layout` binding under clippy
+  `-D warnings`. The `llm-perf/main/occupants` table in an archive recorded
+  by rezolus ab24b072 is written by rezolus's dendro writer from that wide
+  row, not sent by llm-perf.
+- Server-metrics tests: the version decision table (alpha.44 no, alpha.45
+  yes, 6.0.0 yes, 5.26.0 yes, 5.22.1 and 5.23.0-alpha.1 no, unparseable no),
+  a stub rezolus that prints a version and records its arguments (alpha.45
+  gets the admin endpoint, alpha.44 does not), and a non-zero exit reported
+  by `finish`. Each was seen red: the probe result ignored, the alpha floor at
+  44, and the success check removed. The existing SIGINT stub test raced (a
+  SIGINT before the stub's `trap` killed the shell, seen once in the full
+  suite after `finish` began reporting the exit); the stubs write a ready file
+  after installing the trap and the test waits for it.
+- Frame size on the real registry, measured during a 20 s run against a local
+  mock (8 workers, all five TTFT context sizes written): opening 190 bytes,
+  then 193,318-196,301 bytes per frame at 1 s, identical for `wide` and `long`
+  (`DefaultRouter` makes no slotted groups, so the long layout has nothing to
+  send long). A frame carries every histogram member's full bucket array
+  (grouping power 7, 64-bit range: 7,424 buckets), so this is about 190 KB/s on
+  the wire per subscriber, independent of load.
+- GO check against rezolus `upstream/main` (ab24b072), on macOS: a 60 s run
+  against the mock with `[admin]` and `[metrics] output = run.parquet`,
+  recorded by `rezolus record --endpoint http://127.0.0.1:19091,source=llm-perf
+  -o run.dendro --interval 1s --duration 66s`. `rezolus mcp describe-metrics
+  run.dendro` lists `ttft`, `ttft_content` (`context_size`), `itl`
+  (`context_size`, `phase`), `tpot` (`phase`), `request_latency`,
+  `schedule_slip` and `ttft_by_cache` as histograms. For every member of
+  `ttft`, `ttft_content`, `itl`, `tpot` and `request_latency`, the count, p50
+  bucket and p99 bucket of the last sample are identical in `run.dendro` and
+  `run.parquet` (both last samples at 01:40:28.001, 0.15 ms apart, after the
+  last of the 4,000 requests completed): for example `ttft{context_size=small}`
+  count 3,184, p50 [22806528, 22937599] ns, p99 [38273024, 38535167] ns;
+  `request_latency` count 4,000, p99 [176160768, 177209343] ns. The p99 bucket
+  ends match the JSON report's `context_latency.small.ttft_p99_ms` (38.535167)
+  and `request_p99_ms` (177.209343). `run.dendro` was 458,752 bytes for 60 rows
+  (about 450 KB per minute), beside a 57,588-byte parquet.
+- A 15 s run with `server_metrics_url` pointing at the mock's `/metrics`,
+  `server_metrics_output = "l2.dendro"` and `[admin]` enabled left one archive
+  with two recordings, `source=127.0.0.1-18080` (`prometheus/scrape`, 15 rows)
+  and `source=llm-perf` (`llm-perf/main`, 16 rows).
+- Gate end to end (8 s runs against the mock, `[admin]` enabled,
+  `server_metrics_output = "<n>.dendro"`): with rezolus ab24b072
+  (6.0.0-alpha.45) the archive has `source=127.0.0.1-38080` and
+  `source=llm-perf` (`llm-perf/main` with `ttft`, `itl`, `tpot`,
+  `request_latency`); with 6.0.0-alpha.44 (9f59f9e8) llm-perf logs the
+  warning and the archive has the server recording only; with 5.26.0 both
+  recordings, llm-perf's as an `unattributed` table. A reviewer ran v5.23.0
+  the same way: the archive held the server scrape and `source=llm-perf` as
+  an `unattributed` table, and rezolus exited 0. None of the three logged
+  the `warp::server` error. With the output in a missing directory, rezolus
+  exited 1 and the summary printed `Warning: rezolus record exited with exit
+  status: 1; ...`.
+- Not checked: `rezolus view` showing the llm-perf dashboard for the llm-perf
+  recording of that archive (the first GO criterion's second half).
