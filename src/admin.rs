@@ -470,6 +470,47 @@ mod tests {
         );
     }
 
+    /// `layout=long`, which rezolus's recorder asks for. The header says
+    /// long, and `llm-perf/main` still arrives as a wide row with the TTFT
+    /// histogram in it: the long layout makes a group long only when every
+    /// metric in it is a counter, gauge or histogram group, and llm-perf's
+    /// one group also holds plain counters, gauges and histograms.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn metrics_stream_long_layout_serves_ttft_rows() {
+        Metrics::init();
+        Metrics::record_ttft(Duration::from_millis(25), 100);
+        let addr = start().await;
+
+        let mut response = get(addr, "/metrics/stream?interval=100ms&layout=long").await;
+        assert_eq!(response.status(), 200);
+        assert_eq!(header(&response, "x-metriken-layout"), Some("long"));
+
+        let frames = frames(&mut response, 2).await;
+        assert!(
+            matches!(frames[0], Frame::Handshake { .. }),
+            "{:?}",
+            frames[0]
+        );
+        let Frame::Rows { rows, .. } = &frames[1] else {
+            panic!("frame 1 is not a rows frame: {:?}", frames[1]);
+        };
+        let group = format!("{STREAM_NAMESPACE}/main");
+        let streams: Vec<&str> = rows.iter().map(|r| r.stream.as_str()).collect();
+        assert_eq!(streams, [group.as_str()], "streams in the first rows frame");
+        let row = metriken_model::wal::decode_wal_group_row(&rows[0].row)
+            .expect("llm-perf/main is a wide row under layout=long");
+        let schema = row.schema.expect("the first row carries the schema");
+        let member = schema
+            .histograms
+            .iter()
+            .position(|m| m.metadata.get("metric").map(String::as_str) == Some("ttft"))
+            .unwrap_or_else(|| panic!("no ttft member: {schema:?}"));
+        let (_, _, buckets) = row.histograms[member]
+            .as_ref()
+            .expect("the ttft member has a value");
+        assert!(buckets.iter().sum::<u64>() >= 1, "ttft count is 0");
+    }
+
     #[tokio::test]
     async fn metrics_stream_without_a_query_uses_the_defaults() {
         let addr = start().await;
