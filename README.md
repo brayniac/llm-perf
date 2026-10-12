@@ -355,9 +355,13 @@ interval, and an unknown layout are refused with 400 and the reason. The
 response headers `x-metriken-frame-interval`, `x-metriken-update-floor` and
 `x-metriken-layout` state what is served.
 
-`rezolus record` (6.0 or later) given the admin server's base URL probes
-`/metrics/binary`, recognizes llm-perf as a metriken source, and writes the
-stream into a `.dendro`:
+`rezolus record` given the admin server's base URL probes `/metrics/binary`,
+recognizes llm-perf as a metriken source, and records it into a `.dendro`.
+rezolus at or after 6.0.0-alpha.45 records the stream; until 6.0.0 is
+released, that is a build of rezolus main at or after ab24b072. rezolus 5.23
+to 5.26 scrape `/metrics/binary` into the `.dendro` instead (measured with
+5.26.0). 6.0 alphas before alpha.45 refuse the stream's content type, and
+rezolus before 5.23.0 writes parquet to a path ending in `.dendro`.
 
 ```bash
 rezolus record --endpoint http://127.0.0.1:9090,source=llm-perf -o run.dendro
@@ -377,9 +381,21 @@ server_metrics_output = "run.dendro"
 enabled = true
 ```
 
-Without `[admin]`, the `.dendro` holds the server under test only. With any
-other `server_metrics_output` extension the server is recorded alone, as
-before.
+Before adding llm-perf's endpoint, llm-perf runs `<rezolus_bin> --version`.
+For a version that cannot record it (a 6.0 alpha before alpha.45, anything
+before 5.23.0, or output it cannot parse) it logs a warning naming the
+version and the reason, and the `.dendro` holds the server under test only.
+Without `[admin]`, the `.dendro` also holds the server under test only. With
+any other `server_metrics_output` extension (the match is exact: `.dendro`,
+not `.DENDRO`) the server is recorded alone, as before. If `rezolus record`
+exits non-zero, llm-perf logs an error with the exit status and repeats it as
+a warning in the console summary.
+
+At the default `[log] level = "info"`, llm-perf hides `warp::server` events,
+so the `server connection error: hyper::Error(IncompleteMessage)` that warp
+logs when `rezolus record` closes `/metrics/stream` at the end of a run does
+not appear. `level = "debug"` shows them, as does
+`filter = ["warp::server=error"]`.
 
 ### Input Format
 

@@ -319,9 +319,13 @@ level = "info"
 # server_metrics_output = "metrics.server.parquet"  # default: <output-stem>.server.parquet
 # rezolus_bin = "rezolus"                             # binary to invoke
 #
-# With server_metrics_output ending in .dendro (needs rezolus 6.0), the same
-# `rezolus record` writes one archive, and when [admin] is enabled it records
-# llm-perf there too, from the admin server's /metrics/stream:
+# With server_metrics_output ending in .dendro, the same `rezolus record`
+# writes one archive, and when [admin] is enabled it records llm-perf there
+# too. rezolus at or after 6.0.0-alpha.45 (until 6.0.0 is released: a build of
+# rezolus main at or after ab24b072) streams /metrics/stream; rezolus 5.23 to
+# 5.26 scrape /metrics/binary into the .dendro. For a 6.0 alpha before
+# alpha.45 (which refuses the stream) or rezolus before 5.23.0, llm-perf
+# checks `rezolus --version`, logs a warning and records the server only.
 # server_metrics_output = "metrics.dendro"
 
 # =============================================================================

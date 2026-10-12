@@ -69,9 +69,12 @@ fn metrics_endpoint() -> impl Filter<Extract = (impl warp::Reply,), Error = warp
 ///
 /// `rezolus record` probes `<base>/metrics/binary` before `<base>/metrics`
 /// when given a base URL, and an endpoint that answers with a snapshot is
-/// classified as a metriken source. Recording to a `.dendro`, it then
-/// subscribes to `/metrics/stream`; recording to anything else, it scrapes
-/// this route. Without it, llm-perf is scraped as a Prometheus endpoint.
+/// classified as a metriken source. Recording to a `.dendro`, rezolus at or
+/// after 6.0.0-alpha.45 (until 6.0.0 is released, a build of rezolus main at
+/// or after ab24b072) subscribes to `/metrics/stream`; rezolus 5.23 to 5.26
+/// scrape this route into the archive; 6.0 alphas before alpha.45 refuse the
+/// stream. Recording to anything else, rezolus scrapes this route. Without
+/// it, llm-perf is scraped as a Prometheus endpoint.
 fn metrics_binary_endpoint(
     snapshotter: Arc<Snapshotter>,
 ) -> impl Filter<Extract = (Response,), Error = warp::Rejection> + Clone {
