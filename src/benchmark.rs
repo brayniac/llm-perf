@@ -823,12 +823,19 @@ impl BenchmarkRunner {
         };
 
         // Launch `rezolus record` for server-side metrics if a URL is configured.
+        // The admin address lets a `.dendro` recording include llm-perf itself.
+        let admin = self
+            .config
+            .admin
+            .as_ref()
+            .filter(|a| a.enabled)
+            .and_then(|a| a.listen.parse().ok());
         let server_recorder = self
             .config
             .metrics
             .as_ref()
             .filter(|m| m.server_metrics_url.is_some())
-            .and_then(crate::server_metrics::ServerMetricsRecorder::spawn);
+            .and_then(|m| crate::server_metrics::ServerMetricsRecorder::spawn(m, admin));
 
         // Run benchmark (without generating report)
         let (test_duration, sat_results) = if self.config.saturation.is_some() {
