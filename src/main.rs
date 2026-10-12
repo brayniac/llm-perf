@@ -3,7 +3,6 @@ use llm_perf::cli::Command;
 use llm_perf::{Cli, Config};
 use log::{debug, info, warn};
 use tracing_appender::non_blocking::WorkerGuard;
-use tracing_subscriber::EnvFilter;
 use tracing_subscriber::prelude::*;
 
 fn main() -> Result<()> {
@@ -65,10 +64,7 @@ fn main() -> Result<()> {
 /// Returns the WorkerGuard which must be held alive for the duration of the program.
 fn setup_logging(config: &Config) -> Result<WorkerGuard> {
     // Build env filter from configured level and per-module overrides
-    let mut filter = EnvFilter::new(config.log.level.as_str());
-    for directive in &config.log.filter {
-        filter = filter.add_directive(directive.parse()?);
-    }
+    let filter = config.log.env_filter()?;
 
     // Set up non-blocking writer to file or stderr
     let (non_blocking, guard) = if let Some(ref log_file) = config.output.trace_log {
