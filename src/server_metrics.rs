@@ -31,9 +31,13 @@ const LLM_PERF_SOURCE: &str = "llm-perf";
 /// `[OUTPUT]` positional. The admin endpoint is the base URL, not its
 /// `/metrics`: given a base URL rezolus probes `/metrics/binary`, classifies
 /// llm-perf as a metriken source and subscribes to `/metrics/stream`, where a
-/// `/metrics` URL would be scraped as Prometheus text. It needs rezolus 6.0,
-/// whose recorder streams metriken sources into a `.dendro`. Without the admin
-/// server only the server under test is recorded.
+/// `/metrics` URL would be scraped as Prometheus text. rezolus streams it at
+/// or after 6.0.0-alpha.45 (until 6.0.0 is released, a build of rezolus main
+/// at or after ab24b072); rezolus 5.23 to 5.26 scrape `/metrics/binary` into
+/// the `.dendro` instead; 6.0 alphas before alpha.45 refuse the stream.
+/// `ServerMetricsRecorder::spawn` checks `rezolus --version` and passes
+/// `admin` only for a version that records it ([`admin_endpoint_support`]).
+/// Without the admin server only the server under test is recorded.
 pub fn record_args(mc: &MetricsConfig, admin: Option<SocketAddr>) -> Vec<String> {
     let url = mc.server_metrics_url.clone().unwrap_or_default();
     let output = mc.resolved_server_output();
@@ -60,10 +64,90 @@ pub fn record_args(mc: &MetricsConfig, admin: Option<SocketAddr>) -> Vec<String>
     args
 }
 
+/// rezolus picks the format from the extension by exact match (`dendro`), so
+/// `run.DENDRO` is not a dendro output there and is not one here.
 fn is_dendro(output: &str) -> bool {
     std::path::Path::new(output)
         .extension()
-        .is_some_and(|ext| ext.eq_ignore_ascii_case("dendro"))
+        .is_some_and(|ext| ext == "dendro")
+}
+
+/// The first 6.0 pre-release whose `record` accepts the metriken stream's
+/// content type (rezolus ab24b072).
+const STREAM_ALPHA: u64 = 45;
+
+/// The first 5.x release whose `record` writes a dendro archive for a
+/// `.dendro` output. Before it, `record -o run.dendro` writes parquet under
+/// that name.
+const DENDRO_5X: (u64, u64) = (23, 0);
+
+/// Whether the rezolus that printed `version_output` (`rezolus --version`)
+/// records llm-perf's admin endpoint into a `.dendro`. `Err` carries the
+/// reason it does not, for the warning.
+///
+/// Yes for 6.0.0-alpha.45 and later pre-releases of 6.0.0 (`beta`, `rc`),
+/// 6.0.0 and anything after it, which stream `/metrics/stream`, and for
+/// 5.23.0 and later 5.x, which scrape `/metrics/binary` into the archive.
+/// No for 6.0 alphas before alpha.45, which refuse the stream's content type,
+/// for anything older than 5.23.0, and for output that does not parse.
+pub fn admin_endpoint_support(version_output: &str) -> Result<(), String> {
+    let unparseable = || format!("cannot parse a version from {:?}", version_output.trim());
+    let token = version_output
+        .split_whitespace()
+        .find(|t| t.starts_with(|c: char| c.is_ascii_digit()))
+        .ok_or_else(unparseable)?;
+    let token = token.split('+').next().unwrap_or(token);
+    let (core, pre) = match token.split_once('-') {
+        Some((core, pre)) => (core, Some(pre)),
+        None => (token, None),
+    };
+    let parts: Vec<u64> = core
+        .split('.')
+        .map(str::parse)
+        .collect::<Result<_, _>>()
+        .map_err(|_| unparseable())?;
+    let [major, minor, patch] = parts[..] else {
+        return Err(unparseable());
+    };
+    if (major, minor, patch) > (6, 0, 0) {
+        return Ok(());
+    }
+    if (major, minor, patch) == (6, 0, 0) {
+        let Some(pre) = pre else { return Ok(()) };
+        if pre.starts_with("beta") || pre.starts_with("rc") {
+            return Ok(());
+        }
+        let n: u64 = pre
+            .strip_prefix("alpha.")
+            .and_then(|n| n.parse().ok())
+            .ok_or_else(unparseable)?;
+        return if n >= STREAM_ALPHA {
+            Ok(())
+        } else {
+            Err(format!(
+                "6.0 alphas before alpha.{STREAM_ALPHA} refuse the metriken stream's content type"
+            ))
+        };
+    }
+    if major == 5 && ((minor, patch) > DENDRO_5X || ((minor, patch) == DENDRO_5X && pre.is_none()))
+    {
+        return Ok(());
+    }
+    Err(format!(
+        "rezolus before {}.{}.{} writes parquet to a path ending in .dendro",
+        5, DENDRO_5X.0, DENDRO_5X.1
+    ))
+}
+
+/// Run `<bin> --version` and decide whether it records the admin endpoint.
+fn probe_admin_support(bin: &str) -> Result<(), String> {
+    let output = std::process::Command::new(bin)
+        .arg("--version")
+        .output()
+        .map_err(|e| format!("could not run `{bin} --version`: {e}"))?;
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    admin_endpoint_support(&stdout)
+        .map_err(|why| format!("`{bin} --version` printed {:?}: {why}", stdout.trim()))
 }
 
 /// The URL a local recorder reaches the admin server at. A listen address
@@ -91,12 +175,23 @@ impl ServerMetricsRecorder {
             .rezolus_bin
             .clone()
             .unwrap_or_else(|| "rezolus".to_string());
+        let output = mc.resolved_server_output();
+        let dendro = is_dendro(&output.to_string_lossy());
+        let admin = match admin {
+            Some(admin) if dendro => match probe_admin_support(&bin) {
+                Ok(()) => Some(admin),
+                Err(why) => {
+                    log::warn!(
+                        "{why}; {output:?} records the server under test only, not llm-perf"
+                    );
+                    None
+                }
+            },
+            admin => admin,
+        };
         let args = record_args(mc, admin);
-        if admin.is_none() && is_dendro(&mc.resolved_server_output().to_string_lossy()) {
-            log::info!(
-                "[admin] is not enabled, so {:?} records the server under test only",
-                mc.resolved_server_output()
-            );
+        if admin.is_none() && dendro {
+            log::info!("{output:?} records the server under test only");
         }
         match Command::new(&bin).args(&args).spawn() {
             Ok(child) => {
@@ -116,29 +211,44 @@ impl ServerMetricsRecorder {
         }
     }
 
-    /// Stop the recorder cleanly: one SIGINT (rezolus finalizes its parquet on the
-    /// first SIGINT), then wait up to 30s; SIGKILL as a backstop.
-    pub async fn finish(mut self) {
-        match self.child.id() {
+    /// Stop the recorder cleanly: one SIGINT (rezolus finalizes its output on
+    /// the first SIGINT), then wait up to 30s; SIGKILL as a backstop.
+    ///
+    /// Returns a description of the failure when rezolus did not exit 0 (or
+    /// had to be killed), for the benchmark summary; it is also logged.
+    pub async fn finish(mut self) -> Option<String> {
+        let failure = match self.child.id() {
             Some(pid) => {
                 // SAFETY: pid is a live child PID from tokio; SIGINT is well-defined.
                 unsafe {
                     libc::kill(pid as libc::pid_t, libc::SIGINT);
                 }
                 match tokio::time::timeout(Duration::from_secs(30), self.child.wait()).await {
-                    Ok(Ok(status)) => log::info!("rezolus record finished ({status})"),
-                    Ok(Err(e)) => log::warn!("rezolus record wait failed: {e}"),
+                    Ok(Ok(status)) if status.success() => {
+                        log::info!("rezolus record finished ({status})");
+                        None
+                    }
+                    Ok(Ok(status)) => Some(format!(
+                        "rezolus record exited with {status}; the server metrics \
+                         recording may be missing or incomplete"
+                    )),
+                    Ok(Err(e)) => Some(format!("rezolus record wait failed: {e}")),
                     Err(_) => {
-                        log::warn!(
-                            "rezolus record didn't exit 30s after SIGINT; killing \
-                             (server parquet may be incomplete)"
-                        );
                         let _ = self.child.kill().await;
+                        Some(
+                            "rezolus record didn't exit 30s after SIGINT and was killed; \
+                             the server metrics recording may be incomplete"
+                                .to_string(),
+                        )
                     }
                 }
             }
-            None => log::warn!("rezolus record already exited before finish()"),
+            None => Some("rezolus record already exited before finish()".to_string()),
+        };
+        if let Some(failure) = &failure {
+            log::error!("{failure}");
         }
+        failure
     }
 }
 
@@ -250,11 +360,18 @@ mod tests {
         let stub = dir.path().join("fake_rezolus.sh");
         // Stub invoked as `record <endpoint> <output> --interval <i>`: the OUTPUT
         // positional is $3. Trap SIGINT, write it (mimics rezolus finalizing), exit.
+        // `ready` is written after the trap is installed: a SIGINT before that
+        // kills the shell, which under a loaded test run took over 200 ms.
+        let ready = dir.path().join("ready");
         std::fs::write(
             &stub,
-            "#!/bin/sh\nout=\"$3\"\n\
-             trap 'echo done > \"$out\"; exit 0' INT\n\
-             while true; do sleep 0.05; done\n",
+            format!(
+                "#!/bin/sh\nout=\"$3\"\n\
+                 trap 'echo done > \"$out\"; exit 0' INT\n\
+                 touch '{}'\n\
+                 while true; do sleep 0.05; done\n",
+                ready.display()
+            ),
         )
         .unwrap();
         #[cfg(unix)]
@@ -267,13 +384,146 @@ mod tests {
         config.rezolus_bin = Some(stub.to_string_lossy().into_owned());
 
         let rec = ServerMetricsRecorder::spawn(&config, None).expect("spawn stub");
-        tokio::time::sleep(Duration::from_millis(200)).await;
-        rec.finish().await;
+        wait_for(&ready).await;
+        assert_eq!(rec.finish().await, None);
 
         assert!(
             out.exists(),
             "stub should have written its output on SIGINT"
         );
         assert_eq!(std::fs::read_to_string(&out).unwrap().trim(), "done");
+    }
+
+    #[test]
+    fn admin_endpoint_support_decision_table() {
+        let yes = [
+            "rezolus 6.0.0-alpha.45",
+            "rezolus 6.0.0-alpha.46\n",
+            "rezolus 6.0.0-beta.1",
+            "rezolus 6.0.0-rc.2",
+            "rezolus 6.0.0",
+            "rezolus 6.0.1",
+            "rezolus 6.1.0-alpha.1",
+            "rezolus 7.0.0",
+            "rezolus 5.23.0",
+            "rezolus 5.26.0",
+            "rezolus 5.26.0+mmap.2",
+            "rezolus 5.27.0-alpha.1",
+        ];
+        for v in yes {
+            assert_eq!(admin_endpoint_support(v), Ok(()), "{v:?}");
+        }
+        let no = [
+            ("rezolus 6.0.0-alpha.44", "alpha.45"),
+            ("rezolus 6.0.0-alpha.1", "alpha.45"),
+            ("rezolus 5.22.1", "5.23.0"),
+            ("rezolus 5.23.0-alpha.1", "5.23.0"),
+            ("rezolus 5.21.1-alpha.1", "5.23.0"),
+            ("rezolus 4.1.2", "5.23.0"),
+            ("", "cannot parse"),
+            ("rezolus", "cannot parse"),
+            ("rezolus six", "cannot parse"),
+            ("rezolus 6.0", "cannot parse"),
+            ("rezolus 6.0.0-dev", "cannot parse"),
+        ];
+        for (v, why) in no {
+            let err = admin_endpoint_support(v).expect_err(v);
+            assert!(err.contains(why), "{v:?}: {err}");
+        }
+    }
+
+    #[test]
+    fn is_dendro_matches_the_extension_exactly() {
+        assert!(is_dendro("run.dendro"));
+        assert!(is_dendro("/a/b/run.dendro"));
+        assert!(!is_dendro("run.DENDRO"));
+        assert!(!is_dendro("run.Dendro"));
+        assert!(!is_dendro("run.dendro.parquet"));
+        assert!(!is_dendro("dendro"));
+    }
+
+    async fn wait_for(path: &std::path::Path) {
+        for _ in 0..500 {
+            if path.exists() {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        panic!("{} never appeared", path.display());
+    }
+
+    /// A stub `rezolus` that prints `version` for `--version` and otherwise
+    /// installs a SIGINT trap that exits `code`, then writes its arguments to
+    /// `<dir>/args`, one per line.
+    fn version_stub(dir: &std::path::Path, version: &str, code: u8) -> String {
+        let stub = dir.join("fake_rezolus.sh");
+        let args = dir.join("args");
+        std::fs::write(
+            &stub,
+            format!(
+                "#!/bin/sh\n\
+                 if [ \"$1\" = --version ]; then echo 'rezolus {version}'; exit 0; fi\n\
+                 trap 'exit {code}' INT\n\
+                 printf '%s\\n' \"$@\" > '{}.tmp' && mv '{0}.tmp' '{0}'\n\
+                 while true; do sleep 0.05; done\n",
+                args.display()
+            ),
+        )
+        .unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&stub, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+        stub.to_string_lossy().into_owned()
+    }
+
+    async fn run_stub(version: &str, code: u8) -> (Vec<String>, Option<String>) {
+        let dir = tempfile::tempdir().unwrap();
+        let out = dir.path().join("run.dendro");
+        let mut config = mc("http://127.0.0.1:9/metrics", Some(out.to_str().unwrap()));
+        config.rezolus_bin = Some(version_stub(dir.path(), version, code));
+        let admin = "127.0.0.1:9090".parse().unwrap();
+        let rec = ServerMetricsRecorder::spawn(&config, Some(admin)).expect("spawn stub");
+        let args_file = dir.path().join("args");
+        wait_for(&args_file).await;
+        let failure = rec.finish().await;
+        let args = std::fs::read_to_string(&args_file)
+            .unwrap()
+            .lines()
+            .map(str::to_string)
+            .collect();
+        (args, failure)
+    }
+
+    #[tokio::test]
+    async fn spawn_adds_the_admin_endpoint_for_a_rezolus_that_streams_it() {
+        let (args, failure) = run_stub("6.0.0-alpha.45", 0).await;
+        assert!(
+            args.iter()
+                .any(|a| a == "http://127.0.0.1:9090,source=llm-perf"),
+            "{args:?}"
+        );
+        assert_eq!(failure, None);
+    }
+
+    #[tokio::test]
+    async fn spawn_records_the_server_only_for_a_rezolus_that_refuses_the_stream() {
+        let (args, _) = run_stub("6.0.0-alpha.44", 0).await;
+        assert!(
+            !args.iter().any(|a| a.contains("source=llm-perf")),
+            "{args:?}"
+        );
+        assert_eq!(
+            args[..3],
+            ["record", "--endpoint", "http://127.0.0.1:9/metrics"]
+        );
+    }
+
+    #[tokio::test]
+    async fn finish_reports_a_non_zero_exit() {
+        let (_, failure) = run_stub("6.0.0-alpha.45", 3).await;
+        let failure = failure.expect("a non-zero exit is reported");
+        assert!(failure.contains("exited with"), "{failure}");
     }
 }

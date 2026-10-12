@@ -858,10 +858,11 @@ impl BenchmarkRunner {
         // Stop metrics capture
         crate::metrics::RUNNING.store(false, std::sync::atomic::Ordering::Relaxed);
 
-        // Stop the server-metrics recorder (SIGINT -> rezolus finalizes its parquet).
-        if let Some(rec) = server_recorder {
-            rec.finish().await;
-        }
+        // Stop the server-metrics recorder (SIGINT -> rezolus finalizes its output).
+        let server_metrics_failure = match server_recorder {
+            Some(rec) => rec.finish().await,
+            None => None,
+        };
 
         // Wait for background tasks to complete
         if let Some(handle) = stats_handle {
@@ -875,7 +876,9 @@ impl BenchmarkRunner {
         tokio::time::sleep(Duration::from_millis(100)).await;
 
         // Generate report after all background tasks are done (use actual test duration)
-        let mut report_builder = report_builder.with_duration(test_duration);
+        let mut report_builder = report_builder
+            .with_duration(test_duration)
+            .with_server_metrics_failure(server_metrics_failure);
         if let Some(sat) = sat_results {
             report_builder = report_builder.with_saturation_results(sat);
         }
@@ -2025,7 +2028,7 @@ impl BenchmarkRunner {
                     // Writing to file - show brief summary to console
                     tokio::fs::write(file_path, json).await?;
                     if !self.config.output.quiet {
-                        self.print_brief_summary(&report)?;
+                        self.print_brief_summary(&report, report_builder.server_metrics_failure())?;
                     }
                 } else {
                     // Writing JSON to stdout - this is for piping
@@ -2534,7 +2537,11 @@ impl BenchmarkRunner {
         }
     }
 
-    fn print_brief_summary(&self, report: &crate::report::BenchmarkReport) -> Result<()> {
+    fn print_brief_summary(
+        &self,
+        report: &crate::report::BenchmarkReport,
+        server_metrics_failure: Option<&str>,
+    ) -> Result<()> {
         use chrono::Utc;
 
         let now = Utc::now();
@@ -2592,6 +2599,9 @@ impl BenchmarkRunner {
             warn_if_eos_not_ignored(report, self.config.endpoint.max_tokens);
         }
         warn_if_ttft_fell_back(report);
+        if let Some(failure) = server_metrics_failure {
+            println!("{} Warning: {}", timestamp, failure);
+        }
 
         println!(
             "{} Throughput: Requests/s: {:.2} Input tokens/s: {:.2} Output tokens/s: {:.2}",
