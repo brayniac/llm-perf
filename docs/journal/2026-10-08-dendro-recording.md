@@ -163,7 +163,7 @@ step 5 for path step 4 (`metriken-recorder`), and step 6 for path step 5
   reviewer ran v5.23.0: the archive held the server scrape and
   `source=llm-perf` as an `unattributed` table, exit 0). Anything else (a
   6.0 alpha before alpha.45, older than 5.23.0, unparseable, or a
-  `--version` that has not exited after 5 s, when it is killed) logs a
+  `--version` still running after 5 s, which is then killed) logs a
   warning with the version or the timeout and the reason, and the server
   under test is recorded alone. No
   `semver` dependency: the parser handles `X.Y.Z[-pre][+build]`, with `beta`

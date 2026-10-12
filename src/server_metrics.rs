@@ -596,11 +596,39 @@ mod tests {
     #[tokio::test]
     async fn probe_reports_the_timeout() {
         let dir = tempfile::tempdir().unwrap();
-        let bin = stub(dir.path(), "exec sleep 30", 0);
-        let err = probe_admin_support(&bin, Duration::from_millis(300))
+        let pid_file = dir.path().join("pid");
+        let bin = stub(
+            dir.path(),
+            &format!("echo $$ > '{}'; exec sleep 30", pid_file.display()),
+            0,
+        );
+        let err = probe_admin_support(&bin, Duration::from_secs(1))
             .await
             .expect_err("a --version that does not exit is not support");
-        assert!(err.contains("did not exit within 300ms"), "{err}");
+        assert!(err.contains("did not exit within 1s"), "{err}");
+
+        // The timed-out child is killed, not left running. A child killed
+        // before its shell ran far enough to write the pid file is gone too.
+        let Ok(pid) = std::fs::read_to_string(&pid_file) else {
+            return;
+        };
+        let pid = pid.trim().to_string();
+        let deadline = std::time::Instant::now() + Duration::from_secs(1);
+        loop {
+            let ps = std::process::Command::new("ps")
+                .args(["-o", "stat=", "-p", &pid])
+                .output()
+                .unwrap();
+            let stat = String::from_utf8_lossy(&ps.stdout).trim().to_string();
+            if stat.is_empty() || stat.starts_with('Z') {
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the --version child {pid} is still running ({stat})"
+            );
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
     }
 
     #[tokio::test]

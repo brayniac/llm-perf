@@ -385,7 +385,7 @@ Before adding llm-perf's endpoint, llm-perf runs `<rezolus_bin> --version`.
 For a version that cannot record it (a 6.0 alpha before alpha.45, anything
 before 5.23.0, or output it cannot parse), or a `--version` that has not
 exited after 5 s, it logs a warning naming the
-version and the reason, and the `.dendro` holds the server under test only.
+version (or the timeout) and the reason, and the `.dendro` holds the server under test only.
 Without `[admin]`, the `.dendro` also holds the server under test only. With
 any other `server_metrics_output` extension (the match is exact: `.dendro`,
 not `.DENDRO`) the server is recorded alone, as before. If `rezolus record`
