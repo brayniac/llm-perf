@@ -1,7 +1,7 @@
 # Recording llm-perf and the server under test into one `.dendro`
 
-**Status:** OPEN. Plan opened 2026-10-08; step 3 built 2026-10-11 (branch
-`deps/metriken-0.11`, see "As built").
+**Status:** OPEN. Plan opened 2026-10-08; steps 3 and 4 built 2026-10-11
+(branches `deps/metriken-0.11` and `feat/metrics-stream`, see "As built").
 
 Related entries opened the same day: rezolus
 `docs/journal/2026-10-08-6-0-release-readiness.md`, metriken
@@ -114,3 +114,66 @@ step 5 for path step 4 (`metriken-recorder`), and step 6 for path step 5
   walk labeled slots only. With the label, the same run adds a
   `requests{status="dropped"}` series and column (124 on `/metrics` at 7 s). A
   test now checks every slot of every group has labels.
+
+### Step 4: `/metrics/stream` (branch `feat/metrics-stream`)
+
+- `src/admin.rs` serves `GET /metrics/stream` through metriken-exposition's
+  stream route (features `stream`, `stream-tokio`): one shared
+  `RegistryPasses<DefaultRouter>` over `GroupBuilder::new(DefaultRouter::new("llm-perf"))`
+  with a 10 ms floor, `StreamRequest::parse` on the raw query, a 400 for an
+  interval below the floor (cachecannon's refusal message), and
+  `StreamSubscription::into_stream` as the warp body with the subscription's
+  headers set on the response. Handshake labels `source=llm-perf`, metadata
+  `version`. Every metric lands in one windowless group, `llm-perf/main`.
+- It also serves `GET /metrics/binary`, a msgpack `Snapshot` from a
+  `Snapshotter` (metadata `source`, `version`). rezolus's recorder classifies a
+  base URL by probing `/metrics/binary` first (`probe_endpoint`, rezolus
+  `src/recorder/mod.rs`), and only a source classified as msgpack is streamed
+  into a `.dendro`; without the route llm-perf is scraped as Prometheus.
+- `record_args` (`src/server_metrics.rs`): when `server_metrics_output` ends in
+  `.dendro`, it builds `rezolus record --endpoint <server_metrics_url>
+  [--endpoint http://<admin>,source=llm-perf] -o <output> --interval <i>`. The
+  admin endpoint is added only when `[admin]` is enabled; a listen address on
+  `0.0.0.0`/`::` becomes loopback. Any other extension keeps the positional
+  form, so step 1's two-endpoint archive is opt-in by extension and the
+  default output stays `<stem>.server.parquet`. The server endpoint gets no
+  `source=`: there is no config key naming the service, and rezolus infers one
+  from host and port (with a warning, as on the positional path).
+- Tests (`admin::tests`): the stream over a socket (content type, the three
+  `x-metriken-*` headers, handshake `source=llm-perf`, three rows frames with
+  advancing `seq`, the first carrying a `ttft` member labeled
+  `context_size=small` with count >= 1, decoded with dendro 0.4's
+  `FrameReader` and metriken-model's `decode_wal_group_row`); refusal of `0s`
+  and `1ms`; acceptance at `10ms`; defaults with no query string;
+  `/metrics/binary` decoding as a `Snapshot` with that member; the old routes
+  still answering. The stream test was seen red with the pass fetch returning
+  `None` and with `record_ttft` not recording.
+- Frame size on the real registry, measured during a 20 s run against a local
+  mock (8 workers, all five TTFT context sizes written): opening 190 bytes,
+  then 193,318-196,301 bytes per frame at 1 s, identical for `wide` and `long`
+  (`DefaultRouter` makes no slotted groups, so the long layout has nothing to
+  send long). A frame carries every histogram member's full bucket array
+  (grouping power 7, 64-bit range: 7,424 buckets), so this is about 190 KB/s on
+  the wire per subscriber, independent of load.
+- GO check against rezolus `upstream/main` (ab24b072), on macOS: a 60 s run
+  against the mock with `[admin]` and `[metrics] output = run.parquet`,
+  recorded by `rezolus record --endpoint http://127.0.0.1:19091,source=llm-perf
+  -o run.dendro --interval 1s --duration 66s`. `rezolus mcp describe-metrics
+  run.dendro` lists `ttft`, `ttft_content` (`context_size`), `itl`
+  (`context_size`, `phase`), `tpot` (`phase`), `request_latency`,
+  `schedule_slip` and `ttft_by_cache` as histograms. For every member of
+  `ttft`, `ttft_content`, `itl`, `tpot` and `request_latency`, the count, p50
+  bucket and p99 bucket of the last sample are identical in `run.dendro` and
+  `run.parquet` (both last samples at 01:40:28.001, 0.15 ms apart, after the
+  last of the 4,000 requests completed): for example `ttft{context_size=small}`
+  count 3,184, p50 [22806528, 22937599] ns, p99 [38273024, 38535167] ns;
+  `request_latency` count 4,000, p99 [176160768, 177209343] ns. The p99 bucket
+  ends match the JSON report's `context_latency.small.ttft_p99_ms` (38.535167)
+  and `request_p99_ms` (177.209343). `run.dendro` was 458,752 bytes for 60 rows
+  (about 450 KB per minute), beside a 57,588-byte parquet.
+- A 15 s run with `server_metrics_url` pointing at the mock's `/metrics`,
+  `server_metrics_output = "l2.dendro"` and `[admin]` enabled left one archive
+  with two recordings, `source=127.0.0.1-18080` (`prometheus/scrape`, 15 rows)
+  and `source=llm-perf` (`llm-perf/main`, 16 rows).
+- Not checked: `rezolus view` showing the llm-perf dashboard for the llm-perf
+  recording of that archive (the first GO criterion's second half).

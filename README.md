@@ -88,7 +88,7 @@ Automatically categorizes TTFT and ITL by input context size:
 - **Log File Support**: Automatic rotation at 10MB with backup file preservation
 - **Periodic Stats**: Windowed metrics output during benchmark runs
 - **Quiet Mode**: Suppress periodic stats for CI/CD or JSON piping
-- **Admin Metrics Server**: Optional HTTP endpoint exposing Prometheus/JSON metrics during runs
+- **Admin Metrics Server**: Optional HTTP server exposing metrics during runs as Prometheus text, JSON, a msgpack snapshot, and a replication stream that `rezolus record` writes into a `.dendro` (see [Admin server](#admin-server))
 
 ### Metrics Capture
 
@@ -334,6 +334,53 @@ level = "info"
 # batch_size = 10000
 ```
 
+### Admin server
+
+`[admin] enabled = true` starts an HTTP server on `listen` (default
+`127.0.0.1:9090`) for the length of a `bench` run:
+
+| Path | Body |
+|------|------|
+| `/metrics` | Prometheus text; histograms as p50/p90/p95/p99/p99.9 gauges |
+| `/metrics.json`, `/vars.json` | JSON, histograms as `<name>/p<permille>` keys |
+| `/vars` | the same, one `name: value` line each |
+| `/metrics/binary` | one msgpack snapshot of every metric (`application/msgpack`) |
+| `/metrics/stream` | dendro replication frames (`application/vnd.metriken.replication.v1+dendro`) |
+
+`/metrics/stream` takes `interval` (default `1s`) and `layout` (`wide`, the
+default, or `long`). It sends a handshake naming `source=llm-perf` and then one
+frame per interval, each carrying every metric recorded so far, histograms with their buckets,
+until the client disconnects. An interval below 10 ms, a zero or malformed
+interval, and an unknown layout are refused with 400 and the reason. The
+response headers `x-metriken-frame-interval`, `x-metriken-update-floor` and
+`x-metriken-layout` state what is served.
+
+`rezolus record` (6.0 or later) given the admin server's base URL probes
+`/metrics/binary`, recognizes llm-perf as a metriken source, and writes the
+stream into a `.dendro`:
+
+```bash
+rezolus record --endpoint http://127.0.0.1:9090,source=llm-perf -o run.dendro
+```
+
+With `[metrics] server_metrics_url` set and `server_metrics_output` ending in
+`.dendro`, llm-perf runs that `rezolus record` itself, with the server under
+test as a second endpoint, so one archive holds both:
+
+```toml
+[metrics]
+output = "run.parquet"
+server_metrics_url = "http://localhost:8080/metrics"
+server_metrics_output = "run.dendro"
+
+[admin]
+enabled = true
+```
+
+Without `[admin]`, the `.dendro` holds the server under test only. With any
+other `server_metrics_output` extension the server is recorded alone, as
+before.
+
 ### Input Format
 
 Create a JSONL file with prompts:
@@ -511,7 +558,7 @@ llm-perf/
 │   ├── report.rs         # Report generation (console and JSON)
 │   ├── stats.rs          # Periodic windowed stats during runs
 │   ├── snapshot.rs       # Metrics snapshot to parquet pipeline
-│   ├── admin.rs          # HTTP admin server (Prometheus/JSON metrics)
+│   ├── admin.rs          # HTTP admin server (Prometheus/JSON/msgpack metrics, /metrics/stream)
 │   ├── distribution.rs   # Request arrival distributions (uniform, poisson)
 │   ├── tokenizer.rs      # Token counting via tiktoken
 │   ├── logprobs.rs       # Log probability collection and JSONL writer

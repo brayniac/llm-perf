@@ -318,11 +318,18 @@ level = "info"
 # server_metrics_url = "http://localhost:4242/metrics"
 # server_metrics_output = "metrics.server.parquet"  # default: <output-stem>.server.parquet
 # rezolus_bin = "rezolus"                             # binary to invoke
+#
+# With server_metrics_output ending in .dendro (needs rezolus 6.0), the same
+# `rezolus record` writes one archive, and when [admin] is enabled it records
+# llm-perf there too, from the admin server's /metrics/stream:
+# server_metrics_output = "metrics.dendro"
 
 # =============================================================================
 # Admin Server Configuration (Optional)
 # =============================================================================
-# HTTP server for live metrics viewing during benchmark
+# HTTP server for live metrics viewing during benchmark: /metrics (Prometheus),
+# /metrics.json, /vars, /vars.json, /metrics/binary (msgpack snapshot) and
+# /metrics/stream (replication frames for `rezolus record -o run.dendro`).
 # [admin]
 # enabled = true
 # listen = "127.0.0.1:9090"

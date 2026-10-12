@@ -4,6 +4,11 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+### Features
+
+- Admin server: `GET /metrics/stream` serves the registry as dendro replication frames through metriken-exposition's stream route (`interval`, default `1s`, and `layout`, `wide` or `long`; an interval below the 10 ms update floor is refused with 400), and `GET /metrics/binary` serves a msgpack snapshot. `rezolus record --endpoint http://<admin>,source=llm-perf -o run.dendro` (rezolus 6.0) probes `/metrics/binary`, then records the stream: rows stamped by llm-perf at read time and histograms with their buckets, where a `/metrics` scrape gives percentile gauges.
+- `server_metrics_output` ending in `.dendro` runs `rezolus record --endpoint <server_metrics_url> [--endpoint http://<admin>,source=llm-perf] -o <output>`, so the server under test and, with `[admin]` enabled, llm-perf itself land in one archive. Other extensions keep the positional `rezolus record <url> <output>` form. An admin server listening on `0.0.0.0` or `::` is recorded through loopback.
+
 ### Changes
 
 - metriken 0.11.3, metriken-exposition 0.22 and metriken-storage 0.2 from crates.io in place of the git dependency on metriken (metriken 0.8, metriken-exposition 0.14). A counter group slot that was never written is now absent from `/metrics` and from the `[metrics] output` parquet. Before, once any slot of a group was written, the group's other labeled slots read 0: on a run with no errors there was a `requests{status="error"}` series and column at 0, and now there is none (likewise `timeout`, `retried`, and `canceled` until a request is canceled). A dashboard panel that plots or divides by such a series shows no data for that run instead of 0. A group with no slot written (`errors` on a clean run) and a histogram group member never written were absent before and still are.
