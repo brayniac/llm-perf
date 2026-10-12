@@ -91,7 +91,7 @@ step 5 for path step 4 (`metriken-recorder`), and step 6 for path step 5
   (features `json`, `msgpack`) and `metriken-storage = "0.2.0"` (no default
   features, `convert`). The plan named metriken-exposition 0.21; 0.22 is the
   first release with the stream route (`stream::RegistryPasses`) that step 4
-  uses, and the msgpack-to-parquet conversion is no longer in it. The msgpack-to-parquet conversion (`MsgpackToParquet`,
+  uses. The msgpack-to-parquet conversion (`MsgpackToParquet`,
   `ParquetOptions`, `ParquetHistogramType`) moved to `metriken_storage::convert`;
   `src/snapshot.rs` imports it from there.
 - histogram resolves to 1.6.0 (was 1.1.0); `quantiles` is inherent there, so
@@ -102,13 +102,23 @@ step 5 for path step 4 (`metriken-recorder`), and step 6 for path step 5
   RUSTSEC-2026-0253); audit warns and exits 0.
 - metriken 0.11 reads a never-written `CounterGroup` slot as absent. Measured
   against a local mock server (8 s, 60 QPS, `max_outstanding_requests = 4`,
-  `[metrics] interval = "1s"`): metriken 0.8's parquet had 42 columns, 0.11's
-  39, the missing three being `requests` with status `error`, `retried` and
-  `timeout`; `/metrics` lost the same series plus `canceled` while no request
-  had been canceled yet. Groups with no slot written (`errors`, `cache`,
-  `conversations` on that run) were absent under 0.8 too. `/vars` keys and the
-  JSON report's keys were unchanged. Downstream, rezolus's `llm-perf.json`
-  error-rate panel shows no data for a clean run instead of 0.
+  `[metrics] interval = "1s"`) before `Metrics::init` wrote any slot: metriken
+  0.8's parquet had 42 columns, 0.11's 39, the missing three being `requests`
+  with status `error`, `retried` and `timeout`; `/metrics` lost the same
+  series plus `canceled` while no request had been canceled yet. Downstream,
+  rezolus's `llm-perf.json` error-rate panel would show no data for a clean
+  run. `Metrics::init` now writes every slot of `requests` and `tokens` (the
+  two counter groups that template queries) with `add(idx, 0)`, which marks a
+  slot written in metriken 0.11.3 without changing a count already there.
+  Rerun the same way against main (e626b9e): the parquet has 42 columns on
+  main and 43 here, and `/metrics` 136 series on main and 137 here; in both
+  the only addition is `requests{status="dropped"}` (below), and `requests`
+  error, timeout, canceled and retried read 0 as on main. The other counter
+  groups (`errors`, `conversations`, `cache`, `replay_reuse`,
+  `replay_sessions`) keep metriken 0.11's absent-until-written behaviour;
+  `errors`, `cache` and `conversations` had no slot written on that run and
+  were absent under 0.8 too. `/vars` keys and the JSON report's keys are
+  unchanged.
 - Separately fixed: `Metrics::init` labeled 6 of the `requests` group's 7
   slots, so `dropped` (slot 6) was never exposed; the snapshot and exposition
   walk labeled slots only. With the label, the same run adds a
