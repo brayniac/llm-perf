@@ -420,12 +420,15 @@ impl LogLevel {
 
 /// The directive that hides warp's server events below `debug`.
 ///
-/// `warp::server` logs at debug and at error only. Its error events are
-/// connection errors on the admin server: `rezolus record` closing
-/// `/metrics/stream` at the end of a run logs `server connection error:
-/// hyper::Error(IncompleteMessage)`. They are hidden unless `level` is
-/// `debug` or `trace`, and a `filter` directive for `warp::server`
-/// replaces this one.
+/// `warp::server` logs at debug and at error only. Its error events are the
+/// admin server's connection errors and accept errors. `rezolus record`
+/// closing `/metrics/stream` at the end of a run logs `server connection
+/// error: hyper::Error(IncompleteMessage)`. An accept that fails, for example
+/// because the process ran out of file descriptors, logs `accept error: ...`
+/// (warp 0.4.3 `server.rs:477`). Both are hidden unless `level` is `debug` or
+/// `trace`, and a `filter` directive for `warp::server` replaces this one. A
+/// bind failure is not a log event and still shows: warp panics with `failed
+/// to bind to address`.
 const WARP_SERVER_QUIET: &str = "warp::server=off";
 
 impl LogConfig {

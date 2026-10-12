@@ -158,10 +158,14 @@ step 5 for path step 4 (`metriken-recorder`), and step 6 for path step 5
   is the first 5.x tag whose recorder has a `Format::Dendro`; before it a
   `.dendro` output is written as parquet (the reviewer saw this with
   5.21.1-alpha.1). `src/recorder/` differs by one line between v5.23.0 and
-  v5.26.0, so 5.23 to 5.25 are taken to scrape `/metrics/binary` into the
-  archive as 5.26.0 does; only 5.26.0 was run. Anything else (a 6.0 alpha
-  before alpha.45, older than 5.23.0, unparseable) logs a warning with the
-  version and the reason, and the server under test is recorded alone. No
+  v5.26.0, so 5.24 and 5.25 are taken to scrape `/metrics/binary` into the
+  archive as 5.23.0 and 5.26.0 do; 5.23.0 and 5.26.0 were run end to end (a
+  reviewer ran v5.23.0: the archive held the server scrape and
+  `source=llm-perf` as an `unattributed` table, exit 0). Anything else (a
+  6.0 alpha before alpha.45, older than 5.23.0, unparseable, or a
+  `--version` that has not exited after 5 s, when it is killed) logs a
+  warning with the version or the timeout and the reason, and the server
+  under test is recorded alone. No
   `semver` dependency: the parser handles `X.Y.Z[-pre][+build]`, with `beta`
   and `rc` pre-releases of 6.0.0 accepted.
 - `ServerMetricsRecorder::finish` returns the failure when rezolus exits
@@ -172,7 +176,11 @@ step 5 for path step 4 (`metriken-recorder`), and step 6 for path step 5
   `warp::server=off` before the configured `filter` directives, which can
   replace it. warp's server module logs at debug and error only, and its
   error is `server connection error: hyper::Error(IncompleteMessage)` when
-  rezolus closes `/metrics/stream` at the end of a run. An EnvFilter cannot
+  rezolus closes `/metrics/stream` at the end of a run. The filter also
+  hides warp's other connection errors and its accept errors (`accept
+  error`, for example on running out of file descriptors; warp 0.4.3
+  `server.rs:477`). A bind failure still shows, since warp panics with
+  `failed to bind to address` rather than logging it. An EnvFilter cannot
   lower an event's level, so "debug or more verbose" is approximated by
   showing these events only when `level` is `debug` or `trace`.
 - Tests (`admin::tests`): the stream over a socket (content type, the three
@@ -238,7 +246,9 @@ step 5 for path step 4 (`metriken-recorder`), and step 6 for path step 5
   `source=llm-perf` (`llm-perf/main` with `ttft`, `itl`, `tpot`,
   `request_latency`); with 6.0.0-alpha.44 (9f59f9e8) llm-perf logs the
   warning and the archive has the server recording only; with 5.26.0 both
-  recordings, llm-perf's as an `unattributed` table. None of the three logged
+  recordings, llm-perf's as an `unattributed` table. A reviewer ran v5.23.0
+  the same way: the archive held the server scrape and `source=llm-perf` as
+  an `unattributed` table, and rezolus exited 0. None of the three logged
   the `warp::server` error. With the output in a missing directory, rezolus
   exited 1 and the summary printed `Warning: rezolus record exited with exit
   status: 1; ...`.
