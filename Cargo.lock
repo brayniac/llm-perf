@@ -832,6 +832,12 @@ dependencies = [
 ]
 
 [[package]]
+name = "dendro"
+version = "0.4.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "4c7ee00a1be36806c9d2198457f6da4023710209f3d79cd246fcbd3ea4eb0e86"
+
+[[package]]
 name = "deranged"
 version = "0.5.8"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1808,6 +1814,7 @@ dependencies = [
  "arrow 56.2.0",
  "chrono",
  "clap",
+ "dendro",
  "fake",
  "flate2",
  "futures",
@@ -1818,6 +1825,7 @@ dependencies = [
  "log",
  "metriken",
  "metriken-exposition",
+ "metriken-model",
  "metriken-storage",
  "mockito",
  "num_cpus",
@@ -1961,15 +1969,22 @@ version = "0.22.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "4490aadf5922e994e5ffeb6ae31b9b9f72d46cf761ec64da60fa0e327365e801"
 dependencies = [
+ "bytes",
  "chrono",
+ "dendro",
  "foldhash 0.2.0",
+ "futures-core",
+ "futures-util",
  "histogram",
+ "humantime",
  "metriken",
  "metriken-model",
  "metriken-types",
  "rmp-serde",
  "serde",
  "serde_json",
+ "tokio",
+ "tracing",
 ]
 
 [[package]]
