@@ -830,12 +830,15 @@ impl BenchmarkRunner {
             .as_ref()
             .filter(|a| a.enabled)
             .and_then(|a| a.listen.parse().ok());
-        let server_recorder = self
+        let server_recorder = match self
             .config
             .metrics
             .as_ref()
             .filter(|m| m.server_metrics_url.is_some())
-            .and_then(|m| crate::server_metrics::ServerMetricsRecorder::spawn(m, admin));
+        {
+            Some(m) => crate::server_metrics::ServerMetricsRecorder::spawn(m, admin).await,
+            None => None,
+        };
 
         // Run benchmark (without generating report)
         let (test_duration, sat_results) = if self.config.saturation.is_some() {

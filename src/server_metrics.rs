@@ -139,11 +139,21 @@ pub fn admin_endpoint_support(version_output: &str) -> Result<(), String> {
     ))
 }
 
+/// How long `<bin> --version` may take before llm-perf gives up on it and
+/// records the server under test only.
+const VERSION_TIMEOUT: Duration = Duration::from_secs(5);
+
 /// Run `<bin> --version` and decide whether it records the admin endpoint.
-fn probe_admin_support(bin: &str) -> Result<(), String> {
-    let output = std::process::Command::new(bin)
+/// A `--version` that has not exited after `timeout` is killed and treated
+/// like output that does not parse.
+async fn probe_admin_support(bin: &str, timeout: Duration) -> Result<(), String> {
+    let run = Command::new(bin)
         .arg("--version")
-        .output()
+        .kill_on_drop(true)
+        .output();
+    let output = tokio::time::timeout(timeout, run)
+        .await
+        .map_err(|_| format!("`{bin} --version` did not exit within {timeout:?}"))?
         .map_err(|e| format!("could not run `{bin} --version`: {e}"))?;
     let stdout = String::from_utf8_lossy(&output.stdout);
     admin_endpoint_support(&stdout)
@@ -170,7 +180,18 @@ impl ServerMetricsRecorder {
     /// Spawn `rezolus record` for the configured server endpoint. Returns `None`
     /// (with a warning) if the binary can't be started, so the benchmark proceeds
     /// without server metrics.
-    pub fn spawn(mc: &MetricsConfig, admin: Option<SocketAddr>) -> Option<Self> {
+    ///
+    /// For a `.dendro` output with `admin` set, `<bin> --version` runs first
+    /// (at most 5 s) to decide whether llm-perf's endpoint is added.
+    pub async fn spawn(mc: &MetricsConfig, admin: Option<SocketAddr>) -> Option<Self> {
+        Self::spawn_with(mc, admin, VERSION_TIMEOUT).await
+    }
+
+    async fn spawn_with(
+        mc: &MetricsConfig,
+        admin: Option<SocketAddr>,
+        version_timeout: Duration,
+    ) -> Option<Self> {
         let bin = mc
             .rezolus_bin
             .clone()
@@ -178,7 +199,15 @@ impl ServerMetricsRecorder {
         let output = mc.resolved_server_output();
         let dendro = is_dendro(&output.to_string_lossy());
         let admin = match admin {
-            Some(admin) if dendro => match probe_admin_support(&bin) {
+            None => {
+                if dendro {
+                    log::info!(
+                        "[admin] is not enabled, so {output:?} records the server under test only"
+                    );
+                }
+                None
+            }
+            Some(admin) if dendro => match probe_admin_support(&bin, version_timeout).await {
                 Ok(()) => Some(admin),
                 Err(why) => {
                     log::warn!(
@@ -187,12 +216,9 @@ impl ServerMetricsRecorder {
                     None
                 }
             },
-            admin => admin,
+            Some(admin) => Some(admin),
         };
         let args = record_args(mc, admin);
-        if admin.is_none() && dendro {
-            log::info!("{output:?} records the server under test only");
-        }
         match Command::new(&bin).args(&args).spawn() {
             Ok(child) => {
                 log::info!(
@@ -383,7 +409,9 @@ mod tests {
         let mut config = mc("http://127.0.0.1:9/metrics", Some(out.to_str().unwrap()));
         config.rezolus_bin = Some(stub.to_string_lossy().into_owned());
 
-        let rec = ServerMetricsRecorder::spawn(&config, None).expect("spawn stub");
+        let rec = ServerMetricsRecorder::spawn(&config, None)
+            .await
+            .expect("spawn stub");
         wait_for(&ready).await;
         assert_eq!(rec.finish().await, None);
 
@@ -455,14 +483,24 @@ mod tests {
     /// A stub `rezolus` that prints `version` for `--version` and otherwise
     /// installs a SIGINT trap that exits `code`, then writes its arguments to
     /// `<dir>/args`, one per line.
+    ///
+    /// The stub tests need SIGINT not ignored in the test process: a shell
+    /// started with SIGINT ignored cannot trap it, so the suite must not be
+    /// started in the background (`cargo test &`) on a CI runner.
     fn version_stub(dir: &std::path::Path, version: &str, code: u8) -> String {
+        stub(dir, &format!("echo 'rezolus {version}'; exit 0"), code)
+    }
+
+    /// [`version_stub`] with `on_version` as the shell command run for
+    /// `--version`.
+    fn stub(dir: &std::path::Path, on_version: &str, code: u8) -> String {
         let stub = dir.join("fake_rezolus.sh");
         let args = dir.join("args");
         std::fs::write(
             &stub,
             format!(
                 "#!/bin/sh\n\
-                 if [ \"$1\" = --version ]; then echo 'rezolus {version}'; exit 0; fi\n\
+                 if [ \"$1\" = --version ]; then {on_version}; fi\n\
                  trap 'exit {code}' INT\n\
                  printf '%s\\n' \"$@\" > '{}.tmp' && mv '{0}.tmp' '{0}'\n\
                  while true; do sleep 0.05; done\n",
@@ -480,11 +518,22 @@ mod tests {
 
     async fn run_stub(version: &str, code: u8) -> (Vec<String>, Option<String>) {
         let dir = tempfile::tempdir().unwrap();
+        let bin = version_stub(dir.path(), version, code);
+        run_bin(&dir, bin, VERSION_TIMEOUT).await
+    }
+
+    async fn run_bin(
+        dir: &tempfile::TempDir,
+        bin: String,
+        version_timeout: Duration,
+    ) -> (Vec<String>, Option<String>) {
         let out = dir.path().join("run.dendro");
         let mut config = mc("http://127.0.0.1:9/metrics", Some(out.to_str().unwrap()));
-        config.rezolus_bin = Some(version_stub(dir.path(), version, code));
+        config.rezolus_bin = Some(bin);
         let admin = "127.0.0.1:9090".parse().unwrap();
-        let rec = ServerMetricsRecorder::spawn(&config, Some(admin)).expect("spawn stub");
+        let rec = ServerMetricsRecorder::spawn_with(&config, Some(admin), version_timeout)
+            .await
+            .expect("spawn stub");
         let args_file = dir.path().join("args");
         wait_for(&args_file).await;
         let failure = rec.finish().await;
@@ -518,6 +567,40 @@ mod tests {
             args[..3],
             ["record", "--endpoint", "http://127.0.0.1:9/metrics"]
         );
+    }
+
+    #[tokio::test]
+    async fn spawn_records_the_server_only_when_version_does_not_exit() {
+        let dir = tempfile::tempdir().unwrap();
+        // `exec` so the process killed on timeout is the `sleep` itself.
+        let bin = stub(dir.path(), "exec sleep 30", 0);
+        let timeout = Duration::from_millis(300);
+        let started = std::time::Instant::now();
+        let (args, failure) = run_bin(&dir, bin, timeout).await;
+        assert!(
+            started.elapsed() < Duration::from_secs(10),
+            "{:?}",
+            started.elapsed()
+        );
+        assert!(
+            !args.iter().any(|a| a.contains("source=llm-perf")),
+            "{args:?}"
+        );
+        assert_eq!(
+            args[..3],
+            ["record", "--endpoint", "http://127.0.0.1:9/metrics"]
+        );
+        assert_eq!(failure, None);
+    }
+
+    #[tokio::test]
+    async fn probe_reports_the_timeout() {
+        let dir = tempfile::tempdir().unwrap();
+        let bin = stub(dir.path(), "exec sleep 30", 0);
+        let err = probe_admin_support(&bin, Duration::from_millis(300))
+            .await
+            .expect_err("a --version that does not exit is not support");
+        assert!(err.contains("did not exit within 300ms"), "{err}");
     }
 
     #[tokio::test]
