@@ -4,6 +4,14 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+### Changes
+
+- metriken 0.11.3, metriken-exposition 0.22 and metriken-storage 0.2 from crates.io in place of the git dependency on metriken (metriken 0.8, metriken-exposition 0.14). A counter group slot that was never written is now absent from `/metrics` and from the `[metrics] output` parquet. Before, once any slot of a group was written, the group's other labeled slots read 0: on a run with no errors there was a `requests{status="error"}` series and column at 0, and now there is none (likewise `timeout`, `retried`, and `canceled` until a request is canceled). A dashboard panel that plots or divides by such a series shows no data for that run instead of 0. A group with no slot written (`errors` on a clean run) and a histogram group member never written were absent before and still are.
+
+### Bug Fixes
+
+- The `requests` counter group's `dropped` slot (requests the QPS generator declined at `max_outstanding_requests`) had no labels, so it was missing from `/metrics` and the parquet; it is now `requests{status="dropped"}`. The JSON report's `requests_dropped` was correct.
+
 ## [0.1.20] - 2026-10-07
 
 ### Features
