@@ -1,8 +1,7 @@
 use anyhow::Result;
 use chrono::{Timelike, Utc};
-use metriken_exposition::{
-    MsgpackToParquet, ParquetHistogramType, ParquetOptions, Snapshot, SnapshotterBuilder,
-};
+use metriken_exposition::{Snapshot, SnapshotterBuilder};
+use metriken_storage::convert::{MsgpackToParquet, ParquetHistogramType, ParquetOptions};
 use std::sync::atomic::Ordering;
 use std::time::Duration;
 use tempfile::NamedTempFile;

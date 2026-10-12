@@ -1,5 +1,4 @@
 use chrono::{Timelike, Utc};
-use histogram::SampleQuantiles;
 use metriken::histogram::Histogram;
 use std::sync::Arc;
 use std::sync::atomic::Ordering;

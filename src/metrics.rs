@@ -241,6 +241,10 @@ fn phase_index(phase: Phase) -> usize {
     }
 }
 
+/// Counter groups whose every slot `Metrics::init` writes as 0. Other groups
+/// keep metriken 0.11's behaviour: a slot is absent until first written.
+static ZERO_INITIALIZED_GROUPS: [&CounterGroup; 2] = [&REQUESTS, &TOKENS];
+
 pub struct Metrics;
 
 impl Metrics {
@@ -248,11 +252,17 @@ impl Metrics {
         let ctx_names = ["small", "medium", "large", "xlarge", "xxlarge"];
         let phase_names = ["reasoning", "content"];
 
-        // Request counter metadata
-        for (idx, status) in ["sent", "success", "error", "timeout", "canceled", "retried"]
-            .iter()
-            .enumerate()
-        {
+        // Request counter metadata, keyed by the slot constants, so a label
+        // cannot land on the wrong slot by position.
+        for (idx, status) in [
+            (REQ_SENT, "sent"),
+            (REQ_SUCCESS, "success"),
+            (REQ_ERROR, "error"),
+            (REQ_TIMEOUT, "timeout"),
+            (REQ_CANCELED, "canceled"),
+            (REQ_RETRIED, "retried"),
+            (REQ_DROPPED, "dropped"),
+        ] {
             REQUESTS.set_metadata(
                 idx,
                 HashMap::from([("status".to_string(), status.to_string())]),
@@ -368,6 +378,18 @@ impl Metrics {
                 idx,
                 HashMap::from([("expected".to_string(), expected.to_string())]),
             );
+        }
+
+        // metriken 0.11 leaves a counter group slot absent from /metrics and
+        // the parquet until it is first written. rezolus's llm-perf dashboard
+        // plots `requests` by status (and divides error by sent) and `tokens`
+        // by direction, so those slots are written here: a clean run reports
+        // error, timeout, canceled, retried and dropped as 0. `add(idx, 0)`
+        // marks a slot written without changing a value already counted.
+        for group in ZERO_INITIALIZED_GROUPS {
+            for idx in 0..group.entries() {
+                group.add(idx, 0);
+            }
         }
     }
 
@@ -583,6 +605,82 @@ mod tests {
     #[test]
     fn ttft_by_cache_hit_and_miss_indices_are_distinct() {
         assert_ne!(CACHE_EXPECTED_HIT_IDX, CACHE_EXPECTED_MISS_IDX);
+    }
+
+    /// Every slot of every group carries labels. The exposition and the
+    /// parquet snapshot walk a group's labeled slots, so an unlabeled slot is
+    /// left out of both: the `requests` group's `dropped` slot was.
+    #[test]
+    fn every_group_slot_is_labeled() {
+        Metrics::init();
+        let counters: [(&str, &CounterGroup); 7] = [
+            ("requests", &REQUESTS),
+            ("errors", &ERRORS),
+            ("tokens", &TOKENS),
+            ("conversations", &CONVERSATIONS),
+            ("cache", &CACHE),
+            ("replay_reuse", &REPLAY_REUSE),
+            ("replay_sessions", &REPLAY_SESSIONS),
+        ];
+        for (name, group) in counters {
+            for idx in 0..group.entries() {
+                assert!(
+                    group.load_metadata(idx).is_some_and(|m| !m.is_empty()),
+                    "{name} slot {idx} has no labels"
+                );
+            }
+        }
+        let histograms: [(&str, &HistogramGroup); 5] = [
+            ("ttft", &TTFT),
+            ("ttft_content", &TTFT_CONTENT),
+            ("tpot", &TPOT),
+            ("itl", &ITL),
+            ("ttft_by_cache", &TTFT_BY_CACHE),
+        ];
+        for (name, group) in histograms {
+            for idx in 0..group.entries() {
+                assert!(
+                    group.load_metadata(idx).is_some_and(|m| !m.is_empty()),
+                    "{name} slot {idx} has no labels"
+                );
+            }
+        }
+        assert_eq!(
+            REQUESTS
+                .load_metadata(REQ_DROPPED)
+                .and_then(|m| m.get("status").cloned())
+                .as_deref(),
+            Some("dropped")
+        );
+    }
+
+    /// After init every slot of `requests` and `tokens` reads Some(0) or
+    /// more, so the dashboard's error, timeout and canceled series exist on a
+    /// clean run.
+    #[test]
+    fn init_writes_requests_and_tokens_slots() {
+        Metrics::init();
+        for (name, group) in [("requests", &REQUESTS), ("tokens", &TOKENS)] {
+            for idx in 0..group.entries() {
+                assert!(
+                    group.value(idx).is_some(),
+                    "{name} slot {idx} is unwritten after init"
+                );
+            }
+        }
+    }
+
+    /// `add(idx, 0)` on a fresh group reads Some(0), and on a written slot
+    /// leaves the count alone, so calling init after counting is harmless.
+    #[test]
+    fn zero_add_marks_written_and_keeps_counts() {
+        static GROUP: CounterGroup = CounterGroup::new(2);
+        GROUP.add(0, 0);
+        assert_eq!(GROUP.value(0), Some(0));
+        assert_eq!(GROUP.value(1), None);
+        GROUP.add(1, 5);
+        GROUP.add(1, 0);
+        assert_eq!(GROUP.value(1), Some(5));
     }
 
     #[test]

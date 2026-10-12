@@ -123,11 +123,21 @@ mod tests {
         let stub = dir.path().join("fake_rezolus.sh");
         // Stub invoked as `record <endpoint> <output> --interval <i>`: the OUTPUT
         // positional is $3. Trap SIGINT, write it (mimics rezolus finalizing), exit.
+        // `ready` is written after the trap is installed: a SIGINT before that
+        // kills the shell, which under a loaded test run took over 200 ms.
+        // The test needs SIGINT not ignored in the test process: a shell started
+        // with SIGINT ignored cannot trap it, so the suite must not be started
+        // in the background.
+        let ready = dir.path().join("ready");
         std::fs::write(
             &stub,
-            "#!/bin/sh\nout=\"$3\"\n\
-             trap 'echo done > \"$out\"; exit 0' INT\n\
-             while true; do sleep 0.05; done\n",
+            format!(
+                "#!/bin/sh\nout=\"$3\"\n\
+                 trap 'echo done > \"$out\"; exit 0' INT\n\
+                 touch '{}'\n\
+                 while true; do sleep 0.05; done\n",
+                ready.display()
+            ),
         )
         .unwrap();
         #[cfg(unix)]
@@ -140,7 +150,7 @@ mod tests {
         config.rezolus_bin = Some(stub.to_string_lossy().into_owned());
 
         let rec = ServerMetricsRecorder::spawn(&config).expect("spawn stub");
-        tokio::time::sleep(Duration::from_millis(200)).await;
+        wait_for(&ready).await;
         rec.finish().await;
 
         assert!(
@@ -148,5 +158,15 @@ mod tests {
             "stub should have written its output on SIGINT"
         );
         assert_eq!(std::fs::read_to_string(&out).unwrap().trim(), "done");
+    }
+
+    async fn wait_for(path: &std::path::Path) {
+        for _ in 0..500 {
+            if path.exists() {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        panic!("{} never appeared", path.display());
     }
 }
