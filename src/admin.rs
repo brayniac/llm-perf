@@ -55,7 +55,6 @@ async fn prometheus_metrics() -> Result<impl warp::Reply, Infallible> {
 }
 
 async fn json_metrics() -> Result<impl warp::Reply, Infallible> {
-    use histogram::SampleQuantiles;
     use metriken::Value;
     use serde_json::json;
 
@@ -109,7 +108,6 @@ async fn json_metrics() -> Result<impl warp::Reply, Infallible> {
 }
 
 async fn human_metrics() -> Result<impl warp::Reply, Infallible> {
-    use histogram::SampleQuantiles;
     use metriken::Value;
 
     let quantile_values = [0.5, 0.9, 0.95, 0.99, 0.999];

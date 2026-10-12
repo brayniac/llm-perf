@@ -6,7 +6,6 @@
 use crate::config::{SaturationConfig, SloPercentiles};
 use crate::metrics;
 
-use histogram::SampleQuantiles;
 use metriken::HistogramGroup;
 use metriken::histogram::Histogram;
 use serde::Serialize;

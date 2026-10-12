@@ -1,6 +1,5 @@
 use anyhow::Result;
 use chrono::{DateTime, Utc};
-use histogram::SampleQuantiles;
 use metriken::HistogramGroup;
 use metriken::histogram::Histogram;
 use serde::Serialize;
