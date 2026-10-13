@@ -59,6 +59,7 @@ cargo clippy
 - `src/report.rs` - Report generation (console and JSON output)
 - `src/stats.rs` - Periodic windowed stats output during benchmark runs
 - `src/snapshot.rs` - Metrics snapshot to parquet pipeline
+- `src/recording.rs` - The run's `.dendro` archive (llm-perf and the server under test), recorded in process with metriken-recorder
 - `src/admin.rs` - HTTP admin server for live metrics (Prometheus/JSON, msgpack `/metrics/binary`, dendro replication `/metrics/stream`)
 - `src/distribution.rs` - Request arrival distributions (uniform, poisson)
 - `src/tokenizer.rs` - Token counting via tiktoken

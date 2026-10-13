@@ -743,6 +743,11 @@ impl BenchmarkRunner {
     /// - Report generation fails
     /// - File I/O errors occur (for JSON output)
     ///
+    /// When `[metrics]` names a `.dendro` archive, the run installs
+    /// process-wide SIGINT and SIGTERM handlers (`recording::RunRecorder`): a
+    /// signal finalizes the archive and kills the process by that signal,
+    /// after the report when it arrives while the archive is being finalized.
+    ///
     /// # Examples
     ///
     /// ```no_run
@@ -757,6 +762,14 @@ impl BenchmarkRunner {
     /// # }
     /// ```
     pub async fn run(&self) -> Result<()> {
+        let result = self.run_and_report().await;
+        // A signal while the recording was finalized: die by it now that the
+        // report is written (or the run has failed).
+        crate::recording::reraise_pending();
+        result
+    }
+
+    async fn run_and_report(&self) -> Result<()> {
         let report_builder = ReportBuilder::new()
             .with_config(self.config.clone())
             .with_tokenizer_info(self.tokenizer.source_label(), self.tokenizer.is_estimate());
@@ -792,6 +805,12 @@ impl BenchmarkRunner {
         }
 
         // Set running flag
+        // Record llm-perf and the server under test into the run's archive.
+        let recorder = match self.config.metrics.as_ref() {
+            Some(m) => crate::recording::RunRecorder::start(m).await?,
+            None => None,
+        };
+
         crate::metrics::RUNNING.store(true, std::sync::atomic::Ordering::Relaxed);
 
         // Create notification for warmup completion
@@ -810,8 +829,13 @@ impl BenchmarkRunner {
             None
         };
 
-        // Spawn snapshot task if metrics are configured
-        let snapshot_handle = if self.config.metrics.is_some() {
+        // Spawn the parquet snapshot task when [metrics] output is a parquet
+        let snapshot_handle = if self
+            .config
+            .metrics
+            .as_ref()
+            .is_some_and(|m| m.parquet_output().is_some())
+        {
             let config = self.config.clone();
             Some(tokio::spawn(async move {
                 if let Err(e) = crate::snapshot::capture_snapshots(config).await {
@@ -822,50 +846,36 @@ impl BenchmarkRunner {
             None
         };
 
-        // Launch `rezolus record` for server-side metrics if a URL is configured.
-        // The admin address lets a `.dendro` recording include llm-perf itself.
-        let admin = self
-            .config
-            .admin
-            .as_ref()
-            .filter(|a| a.enabled)
-            .and_then(|a| a.listen.parse().ok());
-        let server_recorder = match self
-            .config
-            .metrics
-            .as_ref()
-            .filter(|m| m.server_metrics_url.is_some())
-        {
-            Some(m) => crate::server_metrics::ServerMetricsRecorder::spawn(m, admin).await,
-            None => None,
-        };
-
         // Run benchmark (without generating report)
-        let (test_duration, sat_results) = if self.config.saturation.is_some() {
-            let (d, r) = self
-                .run_saturation_mode_internal(start_instant, warmup_complete)
-                .await?;
-            (d, Some(r))
-        } else if self.config.load.qps.is_some() {
-            let d = self
-                .run_qps_mode_internal(start_instant, warmup_complete)
-                .await?;
-            (d, None)
-        } else {
-            let d = self
-                .run_concurrent_mode_internal(start_instant, warmup_complete)
-                .await?;
-            (d, None)
+        let run = async {
+            if self.config.saturation.is_some() {
+                let (d, r) = self
+                    .run_saturation_mode_internal(start_instant, warmup_complete)
+                    .await?;
+                Ok((d, Some(r)))
+            } else if self.config.load.qps.is_some() {
+                let d = self
+                    .run_qps_mode_internal(start_instant, warmup_complete)
+                    .await?;
+                Ok((d, None))
+            } else {
+                let d = self
+                    .run_concurrent_mode_internal(start_instant, warmup_complete)
+                    .await?;
+                Ok((d, None))
+            }
         };
+        let outcome: Result<_> = run.await;
 
         // Stop metrics capture
         crate::metrics::RUNNING.store(false, std::sync::atomic::Ordering::Relaxed);
 
-        // Stop the server-metrics recorder (SIGINT -> rezolus finalizes its output).
-        let server_metrics_failure = match server_recorder {
-            Some(rec) => rec.finish().await,
+        // Finalize the run's archive, on an error too.
+        let recording_failure = match recorder {
+            Some(rec) => rec.finish(outcome.is_ok()).await,
             None => None,
         };
+        let (test_duration, sat_results) = outcome?;
 
         // Wait for background tasks to complete
         if let Some(handle) = stats_handle {
@@ -881,7 +891,7 @@ impl BenchmarkRunner {
         // Generate report after all background tasks are done (use actual test duration)
         let mut report_builder = report_builder
             .with_duration(test_duration)
-            .with_server_metrics_failure(server_metrics_failure);
+            .with_recording_failure(recording_failure);
         if let Some(sat) = sat_results {
             report_builder = report_builder.with_saturation_results(sat);
         }
@@ -2031,7 +2041,7 @@ impl BenchmarkRunner {
                     // Writing to file - show brief summary to console
                     tokio::fs::write(file_path, json).await?;
                     if !self.config.output.quiet {
-                        self.print_brief_summary(&report, report_builder.server_metrics_failure())?;
+                        self.print_brief_summary(&report, report_builder.recording_failure())?;
                     }
                 } else {
                     // Writing JSON to stdout - this is for piping
@@ -2543,7 +2553,7 @@ impl BenchmarkRunner {
     fn print_brief_summary(
         &self,
         report: &crate::report::BenchmarkReport,
-        server_metrics_failure: Option<&str>,
+        recording_failure: Option<&str>,
     ) -> Result<()> {
         use chrono::Utc;
 
@@ -2602,7 +2612,7 @@ impl BenchmarkRunner {
             warn_if_eos_not_ignored(report, self.config.endpoint.max_tokens);
         }
         warn_if_ttft_fell_back(report);
-        if let Some(failure) = server_metrics_failure {
+        if let Some(failure) = recording_failure {
             println!("{} Warning: {}", timestamp, failure);
         }
 

@@ -93,7 +93,8 @@ Automatically categorizes TTFT and ITL by input context size:
 ### Metrics Capture
 
 - **Periodic Snapshots**: Capture all metrics at regular intervals (e.g., secondly resolution)
-- **Parquet Output**: Columnar format optimized for analytics and data processing
+- **One archive per run**: `[metrics] output` ending in `.dendro` records llm-perf and the server under test into one dendro archive, in process (see [Recording a run](#recording-a-run))
+- **Parquet Output**: any other `output` is a parquet of llm-perf's metrics, written at exit
 - **Configurable Intervals**: From milliseconds to minutes
 - **Batch Control**: Configurable batch sizes for efficient parquet file generation
 
@@ -367,30 +368,6 @@ rezolus before 5.23.0 writes parquet to a path ending in `.dendro`.
 rezolus record --endpoint http://127.0.0.1:9090,source=llm-perf -o run.dendro
 ```
 
-With `[metrics] server_metrics_url` set and `server_metrics_output` ending in
-`.dendro`, llm-perf runs that `rezolus record` itself, with the server under
-test as a second endpoint, so one archive holds both:
-
-```toml
-[metrics]
-output = "run.parquet"
-server_metrics_url = "http://localhost:8080/metrics"
-server_metrics_output = "run.dendro"
-
-[admin]
-enabled = true
-```
-
-Before adding llm-perf's endpoint, llm-perf runs `<rezolus_bin> --version`.
-For a version that cannot record it (a 6.0 alpha before alpha.45, anything
-before 5.23.0, or output it cannot parse), or a `--version` that has not
-exited after 5 s, it logs a warning naming the
-version (or the timeout) and the reason, and the `.dendro` holds the server under test only.
-Without `[admin]`, the `.dendro` also holds the server under test only. With
-any other `server_metrics_output` extension (the match is exact: `.dendro`,
-not `.DENDRO`) the server is recorded alone, as before. If `rezolus record`
-exits non-zero, llm-perf logs an error with the exit status and repeats it as
-a warning in the console summary.
 
 At the default `[log] level = "info"`, llm-perf hides `warp::server` events,
 so the `server connection error: hyper::Error(IncompleteMessage)` that warp
@@ -400,6 +377,67 @@ and its accept errors, such as `accept error` when llm-perf runs out of file
 descriptors. `level = "debug"` shows them, as does
 `filter = ["warp::server=error"]`. A failure to bind the admin address still
 shows: warp panics with `failed to bind to address`.
+
+### Recording a run
+
+With `[metrics] output` ending in `.dendro`, llm-perf records the run into
+that archive itself, through metriken-recorder: its own metrics, and the
+server under test when `server_metrics_url` is set. Both are on one timeline,
+each as its own recording, and the archive is readable while the run goes. No
+rezolus binary is needed.
+
+```toml
+[metrics]
+output = "run.dendro"
+interval = "1s"
+server_metrics_url = "http://localhost:8080/metrics"
+```
+
+llm-perf's histograms are recorded with their buckets. `server_metrics_url` is
+either a Prometheus `/metrics` URL, scraped each interval, or the base URL of
+a producer that serves `/metrics/stream` (a rezolus agent, cachecannon,
+another llm-perf), which is streamed; a base URL without a stream is scraped
+at `/metrics`. A server that is not reachable or answers with an error at the
+start is detected again each interval. If it is never recorded, the console
+summary says so in a warning with the last reason, and the archive holds
+llm-perf alone.
+
+llm-perf's recording is labeled `source=llm-perf, role=loadgen`. The server's
+is labeled `role=service`, and its `source` is the name its stream's
+handshake gives (`rezolus`, `llm-perf`, ...) or, for a scraped server, one
+made from its host and port.
+
+With a parquet `output`, llm-perf still writes the parquet at exit, and with
+`server_metrics_url` set it also records the archive at
+`server_metrics_output`, by default `<output-stem>.server.dendro`. That
+archive holds llm-perf too. With `server_metrics_url` set,
+`server_metrics_output` must end in `.dendro` (exactly: not `.DENDRO`), and
+must not be set when `output` is the archive. The archive must not exist yet:
+llm-perf refuses to start rather than overwrite one. `rezolus_bin` is ignored
+and logs a warning.
+
+A run that completes ends the recording with one more pass of llm-perf and
+a scraped server, and waits up to one interval plus the scrape timeout for a
+streamed server's last frame. A run that fails ends it without the wait.
+
+SIGINT (Ctrl-C) or SIGTERM during a recorded run finalizes the archive with
+a last pass of llm-perf and a scraped server (no wait for a streamed one),
+prints the outcome to stderr, and then llm-perf dies by that signal, so a
+shell loop stops and the exit status is 130 or 143; no report or parquet is
+written. A second signal while it finalizes kills it at once and leaves the
+archive unfinalized. A signal after the run, while llm-perf finalizes the
+archive (its last pass, or the wait for a streamed server's last frame,
+which the signal ends), lets it finish; the report is written, and then
+llm-perf dies by the signal. A signal after that, while the report is
+written, kills llm-perf at once with no report. A signal while the
+server under test is detected, before the archive exists, kills llm-perf at
+once. A signal the parent set to be ignored (a background job in a script)
+stays ignored.
+
+To pick llm-perf's own recording out of the archive, select `role=loadgen`
+(for example `rezolus mcp query run.dendro ... --recording role=loadgen`):
+when the server under test is another llm-perf, `source=llm-perf` matches
+both.
 
 ### Input Format
 
@@ -578,6 +616,7 @@ llm-perf/
 │   ├── report.rs         # Report generation (console and JSON)
 │   ├── stats.rs          # Periodic windowed stats during runs
 │   ├── snapshot.rs       # Metrics snapshot to parquet pipeline
+│   ├── recording.rs      # The run's .dendro archive, recorded in process
 │   ├── admin.rs          # HTTP admin server (Prometheus/JSON/msgpack metrics, /metrics/stream)
 │   ├── distribution.rs   # Request arrival distributions (uniform, poisson)
 │   ├── tokenizer.rs      # Token counting via tiktoken

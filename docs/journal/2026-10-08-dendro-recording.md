@@ -1,7 +1,8 @@
 # Recording llm-perf and the server under test into one `.dendro`
 
 **Status:** OPEN. Plan opened 2026-10-08; steps 3 and 4 built 2026-10-11
-(branches `deps/metriken-0.11` and `feat/metrics-stream`, see "As built").
+(branches `deps/metriken-0.11` and `feat/metrics-stream`), step 5 built
+2026-10-13 (branch `feat/record-in-process`); see "As built".
 
 Related entries opened the same day: rezolus
 `docs/journal/2026-10-08-6-0-release-readiness.md`, metriken
@@ -254,3 +255,144 @@ step 5 for path step 4 (`metriken-recorder`), and step 6 for path step 5
   status: 1; ...`.
 - Not checked: `rezolus view` showing the llm-perf dashboard for the llm-perf
   recording of that archive (the first GO criterion's second half).
+
+### Step 5: recording in process (branch `feat/record-in-process`)
+
+- `src/recording.rs` (`RunRecorder`) replaces `src/server_metrics.rs`, which
+  ran `rezolus record` as a child process. It starts a `metriken_recorder::Recorder`
+  (metriken-recorder 0.1.1, features `http` and `registry`) with two kinds of
+  source: llm-perf's registry as a `RegistrySource` over
+  `GroupBuilder::new(DefaultRouter::new("llm-perf"))`, labels
+  `source=llm-perf`, metadata `version`, so its table is `llm-perf/main`, as
+  on the stream; and `server_metrics_url`, when set, through
+  `metriken_recorder::detect` with `NoProbe` (a `/metrics` URL is scraped as
+  `prometheus/scrape`; a base URL or `/metrics/stream` URL is asked for its
+  stream first). Both carry a `role` label, `loadgen` for llm-perf and
+  `service` for the server. The server's `source` is the caller's label (none
+  here), else the handshake's, else one made from host and port
+  (metriken-recorder's order): a scraped server is named `127.0.0.1-18085`,
+  a streamed rezolus agent `rezolus`, and a streamed llm-perf `llm-perf`,
+  which without `role` would have the same label set as llm-perf's own
+  recording (found in review; the test
+  `another_llm_perf_streamed_as_the_server_stays_a_separate_recording`
+  streams the admin server's route as the server).
+- Where the archive goes (`MetricsConfig::recording_path`): `[metrics]
+  output` when it ends in `.dendro` (then no parquet is written and the
+  snapshot task does not run); otherwise, with `server_metrics_url` set,
+  `server_metrics_output`, defaulting to `<output-stem>.server.dendro`. Config
+  validation refuses a `server_metrics_output` that does not end in `.dendro`,
+  one set beside a `.dendro` `output`, a zero or unparseable interval, and a
+  `server_metrics_url` that is not `http` or `https`. `rezolus_bin` still
+  parses and logs a warning when set.
+- The admin server is no longer involved: llm-perf records its own registry
+  whether or not `[admin]` is enabled. The `rezolus --version` gate, the
+  loopback rewrite and the `record_args` builder are removed with the child
+  process. The admin server's `/metrics/stream` and `/metrics/binary` stay for
+  external recorders.
+- Finish: `Stop::AfterExit` stamped when the benchmark ends, with a bound of
+  one interval plus the recorder's timeout (`default_timeout`: 2 s at a 1 s
+  interval, 10 s at the default `1m`, so up to 70 s for a streamed server;
+  an info line says so when a source is streamed). A run that fails is
+  finished with the no-wait last pass below, since its workers may still be
+  sending load.
+  Signals: `RunRecorder::start` registers SIGINT and SIGTERM (tokio
+  `signal::unix`) before detection, and spawns `watch_signals` once the
+  recorder is up; it shares the recorder with `finish` through a
+  `Mutex<Option<Live>>`. A signal during the run takes the recorder,
+  finalizes with `Stop::AfterExit { bound: 0 }` (a last pass of llm-perf and
+  a scraped server, no wait for a stream), and dies by the signal
+  (`die_by`: `SIG_DFL`, then `raise`). A signal while `finish` holds the
+  recorder cancels the token `Recorder::finish` takes, which ends the wait
+  for a streamed server; the signal is kept in a static, and
+  `BenchmarkRunner::run` re-raises it (`reraise_pending`) after the report is
+  written, also when the run failed. The watcher decides between these
+  under the `live` mutex, and `finish` marks itself finalized under the same
+  mutex, so a signal cannot fall between the check and the store (found in
+  the fifth review, from the code). One after `finish` has finalized dies at once. Detection races the
+  signals, so a signal before the archive exists ends llm-perf at once
+  rather than after the detect timeout. A signal whose action was `SIG_IGN`
+  at startup is not registered, so a background job keeps ignoring SIGINT. A second signal while finalizing dies at once. The
+  outcome goes to stderr first, since dying skips the non-blocking log
+  writer's flush. Five reviews shaped this: the first fix raced the run
+  against `ctrl_c()` and dropped the run future, which left the benchmark's
+  spawned workers sending load (they do not check `RUNNING`) and left SIGINT
+  ignored after a normal finish, since tokio never removes a handler; the
+  second exited with status 130 instead of dying by the signal, and a
+  reviewer showed a bash loop then started its next run. Before this branch,
+  Ctrl-C reached the `rezolus record` child, which finalized. The third
+  review found the interrupt path skipped the server's last scrape
+  (`Stop::Now` takes local passes only). The fourth review found that a signal during the
+  final wait lost a completed run's report, and that a signal during
+  detection waited out the detect timeout (9.5 s with three signals).
+  A recording error, a server never recorded (with the
+  last reason from detection or a `Pending`/`Refused` event, so a 404 reads
+  `not detected: ... 404 ...` rather than "never answered"), or a discarded
+  archive becomes the console summary's warning line
+  (`ReportBuilder::recording_failure`, renamed from `server_metrics_failure`).
+- An archive that already exists is refused by
+  `MetricsConfig::check_archive_absent` in `run_benchmark`, before
+  `BenchmarkRunner::new` loads the tokenizer and dataset; `RunRecorder::start`
+  runs before the stats and snapshot tasks are spawned. A
+  `server_metrics_output` with no `server_metrics_url` is not checked, so an
+  older config with a parquet one still loads.
+- Crypto: metriken-recorder's client is reqwest 0.13 (llm-perf's own client
+  stays on 0.12), built with `rustls-no-provider`; `RunRecorder::start`
+  installs rustls's ring provider, which reqwest 0.12's `rustls-tls` already
+  pulled in. The build still holds one `metriken-core`.
+- Tests (`recording::tests`): a mockito Prometheus server and the registry
+  into one archive (two sources, `llm-perf/main` and `prometheus/scrape`,
+  the server `role=service`); another llm-perf's stream (the admin route) as
+  the server, kept as a second recording by `role`; no server URL (llm-perf
+  alone); a port with nothing listening and a URL answering 404 (the failure
+  names the URL and the reason, llm-perf's rows kept); an existing file
+  refused and left as it was; a parquet output with no server records
+  nothing. Config tests cover each path and refusal. Seen red: the server
+  spec not passed to `detect`, the missing-server report removed, and the
+  `.dendro`-extension check removed. In the full suite, other tests write the
+  histogram groups, so `llm-perf/main/occupants` is present too; the test
+  checks that `llm-perf/main` is among the tables rather than the whole list.
+- Manual checks of the review fixes, against the mock: a bash loop of two
+  30 s runs, SIGINT to its process group 6 s in: the first run printed
+  `llm-perf: interrupted; finalized ...` and died by SIGINT, the loop
+  stopped before the second run, and the archive held 6 rows for both
+  recordings (the server's last scrape included). SIGTERM 4 s into a run:
+  status 143 (`Terminated: 15`). With another llm-perf's admin route as a
+  streamed server at a 10 s interval and a 5 s run, SIGINT 1 s into the 20 s
+  final wait ended it; the archive was finalized, the JSON report written,
+  and llm-perf died by SIGINT. SIGINT 0.6 s into detecting a server that
+  accepts connections and never answers killed llm-perf 0.03 s later, with
+  no archive created. Under `trap '' INT`, SIGINT 2 s into a 5 s run was
+  ignored and the run finished with status 0. Rerunning a config whose archive exists exited 1 with
+  `already exists` before the tokenizer loaded. Not covered by a test: the
+  wiring in `benchmark.rs` (the snapshot task skipped for a `.dendro`
+  output, `finish` on the error path) and the signal paths.
+- `rezolus recording metadata` names both recordings of that last archive
+  `llm-perf`; `--recording source=llm-perf` matches both, `role=loadgen` or
+  `role=service` one.
+- GO check, on macOS, against the step-4 mock (`mockllm.py`, 8 concurrent
+  requests, `[metrics] interval = "1s"`, no `[admin]`), read with rezolus
+  6.0.0-alpha.53 (upstream main 8b20dc17):
+  - 15 s with `output = "solo.dendro"` and `server_metrics_url` at the
+    mock's `/metrics`: exit 0, no parquet, no `-wal`/`-shm` left by llm-perf.
+    `rezolus recording metadata` lists two recordings, `source=127.0.0.1-18085`
+    (`prometheus/scrape`, 16 rows) and `source=llm-perf` (`llm-perf/main`, 16
+    rows in 4 segments, plus `llm-perf/main/occupants`).
+  - 60 s with `output = "run.parquet"` and `server_metrics_output =
+    "run.dendro"`: both from the same run; 61 rows per recording in the
+    archive (425,984 bytes), 60 in the parquet (52,059 bytes). For `ttft`,
+    `ttft_content`, `itl`, `tpot` and `request_latency`,
+    `histogram_quantile(0.5, m)`, `histogram_quantile(0.99, m)` and
+    `histogram_count(m)` through `rezolus mcp query` (the archive with
+    `--recording source=llm-perf`) print the same first, last, min, max and
+    mean values for 14 of the 15 queries; the timestamps differ (the
+    archive's last row is the finish pass at 618.45 s, the parquet's the
+    1 s tick at 619.00 s). `histogram_quantile(0.99, itl)` differs in its
+    mean by 546 ns over 60 points, one 32,768 ns bucket at one point. Which
+    point was not checked; the different final stamp is the likely cause
+    and is inferred, not shown.
+  - `rezolus recording metadata` shows llm-perf's version as `agent rezolus
+    0.1.21-alpha.0`: rezolus labels any recording's `version` as a rezolus
+    agent's. That is rezolus's display, not this archive.
+- Not checked here: `rezolus view` showing the llm-perf dashboard for the
+  llm-perf recording. That is the metriken entry's path step 5 (templates in
+  the archive and the combined view), which step 6 here follows.
