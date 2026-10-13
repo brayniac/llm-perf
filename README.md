@@ -383,9 +383,8 @@ shows: warp panics with `failed to bind to address`.
 With `[metrics] output` ending in `.dendro`, llm-perf records the run into
 that archive itself, through metriken-recorder: its own metrics, and the
 server under test when `server_metrics_url` is set. Both are on one timeline,
-each as its own recording (`source=llm-perf`, and the server named from its
-host and port), and the archive is readable while the run goes and after a
-crash. No rezolus binary is needed.
+each as its own recording, and the archive is readable while the run goes. No
+rezolus binary is needed.
 
 ```toml
 [metrics]
@@ -398,17 +397,29 @@ llm-perf's histograms are recorded with their buckets. `server_metrics_url` is
 either a Prometheus `/metrics` URL, scraped each interval, or the base URL of
 a producer that serves `/metrics/stream` (a rezolus agent, cachecannon,
 another llm-perf), which is streamed; a base URL without a stream is scraped
-at `/metrics`. A server that does not answer at the start is recorded once it
-does. If it never answers, the console summary says so in a warning, and
-the archive holds llm-perf alone.
+at `/metrics`. A server that is not reachable or answers with an error at the
+start is detected again each interval. If it is never recorded, the console
+summary says so in a warning with the last reason, and the archive holds
+llm-perf alone.
+
+llm-perf's recording is labeled `source=llm-perf, role=loadgen`. The server's
+is labeled `role=service`, and its `source` is the name its stream's
+handshake gives (`rezolus`, `llm-perf`, ...) or, for a scraped server, one
+made from its host and port.
 
 With a parquet `output`, llm-perf still writes the parquet at exit, and with
 `server_metrics_url` set it also records the archive at
 `server_metrics_output`, by default `<output-stem>.server.dendro`. That
-archive holds llm-perf too. `server_metrics_output` must end in `.dendro`
-(exactly: not `.DENDRO`), and must not be set when `output` is the archive.
-The archive must not exist yet: llm-perf refuses to start rather than
-overwrite one. `rezolus_bin` is ignored and logs a warning.
+archive holds llm-perf too. With `server_metrics_url` set,
+`server_metrics_output` must end in `.dendro` (exactly: not `.DENDRO`), and
+must not be set when `output` is the archive. The archive must not exist yet:
+llm-perf refuses to start rather than overwrite one. `rezolus_bin` is ignored
+and logs a warning.
+
+The run ends the recording with one more pass of llm-perf and a scraped
+server, and waits up to one interval plus the scrape timeout for a streamed
+server's last frame. Ctrl-C during a recorded run ends the run and finalizes
+the archive (no report or parquet is written); a second Ctrl-C exits at once.
 
 ### Input Format
 

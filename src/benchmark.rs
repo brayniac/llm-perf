@@ -792,6 +792,12 @@ impl BenchmarkRunner {
         }
 
         // Set running flag
+        // Record llm-perf and the server under test into the run's archive.
+        let recorder = match self.config.metrics.as_ref() {
+            Some(m) => crate::recording::RunRecorder::start(m).await?,
+            None => None,
+        };
+
         crate::metrics::RUNNING.store(true, std::sync::atomic::Ordering::Relaxed);
 
         // Create notification for warmup completion
@@ -827,38 +833,52 @@ impl BenchmarkRunner {
             None
         };
 
-        // Record llm-perf and the server under test into the run's archive.
-        let recorder = match self.config.metrics.as_ref() {
-            Some(m) => crate::recording::RunRecorder::start(m).await?,
-            None => None,
-        };
-
         // Run benchmark (without generating report)
-        let (test_duration, sat_results) = if self.config.saturation.is_some() {
-            let (d, r) = self
-                .run_saturation_mode_internal(start_instant, warmup_complete)
-                .await?;
-            (d, Some(r))
-        } else if self.config.load.qps.is_some() {
-            let d = self
-                .run_qps_mode_internal(start_instant, warmup_complete)
-                .await?;
-            (d, None)
+        let run = async {
+            if self.config.saturation.is_some() {
+                let (d, r) = self
+                    .run_saturation_mode_internal(start_instant, warmup_complete)
+                    .await?;
+                Ok((d, Some(r)))
+            } else if self.config.load.qps.is_some() {
+                let d = self
+                    .run_qps_mode_internal(start_instant, warmup_complete)
+                    .await?;
+                Ok((d, None))
+            } else {
+                let d = self
+                    .run_concurrent_mode_internal(start_instant, warmup_complete)
+                    .await?;
+                Ok((d, None))
+            }
+        };
+        // With a recording, the first Ctrl-C ends the run and finalizes the
+        // archive; a second one exits at once.
+        let outcome: Result<_> = if recorder.is_some() {
+            tokio::select! {
+                outcome = run => outcome,
+                _ = tokio::signal::ctrl_c() => {
+                    tokio::spawn(async {
+                        let _ = tokio::signal::ctrl_c().await;
+                        std::process::exit(130);
+                    });
+                    log::warn!("interrupted; finalizing the recording (Ctrl-C again to exit now)");
+                    Err(anyhow::anyhow!("interrupted"))
+                }
+            }
         } else {
-            let d = self
-                .run_concurrent_mode_internal(start_instant, warmup_complete)
-                .await?;
-            (d, None)
+            run.await
         };
 
         // Stop metrics capture
         crate::metrics::RUNNING.store(false, std::sync::atomic::Ordering::Relaxed);
 
-        // Finalize the run's archive.
+        // Finalize the run's archive, on an error or interrupt too.
         let recording_failure = match recorder {
             Some(rec) => rec.finish().await,
             None => None,
         };
+        let (test_duration, sat_results) = outcome?;
 
         // Wait for background tasks to complete
         if let Some(handle) = stats_handle {

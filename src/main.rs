@@ -157,6 +157,10 @@ async fn run_benchmark(config: Config) -> Result<()> {
         return Ok(());
     }
 
+    if let Some(metrics) = &config.metrics {
+        metrics.check_archive_absent()?;
+    }
+
     debug!("Initializing benchmark runner");
     let runner = llm_perf::BenchmarkRunner::new(config).await?;
     info!("Starting benchmark run");

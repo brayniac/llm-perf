@@ -317,9 +317,12 @@ level = "info"
 # the base URL of a producer that serves /metrics/stream (streamed).
 # server_metrics_url = "http://localhost:4242/metrics"
 #
+# llm-perf's recording is labeled role=loadgen and the server's role=service.
+#
 # With a parquet output, the server under test and llm-perf are recorded into
-# a separate archive. It must end in .dendro; the default is
-# <output-stem>.server.dendro. Leave it unset when output is the archive.
+# a separate archive. It must end in .dendro and must not exist yet; the
+# default is <output-stem>.server.dendro. Leave it unset when output is the
+# archive.
 # server_metrics_output = "metrics.server.dendro"
 #
 # rezolus_bin is ignored: no rezolus binary is needed.

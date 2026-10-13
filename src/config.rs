@@ -531,7 +531,9 @@ impl MetricsConfig {
                 anyhow::bail!("[metrics] server_metrics_url {url:?} must be an http or https URL");
             }
         }
-        if let Some(p) = &self.server_metrics_output {
+        // An unused server_metrics_output (no server_metrics_url) is left
+        // alone, so an older config with a parquet one still loads.
+        if let (Some(p), Some(_)) = (&self.server_metrics_output, &self.server_metrics_url) {
             if is_dendro(&self.output) {
                 anyhow::bail!(
                     "[metrics] output {:?} is the run's archive and holds the server under \
@@ -545,6 +547,20 @@ impl MetricsConfig {
                      records the server under test in process into a dendro archive"
                 );
             }
+        }
+        Ok(())
+    }
+
+    /// Refuse to start when the run's archive already exists: the recorder
+    /// never overwrites one. Checked before the benchmark loads anything.
+    pub fn check_archive_absent(&self) -> anyhow::Result<()> {
+        if let Some(path) = self.recording_path()
+            && std::fs::symlink_metadata(&path).is_ok()
+        {
+            anyhow::bail!(
+                "[metrics] {path:?} already exists; llm-perf records each run into a new \
+                 archive and does not overwrite one"
+            );
         }
         Ok(())
     }
@@ -1338,6 +1354,35 @@ mod server_metrics_config_tests {
             let err = metrics(toml).validate().unwrap_err().to_string();
             assert!(err.contains(want), "{toml}: {err}");
         }
+    }
+
+    #[test]
+    fn an_unused_server_output_is_not_checked() {
+        let cfg = metrics(
+            r#"
+            output = "run.dendro"
+            server_metrics_output = "old.server.parquet"
+        "#,
+        );
+        cfg.validate().unwrap();
+        assert_eq!(cfg.recording_path(), Some(PathBuf::from("run.dendro")));
+    }
+
+    #[test]
+    fn an_existing_archive_is_refused_before_the_run() {
+        let dir = tempfile::tempdir().unwrap();
+        let out = dir.path().join("run.dendro");
+        let cfg = metrics(&format!("output = {:?}", out.to_str().unwrap()));
+        cfg.check_archive_absent().unwrap();
+        std::fs::write(&out, b"").unwrap();
+        let err = cfg.check_archive_absent().unwrap_err().to_string();
+        assert!(err.contains("already exists"), "{err}");
+        // A parquet output with no server records no archive.
+        let parquet = metrics(&format!(
+            "output = {:?}",
+            dir.path().join("run.dendro.parquet").to_str().unwrap()
+        ));
+        parquet.check_archive_absent().unwrap();
     }
 
     #[test]

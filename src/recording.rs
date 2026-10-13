@@ -1,23 +1,27 @@
 //! Records the run into one `.dendro` archive in process, through
 //! metriken-recorder: llm-perf's own registry, and the server under test
 //! when `server_metrics_url` is set. Both are on one timeline, and the
-//! archive is readable while the run goes and after a crash.
+//! archive is readable while the run goes.
 //!
 //! llm-perf is a local source: each tick takes a pass of the registry, so
 //! histograms are recorded with their buckets. The server under test is
 //! detected by metriken-recorder: a base URL (path `/`) or a
 //! `/metrics/stream` URL is asked for its stream first and scraped at
 //! `/metrics` if it has none; any other URL is scraped as Prometheus text.
+//!
+//! Each recording carries a `role` label, `loadgen` for llm-perf and
+//! `service` for the server under test, so the two stay distinct when the
+//! server names itself `llm-perf` too (another llm-perf's stream does).
 
-use std::collections::BTreeMap;
-use std::sync::Arc;
+use std::collections::{BTreeMap, HashMap};
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use anyhow::Context;
 use metriken_exposition::group_builder::{DefaultRouter, GroupBuilder};
 use metriken_recorder::{
-    CancellationToken, DetectConfig, Detected, EndpointSpec, Event, NoProbe, Recorder,
-    RecorderConfig, RegistrySource, SourceState, Stop, Summary,
+    ActiveTransport, CancellationToken, DetectConfig, Detected, EndpointSpec, Event, NoProbe,
+    Recorder, RecorderConfig, RegistrySource, SourceId, SourceState, Stop, Summary,
 };
 use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
@@ -29,10 +33,27 @@ use crate::config::MetricsConfig;
 /// handshake's.
 pub const LLM_PERF_SOURCE: &str = STREAM_NAMESPACE;
 
+/// The label that tells llm-perf's recording from the server under test's.
+pub const ROLE: &str = "role";
+/// llm-perf's `role`.
+pub const ROLE_LOADGEN: &str = "loadgen";
+/// The server under test's `role`.
+pub const ROLE_SERVICE: &str = "service";
+
+/// What the event logger keeps for [`RunRecorder::finish`].
+#[derive(Default)]
+struct Seen {
+    /// The last reason each source was pending or refused.
+    reasons: HashMap<SourceId, String>,
+    /// A source is streamed, so finishing waits for its last frame.
+    streamed: bool,
+}
+
 /// A recording in progress.
 pub struct RunRecorder {
     recorder: Recorder,
     events: JoinHandle<()>,
+    seen: Arc<Mutex<Seen>>,
     path: std::path::PathBuf,
     bound: Duration,
 }
@@ -67,7 +88,7 @@ impl RunRecorder {
         if let Some(url) = &mc.server_metrics_url {
             let url = url::Url::parse(url)
                 .with_context(|| format!("[metrics] server_metrics_url {url:?}"))?;
-            specs.push(EndpointSpec::new(url));
+            specs.push(EndpointSpec::new(url).with_label(ROLE, ROLE_SERVICE));
         }
         let detected = if specs.is_empty() {
             Vec::new()
@@ -80,25 +101,36 @@ impl RunRecorder {
             )
             .await
         };
-        for d in &detected {
+        // Detection's reasons, keyed by position: endpoints are numbered first.
+        let mut seen = Seen::default();
+        for (i, d) in detected.iter().enumerate() {
             match d {
-                Detected::Refused { spec, reason } => log::warn!(
-                    "the server under test at {} cannot be recorded: {reason}; {path:?} \
-                     records llm-perf only",
-                    spec.url
-                ),
-                Detected::Pending { spec, reason } => log::warn!(
-                    "the server under test at {} did not answer ({reason}); it is recorded \
-                     once it does",
-                    spec.url
-                ),
+                Detected::Refused { spec, reason } => {
+                    log::warn!(
+                        "the server under test at {} cannot be recorded: {reason}; {path:?} \
+                         records llm-perf only",
+                        spec.url
+                    );
+                    seen.reasons.insert(SourceId(i as u32), reason.clone());
+                }
+                Detected::Pending { spec, reason } => {
+                    log::warn!(
+                        "the server under test at {} is not recorded yet ({reason}); it is \
+                         detected again each interval",
+                        spec.url
+                    );
+                    seen.reasons.insert(SourceId(i as u32), reason.clone());
+                }
                 Detected::Streamed { .. } | Detected::Scraped { .. } => {}
             }
         }
 
         let llm_perf = RegistrySource::new(
             GroupBuilder::new(DefaultRouter::new(STREAM_NAMESPACE)),
-            [("source".to_string(), LLM_PERF_SOURCE.to_string())].into(),
+            BTreeMap::from([
+                ("source".to_string(), LLM_PERF_SOURCE.to_string()),
+                (ROLE.to_string(), ROLE_LOADGEN.to_string()),
+            ]),
             BTreeMap::from([("version".to_string(), env!("CARGO_PKG_VERSION").to_string())]),
         );
         let (recorder, _ids, rx) = Recorder::start(
@@ -115,9 +147,11 @@ impl RunRecorder {
         } else {
             log::info!("recording llm-perf into {path:?}");
         }
+        let seen = Arc::new(Mutex::new(seen));
         Ok(Some(Self {
             recorder,
-            events: tokio::spawn(log_events(rx)),
+            events: tokio::spawn(log_events(rx, Arc::clone(&seen))),
+            seen,
             path,
             bound: interval + timeout,
         }))
@@ -132,6 +166,13 @@ impl RunRecorder {
             .duration_since(UNIX_EPOCH)
             .map(|d| d.as_nanos() as u64)
             .unwrap_or_default();
+        if self.seen.lock().map(|s| s.streamed).unwrap_or(false) {
+            log::info!(
+                "finalizing {:?}: waiting up to {:?} for the server under test's last frame",
+                self.path,
+                self.bound
+            );
+        }
         let stop = Stop::AfterExit {
             wall_ns,
             bound: self.bound,
@@ -139,7 +180,10 @@ impl RunRecorder {
         let result = self.recorder.finish(stop, CancellationToken::new()).await;
         let _ = self.events.await;
         let failure = match result {
-            Ok(summary) => summary_failure(&summary, &self.path),
+            Ok(summary) => {
+                let seen = self.seen.lock().unwrap_or_else(|e| e.into_inner());
+                summary_failure(&summary, &seen.reasons, &self.path)
+            }
             Err(e) => Some(format!(
                 "recording {:?} failed: {e}; it holds the ticks committed before the failure",
                 self.path
@@ -154,8 +198,12 @@ impl RunRecorder {
 }
 
 /// What the summary says went wrong, if anything: no data at all, or a server
-/// under test that was never recorded.
-fn summary_failure(summary: &Summary, path: &std::path::Path) -> Option<String> {
+/// under test that was never recorded, with the last reason it gave.
+fn summary_failure(
+    summary: &Summary,
+    reasons: &HashMap<SourceId, String>,
+    path: &std::path::Path,
+) -> Option<String> {
     if summary.discarded {
         return Some(format!(
             "nothing was recorded, so {path:?} was removed rather than finalized"
@@ -167,12 +215,15 @@ fn summary_failure(summary: &Summary, path: &std::path::Path) -> Option<String> 
         .filter(|s| s.passes_total == 0)
         .filter_map(|s| {
             let endpoint = s.endpoint.as_deref()?;
-            let why = match s.state {
-                SourceState::Refused => "it cannot be recorded",
-                SourceState::Pending | SourceState::Activating => "it never answered",
+            let state = match s.state {
+                SourceState::Refused => "refused",
+                SourceState::Pending | SourceState::Activating => "not detected",
                 _ => "no frame or scrape arrived",
             };
-            Some(format!("{endpoint} ({why})"))
+            Some(match reasons.get(&s.id) {
+                Some(reason) => format!("{endpoint} ({state}: {reason})"),
+                None => format!("{endpoint} ({state})"),
+            })
         })
         .collect();
     (!missing.is_empty()).then(|| {
@@ -183,17 +234,26 @@ fn summary_failure(summary: &Summary, path: &std::path::Path) -> Option<String> 
     })
 }
 
-/// Log what the recorder reports. Per-frame and per-commit events are left
-/// to debug.
-async fn log_events(mut rx: mpsc::Receiver<Event>) {
+/// Log what the recorder reports, and keep what `finish` needs. Per-frame
+/// and per-commit events are left to debug.
+async fn log_events(mut rx: mpsc::Receiver<Event>, seen: Arc<Mutex<Seen>>) {
+    let note = |f: &mut dyn FnMut(&mut Seen)| {
+        if let Ok(mut s) = seen.lock() {
+            f(&mut s);
+        }
+    };
     while let Some(event) = rx.recv().await {
         match event {
             Event::Active {
+                source,
                 name,
                 transport,
                 inferred,
-                ..
             } => {
+                note(&mut |s| {
+                    s.reasons.remove(&source);
+                    s.streamed |= transport == ActiveTransport::Stream;
+                });
                 if inferred {
                     log::info!(
                         "recording source={name} ({transport:?}); the name was made from its URL"
@@ -203,7 +263,10 @@ async fn log_events(mut rx: mpsc::Receiver<Event>) {
                 }
             }
             Event::Pending { source, reason } => {
-                log::warn!("{source} is not recorded yet: {reason}")
+                log::warn!("{source} is not recorded yet: {reason}");
+                note(&mut |s| {
+                    s.reasons.insert(source, reason.clone());
+                });
             }
             Event::Dropped { source, reason } => {
                 log::warn!("{source}'s stream dropped ({reason}); reconnecting")
@@ -211,7 +274,12 @@ async fn log_events(mut rx: mpsc::Receiver<Event>) {
             Event::Reconnected {
                 source, restarted, ..
             } => log::info!("{source} reconnected (restarted: {restarted})"),
-            Event::Refused { source, reason } => log::warn!("{source} is refused: {reason}"),
+            Event::Refused { source, reason } => {
+                log::warn!("{source} is refused: {reason}");
+                note(&mut |s| {
+                    s.reasons.insert(source, reason.clone());
+                });
+            }
             Event::Restarted {
                 source, version, ..
             } => log::warn!(
@@ -252,6 +320,26 @@ mod tests {
                 let name = s.labels.get("source").cloned().unwrap_or_default();
                 (name, catalog.tables(s.id).unwrap())
             })
+            .collect()
+    }
+
+    /// Each recording's labels.
+    fn label_sets(path: &Path) -> Vec<BTreeMap<String, String>> {
+        let catalog = DendroCatalog::open(path).unwrap();
+        let mut sets: Vec<_> = catalog
+            .sources()
+            .unwrap()
+            .into_iter()
+            .map(|s| s.labels)
+            .collect();
+        sets.sort();
+        sets
+    }
+
+    fn labels(pairs: &[(&str, &str)]) -> BTreeMap<String, String> {
+        pairs
+            .iter()
+            .map(|(k, v)| (k.to_string(), v.to_string()))
             .collect()
     }
 
@@ -299,6 +387,13 @@ mod tests {
             [metriken_recorder::PROMETHEUS_GROUP],
             "{sources:?}"
         );
+        let sets = label_sets(&path);
+        assert!(
+            sets.iter()
+                .any(|l| l.get("role").map(String::as_str) == Some(ROLE_SERVICE)
+                    && l.get("source").map(String::as_str) != Some(LLM_PERF_SOURCE)),
+            "{sets:?}"
+        );
     }
 
     #[tokio::test(flavor = "multi_thread")]
@@ -330,7 +425,7 @@ mod tests {
             .await
             .expect("a missing server is reported");
         assert!(failure.contains(&url), "{failure}");
-        assert!(failure.contains("never answered"), "{failure}");
+        assert!(failure.contains("not detected"), "{failure}");
 
         let sources = sources(&path);
         assert_eq!(sources.keys().collect::<Vec<_>>(), [LLM_PERF_SOURCE]);
@@ -352,5 +447,62 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let mc = mc(&dir.path().join("run.parquet"), None);
         assert!(RunRecorder::start(&mc).await.unwrap().is_none());
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn another_llm_perf_streamed_as_the_server_stays_a_separate_recording() {
+        let port = std::net::TcpListener::bind("127.0.0.1:0")
+            .unwrap()
+            .local_addr()
+            .unwrap()
+            .port();
+        let addr: std::net::SocketAddr = ([127, 0, 0, 1], port).into();
+        tokio::spawn(crate::admin::start_server(addr));
+        for _ in 0..50 {
+            if tokio::net::TcpStream::connect(addr).await.is_ok() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("run.dendro");
+
+        let failure = record_for(
+            &mc(&path, Some(format!("http://{addr}/"))),
+            Duration::from_millis(600),
+        )
+        .await;
+        assert_eq!(failure, None);
+
+        // Both name themselves llm-perf; the role tells them apart.
+        let sets = label_sets(&path);
+        let ours = labels(&[("role", ROLE_LOADGEN), ("source", LLM_PERF_SOURCE)]);
+        assert!(sets.contains(&ours), "{sets:?}");
+        assert_eq!(sets.len(), 2, "{sets:?}");
+        let server = sets.iter().find(|l| **l != ours).unwrap();
+        assert_eq!(
+            server.get("source").map(String::as_str),
+            Some(LLM_PERF_SOURCE)
+        );
+        assert_eq!(server.get("role").map(String::as_str), Some(ROLE_SERVICE));
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_server_answering_404_is_reported_with_the_status() {
+        let mut server = mockito::Server::new_async().await;
+        let _m = server
+            .mock("GET", "/wrong")
+            .with_status(404)
+            .create_async()
+            .await;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("run.dendro");
+        let url = format!("{}/wrong", server.url());
+
+        let failure = record_for(&mc(&path, Some(url.clone())), Duration::from_millis(300))
+            .await
+            .expect("a 404 is reported");
+        assert!(failure.contains(&url), "{failure}");
+        assert!(failure.contains("404"), "{failure}");
     }
 }

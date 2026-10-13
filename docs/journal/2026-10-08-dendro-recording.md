@@ -267,8 +267,15 @@ step 5 for path step 4 (`metriken-recorder`), and step 6 for path step 5
   on the stream; and `server_metrics_url`, when set, through
   `metriken_recorder::detect` with `NoProbe` (a `/metrics` URL is scraped as
   `prometheus/scrape`; a base URL or `/metrics/stream` URL is asked for its
-  stream first). The server is not given a `source` label, so the recorder
-  names it from host and port, as rezolus did.
+  stream first). Both carry a `role` label, `loadgen` for llm-perf and
+  `service` for the server. The server's `source` is the caller's label (none
+  here), else the handshake's, else one made from host and port
+  (metriken-recorder's order): a scraped server is named `127.0.0.1-18085`,
+  a streamed rezolus agent `rezolus`, and a streamed llm-perf `llm-perf`,
+  which without `role` would have the same label set as llm-perf's own
+  recording (found in review; the test
+  `another_llm_perf_streamed_as_the_server_stays_a_separate_recording`
+  streams the admin server's route as the server).
 - Where the archive goes (`MetricsConfig::recording_path`): `[metrics]
   output` when it ends in `.dendro` (then no parquet is written and the
   snapshot task does not run); otherwise, with `server_metrics_url` set,
@@ -284,25 +291,46 @@ step 5 for path step 4 (`metriken-recorder`), and step 6 for path step 5
   external recorders.
 - Finish: `Stop::AfterExit` stamped when the benchmark ends, with a bound of
   one interval plus the recorder's timeout (`default_timeout`: 2 s at a 1 s
-  interval). A recording error, a server that never answered or was refused
-  (no passes), or a discarded archive becomes the console summary's warning
-  line (`ReportBuilder::recording_failure`, renamed from
-  `server_metrics_failure`). An archive that already exists fails
-  `RunRecorder::start`, and the run, before the load starts.
+  interval, 10 s at the default `1m`, so up to 70 s for a streamed server;
+  an info line says so when a source is streamed). The archive is finalized
+  when the benchmark returns an error too, and on Ctrl-C: with a recording,
+  the run is raced against `tokio::signal::ctrl_c()`, the first Ctrl-C ends
+  it with an `interrupted` error after finalizing, and a second exits with
+  130. Before, Ctrl-C reached the `rezolus record` child, which finalized;
+  without the handler the in-process archive would be left unfinalized
+  (found in review). A recording error, a server never recorded (with the
+  last reason from detection or a `Pending`/`Refused` event, so a 404 reads
+  `not detected: ... 404 ...` rather than "never answered"), or a discarded
+  archive becomes the console summary's warning line
+  (`ReportBuilder::recording_failure`, renamed from `server_metrics_failure`).
+- An archive that already exists is refused by
+  `MetricsConfig::check_archive_absent` in `run_benchmark`, before
+  `BenchmarkRunner::new` loads the tokenizer and dataset; `RunRecorder::start`
+  runs before the stats and snapshot tasks are spawned. A
+  `server_metrics_output` with no `server_metrics_url` is not checked, so an
+  older config with a parquet one still loads.
 - Crypto: metriken-recorder's client is reqwest 0.13 (llm-perf's own client
   stays on 0.12), built with `rustls-no-provider`; `RunRecorder::start`
   installs rustls's ring provider, which reqwest 0.12's `rustls-tls` already
   pulled in. The build still holds one `metriken-core`.
 - Tests (`recording::tests`): a mockito Prometheus server and the registry
-  into one archive (two sources, `llm-perf/main` and `prometheus/scrape`); no
-  server URL (llm-perf alone); a port with nothing listening (the failure
-  names the URL and "never answered", llm-perf's rows kept); an existing file
-  refused and left as it was; a parquet output with no server records nothing.
-  Config tests cover each path and refusal. Seen red: the server spec not
-  passed to `detect`, the missing-server report removed, and the
+  into one archive (two sources, `llm-perf/main` and `prometheus/scrape`,
+  the server `role=service`); another llm-perf's stream (the admin route) as
+  the server, kept as a second recording by `role`; no server URL (llm-perf
+  alone); a port with nothing listening and a URL answering 404 (the failure
+  names the URL and the reason, llm-perf's rows kept); an existing file
+  refused and left as it was; a parquet output with no server records
+  nothing. Config tests cover each path and refusal. Seen red: the server
+  spec not passed to `detect`, the missing-server report removed, and the
   `.dendro`-extension check removed. In the full suite, other tests write the
   histogram groups, so `llm-perf/main/occupants` is present too; the test
   checks that `llm-perf/main` is among the tables rather than the whole list.
+- Manual checks of the review fixes, against the mock: SIGINT 6 s into a
+  60 s run logged the interrupt, finalized `int.dendro` (6 rows per
+  recording, no `-wal`), and exited 1 with `Error: interrupted`; rerunning
+  the same config exited 1 with `already exists` before the tokenizer
+  loaded. Not covered by a test: the wiring in `benchmark.rs` (the snapshot
+  task skipped for a `.dendro` output, `finish` on the error path).
 - GO check, on macOS, against the step-4 mock (`mockllm.py`, 8 concurrent
   requests, `[metrics] interval = "1s"`, no `[admin]`), read with rezolus
   6.0.0-alpha.53 (upstream main 8b20dc17):
