@@ -292,13 +292,22 @@ step 5 for path step 4 (`metriken-recorder`), and step 6 for path step 5
 - Finish: `Stop::AfterExit` stamped when the benchmark ends, with a bound of
   one interval plus the recorder's timeout (`default_timeout`: 2 s at a 1 s
   interval, 10 s at the default `1m`, so up to 70 s for a streamed server;
-  an info line says so when a source is streamed). The archive is finalized
-  when the benchmark returns an error too, and on Ctrl-C: with a recording,
-  the run is raced against `tokio::signal::ctrl_c()`, the first Ctrl-C ends
-  it with an `interrupted` error after finalizing, and a second exits with
-  130. Before, Ctrl-C reached the `rezolus record` child, which finalized;
-  without the handler the in-process archive would be left unfinalized
-  (found in review). A recording error, a server never recorded (with the
+  an info line says so when a source is streamed). A run that fails is
+  finished with `Stop::Now`, since its workers may still be sending load.
+  Signals (second review): `RunRecorder::start` registers SIGINT and SIGTERM
+  (tokio `signal::unix`, registered before the watcher task starts) and
+  spawns `watch_signals`, which shares the recorder with `finish` through a
+  `Mutex<Option<Live>>`. A signal during the run takes the recorder,
+  finalizes with `Stop::Now` and exits 130 or 143 without waiting for the
+  benchmark, whose spawned workers do not check `RUNNING`; dropping the run
+  future (the first fix, `tokio::select!` against `ctrl_c()`) stopped
+  awaiting them without stopping them, and left SIGINT ignored after a
+  normal finish, since tokio never removes a handler. A signal during
+  `finish`'s wait cancels the token `Recorder::finish` takes, which ends the
+  wait; one after `finish` returned exits at once. The outcome goes to stderr
+  before `exit`, which skips the non-blocking log writer's flush. Before this
+  branch, Ctrl-C reached the `rezolus record` child, which finalized.
+  A recording error, a server never recorded (with the
   last reason from detection or a `Pending`/`Refused` event, so a 404 reads
   `not detected: ... 404 ...` rather than "never answered"), or a discarded
   archive becomes the console summary's warning line
@@ -325,12 +334,20 @@ step 5 for path step 4 (`metriken-recorder`), and step 6 for path step 5
   `.dendro`-extension check removed. In the full suite, other tests write the
   histogram groups, so `llm-perf/main/occupants` is present too; the test
   checks that `llm-perf/main` is among the tables rather than the whole list.
-- Manual checks of the review fixes, against the mock: SIGINT 6 s into a
-  60 s run logged the interrupt, finalized `int.dendro` (6 rows per
-  recording, no `-wal`), and exited 1 with `Error: interrupted`; rerunning
-  the same config exited 1 with `already exists` before the tokenizer
-  loaded. Not covered by a test: the wiring in `benchmark.rs` (the snapshot
-  task skipped for a `.dendro` output, `finish` on the error path).
+- Manual checks of the review fixes, against the mock: SIGINT 4 s into a
+  60 s run exited 130 within 0.1 s and printed `llm-perf: interrupted;
+  finalized ...`; SIGTERM 6 s in exited 143 within 0.05 s; both archives
+  held both recordings and no `-wal`. With another llm-perf's admin route as
+  a streamed server at a 10 s interval and a 5 s run, SIGINT 1 s into the
+  20 s final wait ended it and the run exited 0, with the summary warning
+  that the server had no rows (no frame had arrived at that interval).
+  Rerunning a config whose archive exists exited 1 with `already exists`
+  before the tokenizer loaded. Not covered by a test: the wiring in
+  `benchmark.rs` (the snapshot task skipped for a `.dendro` output, `finish`
+  on the error path) and the signal paths.
+- `rezolus recording metadata` names both recordings of that last archive
+  `llm-perf`; `--recording source=llm-perf` matches both, `role=loadgen` or
+  `role=service` one.
 - GO check, on macOS, against the step-4 mock (`mockllm.py`, 8 concurrent
   requests, `[metrics] interval = "1s"`, no `[admin]`), read with rezolus
   6.0.0-alpha.53 (upstream main 8b20dc17):

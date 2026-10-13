@@ -852,30 +852,14 @@ impl BenchmarkRunner {
                 Ok((d, None))
             }
         };
-        // With a recording, the first Ctrl-C ends the run and finalizes the
-        // archive; a second one exits at once.
-        let outcome: Result<_> = if recorder.is_some() {
-            tokio::select! {
-                outcome = run => outcome,
-                _ = tokio::signal::ctrl_c() => {
-                    tokio::spawn(async {
-                        let _ = tokio::signal::ctrl_c().await;
-                        std::process::exit(130);
-                    });
-                    log::warn!("interrupted; finalizing the recording (Ctrl-C again to exit now)");
-                    Err(anyhow::anyhow!("interrupted"))
-                }
-            }
-        } else {
-            run.await
-        };
+        let outcome: Result<_> = run.await;
 
         // Stop metrics capture
         crate::metrics::RUNNING.store(false, std::sync::atomic::Ordering::Relaxed);
 
-        // Finalize the run's archive, on an error or interrupt too.
+        // Finalize the run's archive, on an error too.
         let recording_failure = match recorder {
-            Some(rec) => rec.finish().await,
+            Some(rec) => rec.finish(outcome.is_ok()).await,
             None => None,
         };
         let (test_duration, sat_results) = outcome?;

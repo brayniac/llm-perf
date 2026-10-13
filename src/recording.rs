@@ -14,6 +14,8 @@
 //! server names itself `llm-perf` too (another llm-perf's stream does).
 
 use std::collections::{BTreeMap, HashMap};
+use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
@@ -49,12 +51,37 @@ struct Seen {
     streamed: bool,
 }
 
-/// A recording in progress.
-pub struct RunRecorder {
+/// The recorder and its event logger, taken by whichever of
+/// [`RunRecorder::finish`] and the signal watcher gets there first.
+struct Live {
     recorder: Recorder,
     events: JoinHandle<()>,
+}
+
+/// What [`RunRecorder::finish`] and the signal watcher share.
+struct Shared {
+    live: Mutex<Option<Live>>,
+    /// Cancelled by a signal while `finish` waits for a streamed server's
+    /// last frame: the wait ends and the archive is finalized.
+    cancel: CancellationToken,
+    /// `finish` has returned; a signal now exits at once.
+    finished: AtomicBool,
     seen: Arc<Mutex<Seen>>,
-    path: std::path::PathBuf,
+    path: PathBuf,
+}
+
+/// A recording in progress.
+///
+/// From [`RunRecorder::start`] on, SIGINT and SIGTERM (Ctrl-C elsewhere)
+/// finalize the archive and exit with 130 or 143, without waiting for the
+/// benchmark: a pass of llm-perf and of a scraped server, no wait for a
+/// streamed one. A second signal during that exits at once. A signal while
+/// `finish` waits for a streamed server's last frame ends the wait, and one
+/// after `finish` returned exits at once. The handlers stay installed for the
+/// rest of the process (tokio never removes them), which is why the watcher
+/// keeps running after `finish`.
+pub struct RunRecorder {
+    shared: Arc<Shared>,
     bound: Duration,
 }
 
@@ -113,12 +140,9 @@ impl RunRecorder {
                     );
                     seen.reasons.insert(SourceId(i as u32), reason.clone());
                 }
-                Detected::Pending { spec, reason } => {
-                    log::warn!(
-                        "the server under test at {} is not recorded yet ({reason}); it is \
-                         detected again each interval",
-                        spec.url
-                    );
+                // The recorder reports a pending endpoint as an event too,
+                // which `log_events` logs.
+                Detected::Pending { reason, .. } => {
                     seen.reasons.insert(SourceId(i as u32), reason.clone());
                 }
                 Detected::Streamed { .. } | Detected::Scraped { .. } => {}
@@ -148,52 +172,170 @@ impl RunRecorder {
             log::info!("recording llm-perf into {path:?}");
         }
         let seen = Arc::new(Mutex::new(seen));
-        Ok(Some(Self {
-            recorder,
-            events: tokio::spawn(log_events(rx, Arc::clone(&seen))),
+        let events = tokio::spawn(log_events(rx, Arc::clone(&seen)));
+        let shared = Arc::new(Shared {
+            live: Mutex::new(Some(Live { recorder, events })),
+            cancel: CancellationToken::new(),
+            finished: AtomicBool::new(false),
             seen,
             path,
+        });
+        match Signals::new() {
+            Ok(signals) => {
+                tokio::spawn(watch_signals(signals, Arc::clone(&shared)));
+            }
+            Err(e) => log::warn!(
+                "cannot watch for SIGINT/SIGTERM ({e}); an interrupted run leaves {:?} \
+                 unfinalized",
+                shared.path
+            ),
+        }
+        Ok(Some(Self {
+            shared,
             bound: interval + timeout,
         }))
     }
 
-    /// End the recording now: one more pass of llm-perf and a scraped
-    /// server, a wait of up to one interval plus the timeout for a streamed
-    /// server's next frame, then finalize. Returns what went wrong, for the
-    /// benchmark summary; it is also logged.
-    pub async fn finish(self) -> Option<String> {
-        let wall_ns = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .map(|d| d.as_nanos() as u64)
-            .unwrap_or_default();
-        if self.seen.lock().map(|s| s.streamed).unwrap_or(false) {
-            log::info!(
-                "finalizing {:?}: waiting up to {:?} for the server under test's last frame",
-                self.path,
-                self.bound
-            );
-        }
-        let stop = Stop::AfterExit {
-            wall_ns,
-            bound: self.bound,
+    /// End the recording. After a run that `completed`: one more pass of
+    /// llm-perf and a scraped server, a wait of up to one interval plus the
+    /// timeout for a streamed server's next frame, then finalize. After a run
+    /// that failed, no wait, since the benchmark's workers may still be
+    /// sending load. Returns what went wrong, for the benchmark summary; it
+    /// is also logged.
+    pub async fn finish(self, completed: bool) -> Option<String> {
+        let live = self
+            .shared
+            .live
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .take();
+        let Some(live) = live else {
+            // A signal took the recorder; the watcher finalizes and exits.
+            return std::future::pending().await;
         };
-        let result = self.recorder.finish(stop, CancellationToken::new()).await;
-        let _ = self.events.await;
-        let failure = match result {
-            Ok(summary) => {
-                let seen = self.seen.lock().unwrap_or_else(|e| e.into_inner());
-                summary_failure(&summary, &seen.reasons, &self.path)
+        let stop = if completed {
+            if self.shared.seen.lock().map(|s| s.streamed).unwrap_or(false) {
+                log::info!(
+                    "finalizing {:?}: waiting up to {:?} for the server under test's last \
+                     frame (Ctrl-C ends the wait)",
+                    self.shared.path,
+                    self.bound
+                );
             }
-            Err(e) => Some(format!(
-                "recording {:?} failed: {e}; it holds the ticks committed before the failure",
-                self.path
-            )),
+            Stop::AfterExit {
+                wall_ns: wall_now_ns(),
+                bound: self.bound,
+            }
+        } else {
+            Stop::Now
         };
-        match &failure {
-            Some(failure) => log::error!("{failure}"),
-            None => log::info!("finished recording {:?}", self.path),
-        }
+        let failure = finalize(live, stop, self.shared.cancel.clone(), &self.shared).await;
+        self.shared.finished.store(true, Ordering::SeqCst);
         failure
+    }
+}
+
+fn wall_now_ns() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_nanos() as u64)
+        .unwrap_or_default()
+}
+
+/// Finish the recorder, wait for its event logger, and say what went wrong.
+async fn finalize(
+    live: Live,
+    stop: Stop,
+    cancel: CancellationToken,
+    shared: &Shared,
+) -> Option<String> {
+    let path = &shared.path;
+    let result = live.recorder.finish(stop, cancel).await;
+    let _ = live.events.await;
+    let failure = match result {
+        Ok(summary) => {
+            let seen = shared.seen.lock().unwrap_or_else(|e| e.into_inner());
+            summary_failure(&summary, &seen.reasons, path)
+        }
+        Err(e) => Some(format!(
+            "recording {path:?} failed: {e}; it holds the ticks committed before the failure"
+        )),
+    };
+    match &failure {
+        Some(failure) => log::error!("{failure}"),
+        None => log::info!("finished recording {path:?}"),
+    }
+    failure
+}
+
+/// SIGINT and SIGTERM, registered before the watcher starts so none is
+/// missed in between.
+struct Signals {
+    #[cfg(unix)]
+    interrupt: tokio::signal::unix::Signal,
+    #[cfg(unix)]
+    terminate: tokio::signal::unix::Signal,
+}
+
+impl Signals {
+    #[cfg(unix)]
+    fn new() -> std::io::Result<Self> {
+        use tokio::signal::unix::{SignalKind, signal};
+        Ok(Self {
+            interrupt: signal(SignalKind::interrupt())?,
+            terminate: signal(SignalKind::terminate())?,
+        })
+    }
+
+    #[cfg(not(unix))]
+    fn new() -> std::io::Result<Self> {
+        Ok(Self {})
+    }
+
+    /// The next signal, as the exit status a shell gives it.
+    #[cfg(unix)]
+    async fn next(&mut self) -> i32 {
+        tokio::select! {
+            _ = self.interrupt.recv() => 130,
+            _ = self.terminate.recv() => 143,
+        }
+    }
+
+    #[cfg(not(unix))]
+    async fn next(&mut self) -> i32 {
+        let _ = tokio::signal::ctrl_c().await;
+        130
+    }
+}
+
+async fn watch_signals(mut signals: Signals, shared: Arc<Shared>) {
+    loop {
+        let code = signals.next().await;
+        let live = shared.live.lock().unwrap_or_else(|e| e.into_inner()).take();
+        if let Some(live) = live {
+            log::warn!(
+                "interrupted; finalizing {:?} (again to exit now)",
+                shared.path
+            );
+            let cancel = CancellationToken::new();
+            // The log writer is not flushed by `exit`, so the outcome also
+            // goes to stderr.
+            tokio::select! {
+                failure = finalize(live, Stop::Now, cancel, &shared) => match failure {
+                    Some(failure) => eprintln!("llm-perf: interrupted; {failure}"),
+                    None => eprintln!("llm-perf: interrupted; finalized {:?}", shared.path),
+                },
+                _ = signals.next() => {
+                    eprintln!("llm-perf: interrupted again; {:?} is not finalized", shared.path)
+                }
+            }
+            std::process::exit(code);
+        }
+        if shared.finished.load(Ordering::SeqCst) || shared.cancel.is_cancelled() {
+            std::process::exit(code);
+        }
+        log::warn!("interrupted; ending the wait and finalizing (again to exit now)");
+        shared.cancel.cancel();
     }
 }
 
@@ -202,7 +344,7 @@ impl RunRecorder {
 fn summary_failure(
     summary: &Summary,
     reasons: &HashMap<SourceId, String>,
-    path: &std::path::Path,
+    path: &Path,
 ) -> Option<String> {
     if summary.discarded {
         return Some(format!(
@@ -349,7 +491,7 @@ mod tests {
             .increment(1_000_000)
             .unwrap();
         tokio::time::sleep(run).await;
-        recorder.finish().await
+        recorder.finish(true).await
     }
 
     #[tokio::test(flavor = "multi_thread")]

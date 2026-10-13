@@ -416,10 +416,23 @@ must not be set when `output` is the archive. The archive must not exist yet:
 llm-perf refuses to start rather than overwrite one. `rezolus_bin` is ignored
 and logs a warning.
 
-The run ends the recording with one more pass of llm-perf and a scraped
-server, and waits up to one interval plus the scrape timeout for a streamed
-server's last frame. Ctrl-C during a recorded run ends the run and finalizes
-the archive (no report or parquet is written); a second Ctrl-C exits at once.
+A run that completes ends the recording with one more pass of llm-perf and
+a scraped server, and waits up to one interval plus the scrape timeout for a
+streamed server's last frame. A run that fails ends it without the wait.
+
+SIGINT (Ctrl-C) or SIGTERM during a recorded run finalizes the archive with
+a last pass of llm-perf and a scraped server, prints the outcome to stderr,
+and exits with 130 or 143; no report or parquet is written. A second signal
+while it finalizes exits at once and leaves the archive unfinalized. A signal
+while a completed run waits for a streamed server's last frame ends the wait,
+and the run finishes normally. A signal before the recording has started (while
+the server under test is detected) kills llm-perf as before and can leave the
+archive file behind; the next run refuses it until it is removed.
+
+To pick llm-perf's own recording out of the archive, select `role=loadgen`
+(for example `rezolus mcp query run.dendro ... --recording role=loadgen`):
+when the server under test is another llm-perf, `source=llm-perf` matches
+both.
 
 ### Input Format
 
