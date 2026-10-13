@@ -421,13 +421,14 @@ a scraped server, and waits up to one interval plus the scrape timeout for a
 streamed server's last frame. A run that fails ends it without the wait.
 
 SIGINT (Ctrl-C) or SIGTERM during a recorded run finalizes the archive with
-a last pass of llm-perf and a scraped server, prints the outcome to stderr,
-and exits with 130 or 143; no report or parquet is written. A second signal
-while it finalizes exits at once and leaves the archive unfinalized. A signal
-while a completed run waits for a streamed server's last frame ends the wait,
-and the run finishes normally. A signal before the recording has started (while
-the server under test is detected) kills llm-perf as before and can leave the
-archive file behind; the next run refuses it until it is removed.
+a last pass of llm-perf and a scraped server (no wait for a streamed one),
+prints the outcome to stderr, and then llm-perf dies by that signal, so a
+shell loop stops and the exit status is 130 or 143; no report or parquet is
+written. A second signal while it finalizes kills it at once and leaves the
+archive unfinalized. A signal after the run, while the archive is finalized,
+ends the wait for a streamed server's last frame, and llm-perf dies by the
+signal once the archive is finalized. The handlers are installed before the
+server under test is detected.
 
 To pick llm-perf's own recording out of the archive, select `role=loadgen`
 (for example `rezolus mcp query run.dendro ... --recording role=loadgen`):

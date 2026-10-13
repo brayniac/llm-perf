@@ -15,7 +15,6 @@
 
 use std::collections::{BTreeMap, HashMap};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
@@ -64,22 +63,24 @@ struct Shared {
     /// Cancelled by a signal while `finish` waits for a streamed server's
     /// last frame: the wait ends and the archive is finalized.
     cancel: CancellationToken,
-    /// `finish` has returned; a signal now exits at once.
-    finished: AtomicBool,
+    /// Cancelled once `finish` has finalized the archive.
+    finished: CancellationToken,
     seen: Arc<Mutex<Seen>>,
     path: PathBuf,
 }
 
 /// A recording in progress.
 ///
-/// From [`RunRecorder::start`] on, SIGINT and SIGTERM (Ctrl-C elsewhere)
-/// finalize the archive and exit with 130 or 143, without waiting for the
-/// benchmark: a pass of llm-perf and of a scraped server, no wait for a
-/// streamed one. A second signal during that exits at once. A signal while
-/// `finish` waits for a streamed server's last frame ends the wait, and one
-/// after `finish` returned exits at once. The handlers stay installed for the
-/// rest of the process (tokio never removes them), which is why the watcher
-/// keeps running after `finish`.
+/// From [`RunRecorder::start`] on, a SIGINT or SIGTERM (Ctrl-C elsewhere)
+/// finalizes the archive without waiting for the benchmark: a last pass of
+/// llm-perf and of a scraped server, no wait for a streamed one. Then
+/// llm-perf dies by that signal, with the default action restored, so a
+/// shell loop or an orchestrator sees it killed rather than exited. A second
+/// signal while it finalizes kills it at once. A signal while `finish` runs
+/// ends its wait for a streamed server's last frame, and llm-perf dies by
+/// the signal once `finish` has finalized. The handlers are installed before
+/// the server under test is detected, and tokio never removes them, which is
+/// why the watcher keeps running after `finish`.
 pub struct RunRecorder {
     shared: Arc<Shared>,
     bound: Duration,
@@ -100,6 +101,10 @@ impl RunRecorder {
             );
         }
         let interval = mc.interval()?;
+        // Before detection and the archive's creation, so a signal from here
+        // on is handled; one that arrives before the watcher runs is
+        // delivered to it then.
+        let signals = Signals::new();
         let mut cfg = RecorderConfig::new(&path, interval);
         let timeout = cfg.timeout;
         cfg.events = 256;
@@ -176,11 +181,11 @@ impl RunRecorder {
         let shared = Arc::new(Shared {
             live: Mutex::new(Some(Live { recorder, events })),
             cancel: CancellationToken::new(),
-            finished: AtomicBool::new(false),
+            finished: CancellationToken::new(),
             seen,
             path,
         });
-        match Signals::new() {
+        match signals {
             Ok(signals) => {
                 tokio::spawn(watch_signals(signals, Arc::clone(&shared)));
             }
@@ -227,11 +232,20 @@ impl RunRecorder {
                 bound: self.bound,
             }
         } else {
-            Stop::Now
+            last_pass()
         };
         let failure = finalize(live, stop, self.shared.cancel.clone(), &self.shared).await;
-        self.shared.finished.store(true, Ordering::SeqCst);
+        self.shared.finished.cancel();
         failure
+    }
+}
+
+/// One more pass of llm-perf and a scraped server, stamped now, and no wait
+/// for a streamed server.
+fn last_pass() -> Stop {
+    Stop::AfterExit {
+        wall_ns: wall_now_ns(),
+        bound: Duration::ZERO,
     }
 }
 
@@ -277,6 +291,10 @@ struct Signals {
     terminate: tokio::signal::unix::Signal,
 }
 
+/// A signal received: its number, for re-raising it.
+#[derive(Clone, Copy)]
+struct Received(i32);
+
 impl Signals {
     #[cfg(unix)]
     fn new() -> std::io::Result<Self> {
@@ -292,50 +310,77 @@ impl Signals {
         Ok(Self {})
     }
 
-    /// The next signal, as the exit status a shell gives it.
     #[cfg(unix)]
-    async fn next(&mut self) -> i32 {
+    async fn next(&mut self) -> Received {
         tokio::select! {
-            _ = self.interrupt.recv() => 130,
-            _ = self.terminate.recv() => 143,
+            _ = self.interrupt.recv() => Received(libc::SIGINT),
+            _ = self.terminate.recv() => Received(libc::SIGTERM),
         }
     }
 
     #[cfg(not(unix))]
-    async fn next(&mut self) -> i32 {
+    async fn next(&mut self) -> Received {
         let _ = tokio::signal::ctrl_c().await;
-        130
+        Received(2)
     }
 }
 
+/// Die by `sig`: restore its default action and raise it, so the parent sees
+/// the process killed by it (a shell loop stops, `$?` is 128 + sig). `exit`
+/// with that status is the fallback.
+fn die_by(sig: Received) -> ! {
+    #[cfg(unix)]
+    // SAFETY: resetting a signal to its default action and raising it in this
+    // process are async-signal-safe libc calls with valid arguments.
+    unsafe {
+        libc::signal(sig.0, libc::SIG_DFL);
+        libc::raise(sig.0);
+    }
+    std::process::exit(128 + sig.0)
+}
+
 async fn watch_signals(mut signals: Signals, shared: Arc<Shared>) {
-    loop {
-        let code = signals.next().await;
-        let live = shared.live.lock().unwrap_or_else(|e| e.into_inner()).take();
-        if let Some(live) = live {
+    let sig = signals.next().await;
+    let live = shared.live.lock().unwrap_or_else(|e| e.into_inner()).take();
+    match live {
+        Some(live) => {
             log::warn!(
                 "interrupted; finalizing {:?} (again to exit now)",
                 shared.path
             );
-            let cancel = CancellationToken::new();
-            // The log writer is not flushed by `exit`, so the outcome also
-            // goes to stderr.
+            // The log writer is not flushed when the process dies, so the
+            // outcome also goes to stderr.
             tokio::select! {
-                failure = finalize(live, Stop::Now, cancel, &shared) => match failure {
-                    Some(failure) => eprintln!("llm-perf: interrupted; {failure}"),
-                    None => eprintln!("llm-perf: interrupted; finalized {:?}", shared.path),
-                },
-                _ = signals.next() => {
-                    eprintln!("llm-perf: interrupted again; {:?} is not finalized", shared.path)
+                failure = finalize(live, last_pass(), CancellationToken::new(), &shared) => {
+                    match failure {
+                        Some(failure) => eprintln!("llm-perf: interrupted; {failure}"),
+                        None => eprintln!("llm-perf: interrupted; finalized {:?}", shared.path),
+                    }
+                }
+                again = signals.next() => {
+                    eprintln!("llm-perf: interrupted again; {:?} is not finalized", shared.path);
+                    die_by(again);
                 }
             }
-            std::process::exit(code);
+            die_by(sig);
         }
-        if shared.finished.load(Ordering::SeqCst) || shared.cancel.is_cancelled() {
-            std::process::exit(code);
+        None => {
+            // `finish` has the recorder: end its wait for a streamed server,
+            // and die once it has finalized.
+            if !shared.finished.is_cancelled() {
+                log::warn!(
+                    "interrupted; finalizing {:?} (again to exit now)",
+                    shared.path
+                );
+                shared.cancel.cancel();
+                tokio::select! {
+                    _ = shared.finished.cancelled() => {}
+                    again = signals.next() => die_by(again),
+                }
+                eprintln!("llm-perf: interrupted; finalized {:?}", shared.path);
+            }
+            die_by(sig);
         }
-        log::warn!("interrupted; ending the wait and finalizing (again to exit now)");
-        shared.cancel.cancel();
     }
 }
 
