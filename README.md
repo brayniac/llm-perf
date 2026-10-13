@@ -425,10 +425,12 @@ a last pass of llm-perf and a scraped server (no wait for a streamed one),
 prints the outcome to stderr, and then llm-perf dies by that signal, so a
 shell loop stops and the exit status is 130 or 143; no report or parquet is
 written. A second signal while it finalizes kills it at once and leaves the
-archive unfinalized. A signal after the run, while the archive is finalized,
-ends the wait for a streamed server's last frame, and llm-perf dies by the
-signal once the archive is finalized. The handlers are installed before the
-server under test is detected.
+archive unfinalized. A signal after the run, while llm-perf waits for a
+streamed server's last frame, ends the wait; the archive is finalized and
+the report written, and then llm-perf dies by the signal. A signal while the
+server under test is detected, before the archive exists, kills llm-perf at
+once. A signal the parent set to be ignored (a background job in a script)
+stays ignored.
 
 To pick llm-perf's own recording out of the archive, select `role=loadgen`
 (for example `rezolus mcp query run.dendro ... --recording role=loadgen`):

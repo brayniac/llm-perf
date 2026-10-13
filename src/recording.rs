@@ -15,6 +15,7 @@
 
 use std::collections::{BTreeMap, HashMap};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicI32, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
@@ -104,7 +105,7 @@ impl RunRecorder {
         // Before detection and the archive's creation, so a signal from here
         // on is handled; one that arrives before the watcher runs is
         // delivered to it then.
-        let signals = Signals::new();
+        let mut signals = Signals::new();
         let mut cfg = RecorderConfig::new(&path, interval);
         let timeout = cfg.timeout;
         cfg.events = 256;
@@ -125,13 +126,16 @@ impl RunRecorder {
         let detected = if specs.is_empty() {
             Vec::new()
         } else {
-            metriken_recorder::detect(
-                &client,
-                &DetectConfig::new(interval, timeout),
-                specs,
-                &NoProbe,
-            )
-            .await
+            let detect_cfg = DetectConfig::new(interval, timeout);
+            let detect = metriken_recorder::detect(&client, &detect_cfg, specs, &NoProbe);
+            // No archive exists yet, so a signal here just ends llm-perf.
+            match signals.as_mut() {
+                Ok(signals) => tokio::select! {
+                    detected = detect => detected,
+                    sig = signals.next() => die_by(sig),
+                },
+                Err(_) => detect.await,
+            }
         };
         // Detection's reasons, keyed by position: endpoints are numbered first.
         let mut seen = Seen::default();
@@ -222,7 +226,7 @@ impl RunRecorder {
             if self.shared.seen.lock().map(|s| s.streamed).unwrap_or(false) {
                 log::info!(
                     "finalizing {:?}: waiting up to {:?} for the server under test's last \
-                     frame (Ctrl-C ends the wait)",
+                     frame (Ctrl-C ends the wait; the report is still written)",
                     self.shared.path,
                     self.bound
                 );
@@ -283,25 +287,37 @@ async fn finalize(
 }
 
 /// SIGINT and SIGTERM, registered before the watcher starts so none is
-/// missed in between.
+/// missed in between. A signal the process was started with set to ignore
+/// (a background job in a non-interactive shell) is left ignored.
 struct Signals {
     #[cfg(unix)]
-    interrupt: tokio::signal::unix::Signal,
+    interrupt: Option<tokio::signal::unix::Signal>,
     #[cfg(unix)]
-    terminate: tokio::signal::unix::Signal,
+    terminate: Option<tokio::signal::unix::Signal>,
 }
 
 /// A signal received: its number, for re-raising it.
 #[derive(Clone, Copy)]
 struct Received(i32);
 
+/// A signal received that `reraise_pending` re-raises once the report is
+/// written; 0 for none.
+static PENDING: AtomicI32 = AtomicI32::new(0);
+
 impl Signals {
     #[cfg(unix)]
     fn new() -> std::io::Result<Self> {
         use tokio::signal::unix::{SignalKind, signal};
+        let register = |sig: i32, kind: SignalKind| -> std::io::Result<_> {
+            if ignored(sig) {
+                Ok(None)
+            } else {
+                signal(kind).map(Some)
+            }
+        };
         Ok(Self {
-            interrupt: signal(SignalKind::interrupt())?,
-            terminate: signal(SignalKind::terminate())?,
+            interrupt: register(libc::SIGINT, SignalKind::interrupt())?,
+            terminate: register(libc::SIGTERM, SignalKind::terminate())?,
         })
     }
 
@@ -312,9 +328,17 @@ impl Signals {
 
     #[cfg(unix)]
     async fn next(&mut self) -> Received {
+        async fn recv(s: &mut Option<tokio::signal::unix::Signal>) {
+            match s {
+                Some(s) => {
+                    s.recv().await;
+                }
+                None => std::future::pending().await,
+            }
+        }
         tokio::select! {
-            _ = self.interrupt.recv() => Received(libc::SIGINT),
-            _ = self.terminate.recv() => Received(libc::SIGTERM),
+            _ = recv(&mut self.interrupt) => Received(libc::SIGINT),
+            _ = recv(&mut self.terminate) => Received(libc::SIGTERM),
         }
     }
 
@@ -325,13 +349,32 @@ impl Signals {
     }
 }
 
+/// Whether `sig`'s action is to ignore it.
+#[cfg(unix)]
+fn ignored(sig: i32) -> bool {
+    // SAFETY: a null new action only reads the current one into `old`.
+    unsafe {
+        let mut old: libc::sigaction = std::mem::zeroed();
+        libc::sigaction(sig, std::ptr::null(), &mut old) == 0 && old.sa_sigaction == libc::SIG_IGN
+    }
+}
+
+/// Die by a signal that arrived while `finish` ran, once the report is
+/// written: call after the benchmark returns, before propagating its result.
+pub fn reraise_pending() {
+    match PENDING.load(Ordering::SeqCst) {
+        0 => {}
+        sig => die_by(Received(sig)),
+    }
+}
+
 /// Die by `sig`: restore its default action and raise it, so the parent sees
 /// the process killed by it (a shell loop stops, `$?` is 128 + sig). `exit`
 /// with that status is the fallback.
 fn die_by(sig: Received) -> ! {
     #[cfg(unix)]
-    // SAFETY: resetting a signal to its default action and raising it in this
-    // process are async-signal-safe libc calls with valid arguments.
+    // SAFETY: called from a task, not a signal handler; resetting a signal
+    // to its default action and raising it take valid arguments.
     unsafe {
         libc::signal(sig.0, libc::SIG_DFL);
         libc::raise(sig.0);
@@ -365,21 +408,21 @@ async fn watch_signals(mut signals: Signals, shared: Arc<Shared>) {
             die_by(sig);
         }
         None => {
-            // `finish` has the recorder: end its wait for a streamed server,
-            // and die once it has finalized.
-            if !shared.finished.is_cancelled() {
-                log::warn!(
-                    "interrupted; finalizing {:?} (again to exit now)",
-                    shared.path
-                );
-                shared.cancel.cancel();
-                tokio::select! {
-                    _ = shared.finished.cancelled() => {}
-                    again = signals.next() => die_by(again),
-                }
-                eprintln!("llm-perf: interrupted; finalized {:?}", shared.path);
+            if shared.finished.is_cancelled() {
+                // The archive is finalized and the report is being written.
+                die_by(sig);
             }
-            die_by(sig);
+            // `finish` has the recorder: end its wait for a streamed server,
+            // let it finalize and the report be written, then die by the
+            // signal (`reraise_pending`).
+            PENDING.store(sig.0, Ordering::SeqCst);
+            log::warn!(
+                "interrupted; ending the wait and finalizing {:?}; llm-perf exits after the \
+                 report (again to exit now)",
+                shared.path
+            );
+            shared.cancel.cancel();
+            die_by(signals.next().await);
         }
     }
 }

@@ -164,7 +164,11 @@ async fn run_benchmark(config: Config) -> Result<()> {
     debug!("Initializing benchmark runner");
     let runner = llm_perf::BenchmarkRunner::new(config).await?;
     info!("Starting benchmark run");
-    runner.run().await?;
+    let result = runner.run().await;
+    // A signal while the recording was finalized: die by it now that the
+    // report is written.
+    llm_perf::recording::reraise_pending();
+    result?;
     info!("Benchmark completed successfully");
     Ok(())
 }

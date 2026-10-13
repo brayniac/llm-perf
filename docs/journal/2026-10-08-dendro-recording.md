@@ -293,7 +293,8 @@ step 5 for path step 4 (`metriken-recorder`), and step 6 for path step 5
   one interval plus the recorder's timeout (`default_timeout`: 2 s at a 1 s
   interval, 10 s at the default `1m`, so up to 70 s for a streamed server;
   an info line says so when a source is streamed). A run that fails is
-  finished with `Stop::Now`, since its workers may still be sending load.
+  finished with the no-wait last pass below, since its workers may still be
+  sending load.
   Signals: `RunRecorder::start` registers SIGINT and SIGTERM (tokio
   `signal::unix`) before detection, and spawns `watch_signals` once the
   recorder is up; it shares the recorder with `finish` through a
@@ -302,8 +303,12 @@ step 5 for path step 4 (`metriken-recorder`), and step 6 for path step 5
   a scraped server, no wait for a stream), and dies by the signal
   (`die_by`: `SIG_DFL`, then `raise`). A signal while `finish` holds the
   recorder cancels the token `Recorder::finish` takes, which ends the wait
-  for a streamed server, then dies once `finish` has finalized; one after
-  that dies at once. A second signal while finalizing dies at once. The
+  for a streamed server; the signal is kept in a static, and `main` re-raises
+  it (`reraise_pending`) after the report is written, also when the run
+  failed. One after `finish` has finalized dies at once. Detection races the
+  signals, so a signal before the archive exists ends llm-perf at once
+  rather than after the detect timeout. A signal whose action was `SIG_IGN`
+  at startup is not registered, so a background job keeps ignoring SIGINT. A second signal while finalizing dies at once. The
   outcome goes to stderr first, since dying skips the non-blocking log
   writer's flush. Three reviews shaped this: the first fix raced the run
   against `ctrl_c()` and dropped the run future, which left the benchmark's
@@ -313,8 +318,9 @@ step 5 for path step 4 (`metriken-recorder`), and step 6 for path step 5
   reviewer showed a bash loop then started its next run. Before this branch,
   Ctrl-C reached the `rezolus record` child, which finalized. A run that
   fails is finished with the same no-wait last pass, since its workers may
-  still be sending load. A signal during detection is delivered to the
-  watcher once it starts (from tokio's source, not run).
+  still be sending load. The fourth review found that a signal during the
+  final wait lost a completed run's report, and that a signal during
+  detection waited out the detect timeout (9.5 s with three signals).
   A recording error, a server never recorded (with the
   last reason from detection or a `Pending`/`Refused` event, so a 404 reads
   `not detected: ... 404 ...` rather than "never answered"), or a discarded
@@ -349,8 +355,11 @@ step 5 for path step 4 (`metriken-recorder`), and step 6 for path step 5
   recordings (the server's last scrape included). SIGTERM 4 s into a run:
   status 143 (`Terminated: 15`). With another llm-perf's admin route as a
   streamed server at a 10 s interval and a 5 s run, SIGINT 1 s into the 20 s
-  final wait ended it and llm-perf died by SIGINT 0.03 s later with the
-  archive finalized. Rerunning a config whose archive exists exited 1 with
+  final wait ended it; the archive was finalized, the JSON report written,
+  and llm-perf died by SIGINT. SIGINT 0.6 s into detecting a server that
+  accepts connections and never answers killed llm-perf 0.03 s later, with
+  no archive created. Under `trap '' INT`, SIGINT 2 s into a 5 s run was
+  ignored and the run finished with status 0. Rerunning a config whose archive exists exited 1 with
   `already exists` before the tokenizer loaded. Not covered by a test: the
   wiring in `benchmark.rs` (the snapshot task skipped for a `.dendro`
   output, `finish` on the error path) and the signal paths.
