@@ -743,6 +743,11 @@ impl BenchmarkRunner {
     /// - Report generation fails
     /// - File I/O errors occur (for JSON output)
     ///
+    /// When `[metrics]` names a `.dendro` archive, the run installs
+    /// process-wide SIGINT and SIGTERM handlers (`recording::RunRecorder`): a
+    /// signal finalizes the archive and kills the process by that signal,
+    /// after the report when it arrives while the archive is being finalized.
+    ///
     /// # Examples
     ///
     /// ```no_run
@@ -757,6 +762,14 @@ impl BenchmarkRunner {
     /// # }
     /// ```
     pub async fn run(&self) -> Result<()> {
+        let result = self.run_and_report().await;
+        // A signal while the recording was finalized: die by it now that the
+        // report is written (or the run has failed).
+        crate::recording::reraise_pending();
+        result
+    }
+
+    async fn run_and_report(&self) -> Result<()> {
         let report_builder = ReportBuilder::new()
             .with_config(self.config.clone())
             .with_tokenizer_info(self.tokenizer.source_label(), self.tokenizer.is_estimate());

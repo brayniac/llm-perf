@@ -303,22 +303,25 @@ step 5 for path step 4 (`metriken-recorder`), and step 6 for path step 5
   a scraped server, no wait for a stream), and dies by the signal
   (`die_by`: `SIG_DFL`, then `raise`). A signal while `finish` holds the
   recorder cancels the token `Recorder::finish` takes, which ends the wait
-  for a streamed server; the signal is kept in a static, and `main` re-raises
-  it (`reraise_pending`) after the report is written, also when the run
-  failed. One after `finish` has finalized dies at once. Detection races the
+  for a streamed server; the signal is kept in a static, and
+  `BenchmarkRunner::run` re-raises it (`reraise_pending`) after the report is
+  written, also when the run failed. The watcher decides between these
+  under the `live` mutex, and `finish` marks itself finalized under the same
+  mutex, so a signal cannot fall between the check and the store (found in
+  the fifth review, from the code). One after `finish` has finalized dies at once. Detection races the
   signals, so a signal before the archive exists ends llm-perf at once
   rather than after the detect timeout. A signal whose action was `SIG_IGN`
   at startup is not registered, so a background job keeps ignoring SIGINT. A second signal while finalizing dies at once. The
   outcome goes to stderr first, since dying skips the non-blocking log
-  writer's flush. Three reviews shaped this: the first fix raced the run
+  writer's flush. Five reviews shaped this: the first fix raced the run
   against `ctrl_c()` and dropped the run future, which left the benchmark's
   spawned workers sending load (they do not check `RUNNING`) and left SIGINT
   ignored after a normal finish, since tokio never removes a handler; the
   second exited with status 130 instead of dying by the signal, and a
   reviewer showed a bash loop then started its next run. Before this branch,
-  Ctrl-C reached the `rezolus record` child, which finalized. A run that
-  fails is finished with the same no-wait last pass, since its workers may
-  still be sending load. The fourth review found that a signal during the
+  Ctrl-C reached the `rezolus record` child, which finalized. The third
+  review found the interrupt path skipped the server's last scrape
+  (`Stop::Now` takes local passes only). The fourth review found that a signal during the
   final wait lost a completed run's report, and that a signal during
   detection waited out the detect timeout (9.5 s with three signals).
   A recording error, a server never recorded (with the

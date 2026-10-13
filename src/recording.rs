@@ -78,10 +78,14 @@ struct Shared {
 /// llm-perf dies by that signal, with the default action restored, so a
 /// shell loop or an orchestrator sees it killed rather than exited. A second
 /// signal while it finalizes kills it at once. A signal while `finish` runs
-/// ends its wait for a streamed server's last frame, and llm-perf dies by
-/// the signal once `finish` has finalized. The handlers are installed before
-/// the server under test is detected, and tokio never removes them, which is
-/// why the watcher keeps running after `finish`.
+/// (its last pass, or its wait for a streamed server's last frame, which the
+/// signal ends) lets it finalize, and llm-perf dies by the signal when
+/// [`reraise_pending`] is called, after the report is written
+/// (`BenchmarkRunner::run` calls it); a second signal kills it at once. A
+/// signal after `finish` has finalized kills it at once, with no report. The
+/// handlers are installed before the server under test is detected, and
+/// tokio never removes them, which is why the watcher keeps running after
+/// `finish`.
 pub struct RunRecorder {
     shared: Arc<Shared>,
     bound: Duration,
@@ -239,7 +243,12 @@ impl RunRecorder {
             last_pass()
         };
         let failure = finalize(live, stop, self.shared.cancel.clone(), &self.shared).await;
-        self.shared.finished.cancel();
+        // Under the same lock the watcher decides by, so a signal is either
+        // seen as arriving before this (and kept in PENDING) or after.
+        {
+            let _live = self.shared.live.lock().unwrap_or_else(|e| e.into_inner());
+            self.shared.finished.cancel();
+        }
         failure
     }
 }
@@ -384,7 +393,18 @@ fn die_by(sig: Received) -> ! {
 
 async fn watch_signals(mut signals: Signals, shared: Arc<Shared>) {
     let sig = signals.next().await;
-    let live = shared.live.lock().unwrap_or_else(|e| e.into_inner()).take();
+    // Decided under the lock `finish` cancels `finished` under: either the
+    // recorder is ours, or `finish` has it and has not finalized (the signal
+    // is kept in PENDING before `finish` can return), or it has finalized.
+    let (live, finished) = {
+        let mut guard = shared.live.lock().unwrap_or_else(|e| e.into_inner());
+        let live = guard.take();
+        let finished = shared.finished.is_cancelled();
+        if live.is_none() && !finished {
+            PENDING.store(sig.0, Ordering::SeqCst);
+        }
+        (live, finished)
+    };
     match live {
         Some(live) => {
             log::warn!(
@@ -408,14 +428,13 @@ async fn watch_signals(mut signals: Signals, shared: Arc<Shared>) {
             die_by(sig);
         }
         None => {
-            if shared.finished.is_cancelled() {
+            if finished {
                 // The archive is finalized and the report is being written.
                 die_by(sig);
             }
             // `finish` has the recorder: end its wait for a streamed server,
             // let it finalize and the report be written, then die by the
             // signal (`reraise_pending`).
-            PENDING.store(sig.0, Ordering::SeqCst);
             log::warn!(
                 "interrupted; ending the wait and finalizing {:?}; llm-perf exits after the \
                  report (again to exit now)",
