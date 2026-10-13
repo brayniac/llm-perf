@@ -1,7 +1,8 @@
 # Recording llm-perf and the server under test into one `.dendro`
 
 **Status:** OPEN. Plan opened 2026-10-08; steps 3 and 4 built 2026-10-11
-(branches `deps/metriken-0.11` and `feat/metrics-stream`, see "As built").
+(branches `deps/metriken-0.11` and `feat/metrics-stream`), step 5 built
+2026-10-13 (branch `feat/record-in-process`); see "As built".
 
 Related entries opened the same day: rezolus
 `docs/journal/2026-10-08-6-0-release-readiness.md`, metriken
@@ -254,3 +255,78 @@ step 5 for path step 4 (`metriken-recorder`), and step 6 for path step 5
   status: 1; ...`.
 - Not checked: `rezolus view` showing the llm-perf dashboard for the llm-perf
   recording of that archive (the first GO criterion's second half).
+
+### Step 5: recording in process (branch `feat/record-in-process`)
+
+- `src/recording.rs` (`RunRecorder`) replaces `src/server_metrics.rs`, which
+  ran `rezolus record` as a child process. It starts a `metriken_recorder::Recorder`
+  (metriken-recorder 0.1.1, features `http` and `registry`) with two kinds of
+  source: llm-perf's registry as a `RegistrySource` over
+  `GroupBuilder::new(DefaultRouter::new("llm-perf"))`, labels
+  `source=llm-perf`, metadata `version`, so its table is `llm-perf/main`, as
+  on the stream; and `server_metrics_url`, when set, through
+  `metriken_recorder::detect` with `NoProbe` (a `/metrics` URL is scraped as
+  `prometheus/scrape`; a base URL or `/metrics/stream` URL is asked for its
+  stream first). The server is not given a `source` label, so the recorder
+  names it from host and port, as rezolus did.
+- Where the archive goes (`MetricsConfig::recording_path`): `[metrics]
+  output` when it ends in `.dendro` (then no parquet is written and the
+  snapshot task does not run); otherwise, with `server_metrics_url` set,
+  `server_metrics_output`, defaulting to `<output-stem>.server.dendro`. Config
+  validation refuses a `server_metrics_output` that does not end in `.dendro`,
+  one set beside a `.dendro` `output`, a zero or unparseable interval, and a
+  `server_metrics_url` that is not `http` or `https`. `rezolus_bin` still
+  parses and logs a warning when set.
+- The admin server is no longer involved: llm-perf records its own registry
+  whether or not `[admin]` is enabled. The `rezolus --version` gate, the
+  loopback rewrite and the `record_args` builder are removed with the child
+  process. The admin server's `/metrics/stream` and `/metrics/binary` stay for
+  external recorders.
+- Finish: `Stop::AfterExit` stamped when the benchmark ends, with a bound of
+  one interval plus the recorder's timeout (`default_timeout`: 2 s at a 1 s
+  interval). A recording error, a server that never answered or was refused
+  (no passes), or a discarded archive becomes the console summary's warning
+  line (`ReportBuilder::recording_failure`, renamed from
+  `server_metrics_failure`). An archive that already exists fails
+  `RunRecorder::start`, and the run, before the load starts.
+- Crypto: metriken-recorder's client is reqwest 0.13 (llm-perf's own client
+  stays on 0.12), built with `rustls-no-provider`; `RunRecorder::start`
+  installs rustls's ring provider, which reqwest 0.12's `rustls-tls` already
+  pulled in. The build still holds one `metriken-core`.
+- Tests (`recording::tests`): a mockito Prometheus server and the registry
+  into one archive (two sources, `llm-perf/main` and `prometheus/scrape`); no
+  server URL (llm-perf alone); a port with nothing listening (the failure
+  names the URL and "never answered", llm-perf's rows kept); an existing file
+  refused and left as it was; a parquet output with no server records nothing.
+  Config tests cover each path and refusal. Seen red: the server spec not
+  passed to `detect`, the missing-server report removed, and the
+  `.dendro`-extension check removed. In the full suite, other tests write the
+  histogram groups, so `llm-perf/main/occupants` is present too; the test
+  checks that `llm-perf/main` is among the tables rather than the whole list.
+- GO check, on macOS, against the step-4 mock (`mockllm.py`, 8 concurrent
+  requests, `[metrics] interval = "1s"`, no `[admin]`), read with rezolus
+  6.0.0-alpha.53 (upstream main 8b20dc17):
+  - 15 s with `output = "solo.dendro"` and `server_metrics_url` at the
+    mock's `/metrics`: exit 0, no parquet, no `-wal`/`-shm` left by llm-perf.
+    `rezolus recording metadata` lists two recordings, `source=127.0.0.1-18085`
+    (`prometheus/scrape`, 16 rows) and `source=llm-perf` (`llm-perf/main`, 16
+    rows in 4 segments, plus `llm-perf/main/occupants`).
+  - 60 s with `output = "run.parquet"` and `server_metrics_output =
+    "run.dendro"`: both from the same run; 61 rows per recording in the
+    archive (425,984 bytes), 60 in the parquet (52,059 bytes). For `ttft`,
+    `ttft_content`, `itl`, `tpot` and `request_latency`,
+    `histogram_quantile(0.5, m)`, `histogram_quantile(0.99, m)` and
+    `histogram_count(m)` through `rezolus mcp query` (the archive with
+    `--recording source=llm-perf`) print the same first, last, min, max and
+    mean values for 14 of the 15 queries; the timestamps differ (the
+    archive's last row is the finish pass at 618.45 s, the parquet's the
+    1 s tick at 619.00 s). `histogram_quantile(0.99, itl)` differs in its
+    mean by 546 ns over 60 points, one 32,768 ns bucket at one point. Which
+    point was not checked; the different final stamp is the likely cause
+    and is inferred, not shown.
+  - `rezolus recording metadata` shows llm-perf's version as `agent rezolus
+    0.1.21-alpha.0`: rezolus labels any recording's `version` as a rezolus
+    agent's. That is rezolus's display, not this archive.
+- Not checked here: `rezolus view` showing the llm-perf dashboard for the
+  llm-perf recording. That is the metriken entry's path step 5 (templates in
+  the archive and the combined view), which step 6 here follows.

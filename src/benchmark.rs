@@ -810,8 +810,13 @@ impl BenchmarkRunner {
             None
         };
 
-        // Spawn snapshot task if metrics are configured
-        let snapshot_handle = if self.config.metrics.is_some() {
+        // Spawn the parquet snapshot task when [metrics] output is a parquet
+        let snapshot_handle = if self
+            .config
+            .metrics
+            .as_ref()
+            .is_some_and(|m| m.parquet_output().is_some())
+        {
             let config = self.config.clone();
             Some(tokio::spawn(async move {
                 if let Err(e) = crate::snapshot::capture_snapshots(config).await {
@@ -822,21 +827,9 @@ impl BenchmarkRunner {
             None
         };
 
-        // Launch `rezolus record` for server-side metrics if a URL is configured.
-        // The admin address lets a `.dendro` recording include llm-perf itself.
-        let admin = self
-            .config
-            .admin
-            .as_ref()
-            .filter(|a| a.enabled)
-            .and_then(|a| a.listen.parse().ok());
-        let server_recorder = match self
-            .config
-            .metrics
-            .as_ref()
-            .filter(|m| m.server_metrics_url.is_some())
-        {
-            Some(m) => crate::server_metrics::ServerMetricsRecorder::spawn(m, admin).await,
+        // Record llm-perf and the server under test into the run's archive.
+        let recorder = match self.config.metrics.as_ref() {
+            Some(m) => crate::recording::RunRecorder::start(m).await?,
             None => None,
         };
 
@@ -861,8 +854,8 @@ impl BenchmarkRunner {
         // Stop metrics capture
         crate::metrics::RUNNING.store(false, std::sync::atomic::Ordering::Relaxed);
 
-        // Stop the server-metrics recorder (SIGINT -> rezolus finalizes its output).
-        let server_metrics_failure = match server_recorder {
+        // Finalize the run's archive.
+        let recording_failure = match recorder {
             Some(rec) => rec.finish().await,
             None => None,
         };
@@ -881,7 +874,7 @@ impl BenchmarkRunner {
         // Generate report after all background tasks are done (use actual test duration)
         let mut report_builder = report_builder
             .with_duration(test_duration)
-            .with_server_metrics_failure(server_metrics_failure);
+            .with_recording_failure(recording_failure);
         if let Some(sat) = sat_results {
             report_builder = report_builder.with_saturation_results(sat);
         }
@@ -2031,7 +2024,7 @@ impl BenchmarkRunner {
                     // Writing to file - show brief summary to console
                     tokio::fs::write(file_path, json).await?;
                     if !self.config.output.quiet {
-                        self.print_brief_summary(&report, report_builder.server_metrics_failure())?;
+                        self.print_brief_summary(&report, report_builder.recording_failure())?;
                     }
                 } else {
                     // Writing JSON to stdout - this is for piping
@@ -2543,7 +2536,7 @@ impl BenchmarkRunner {
     fn print_brief_summary(
         &self,
         report: &crate::report::BenchmarkReport,
-        server_metrics_failure: Option<&str>,
+        recording_failure: Option<&str>,
     ) -> Result<()> {
         use chrono::Utc;
 
@@ -2602,7 +2595,7 @@ impl BenchmarkRunner {
             warn_if_eos_not_ignored(report, self.config.endpoint.max_tokens);
         }
         warn_if_ttft_fell_back(report);
-        if let Some(failure) = server_metrics_failure {
+        if let Some(failure) = recording_failure {
             println!("{} Warning: {}", timestamp, failure);
         }
 

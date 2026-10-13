@@ -459,7 +459,10 @@ pub enum OutputFormat {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct MetricsConfig {
-    /// File for parquet metrics output
+    /// Where llm-perf's metrics go. A path ending in `.dendro` is the run's
+    /// archive, recorded in process: llm-perf's registry and, with
+    /// `server_metrics_url`, the server under test. Any other path is a
+    /// parquet written at exit.
     pub output: PathBuf,
     /// The snapshot interval (e.g., "1s", "500ms")
     #[serde(default = "default_metrics_interval")]
@@ -467,25 +470,83 @@ pub struct MetricsConfig {
     /// Batch size for parquet files
     #[serde(skip_serializing_if = "Option::is_none")]
     pub batch_size: Option<usize>,
-    /// Prometheus /metrics URL of the server under test. None => feature off.
+    /// The server under test's metrics: a Prometheus `/metrics` URL, or the
+    /// base URL of a producer that serves `/metrics/stream`. None => not
+    /// recorded.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub server_metrics_url: Option<String>,
-    /// Output parquet for server metrics. Defaults to `<output-stem>.server.parquet`.
+    /// The archive for the server under test and llm-perf when `output` is a
+    /// parquet. Must end in `.dendro`. Defaults to
+    /// `<output-stem>.server.dendro`.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub server_metrics_output: Option<PathBuf>,
-    /// Binary to invoke for server-metrics capture. Default `"rezolus"`.
+    /// Ignored: the server under test is recorded in process, without a
+    /// rezolus binary. Accepted for one release so older configs load.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub rezolus_bin: Option<String>,
 }
 
+/// Whether `path` names a dendro archive. The extension must be exactly
+/// `dendro`, as rezolus matches it.
+pub fn is_dendro(path: &std::path::Path) -> bool {
+    path.extension().is_some_and(|ext| ext == "dendro")
+}
+
 impl MetricsConfig {
-    /// Resolved server-metrics parquet path: the explicit `server_metrics_output`,
-    /// else the client `output` with its extension replaced by `.server.parquet`.
-    pub fn resolved_server_output(&self) -> std::path::PathBuf {
-        if let Some(p) = &self.server_metrics_output {
-            return p.clone();
+    /// The parquet llm-perf writes its own metrics to at exit, or `None` when
+    /// `output` is the run's archive.
+    pub fn parquet_output(&self) -> Option<&std::path::Path> {
+        (!is_dendro(&self.output)).then_some(self.output.as_path())
+    }
+
+    /// The run's archive, or `None` when nothing is recorded into one:
+    /// `output` when it ends in `.dendro`; otherwise, when
+    /// `server_metrics_url` is set, `server_metrics_output`, or the client
+    /// `output` with its extension replaced by `.server.dendro`.
+    pub fn recording_path(&self) -> Option<PathBuf> {
+        if is_dendro(&self.output) {
+            return Some(self.output.clone());
         }
-        self.output.with_extension("server.parquet")
+        self.server_metrics_url.as_ref()?;
+        if let Some(p) = &self.server_metrics_output {
+            return Some(p.clone());
+        }
+        Some(self.output.with_extension("server.dendro"))
+    }
+
+    /// The recording interval.
+    pub fn interval(&self) -> anyhow::Result<std::time::Duration> {
+        humantime::parse_duration(&self.interval)
+            .map_err(|e| anyhow::anyhow!("[metrics] interval {:?}: {e}", self.interval))
+    }
+
+    pub fn validate(&self) -> anyhow::Result<()> {
+        if self.interval()?.is_zero() {
+            anyhow::bail!("[metrics] interval must be greater than zero");
+        }
+        if let Some(url) = &self.server_metrics_url {
+            let parsed = url::Url::parse(url)
+                .map_err(|e| anyhow::anyhow!("[metrics] server_metrics_url {url:?}: {e}"))?;
+            if !matches!(parsed.scheme(), "http" | "https") {
+                anyhow::bail!("[metrics] server_metrics_url {url:?} must be an http or https URL");
+            }
+        }
+        if let Some(p) = &self.server_metrics_output {
+            if is_dendro(&self.output) {
+                anyhow::bail!(
+                    "[metrics] output {:?} is the run's archive and holds the server under \
+                     test; remove server_metrics_output",
+                    self.output
+                );
+            }
+            if !is_dendro(p) {
+                anyhow::bail!(
+                    "[metrics] server_metrics_output {p:?} must end in .dendro: llm-perf \
+                     records the server under test in process into a dendro archive"
+                );
+            }
+        }
+        Ok(())
     }
 }
 
@@ -741,6 +802,10 @@ impl Config {
         let Some(ref input) = self.input else {
             anyhow::bail!("an [input] section is required (or [replay] for trace replay)");
         };
+
+        if let Some(metrics) = &self.metrics {
+            metrics.validate()?;
+        }
 
         if self.load.total_requests.is_none() && self.load.duration_seconds.is_none() {
             anyhow::bail!("Either total_requests or duration_seconds must be specified");
@@ -1151,53 +1216,139 @@ turn_delay_max_ms = 1000
 #[cfg(test)]
 mod server_metrics_config_tests {
     use super::*;
+    use std::path::PathBuf;
+
+    fn metrics(toml: &str) -> MetricsConfig {
+        toml::from_str(toml).unwrap()
+    }
 
     #[test]
-    fn derives_default_server_output_from_client_output() {
-        let toml = r#"
+    fn server_metrics_default_to_a_server_dendro_beside_a_parquet_output() {
+        let cfg = metrics(
+            r#"
             output = "run.parquet"
             interval = "1s"
             server_metrics_url = "http://localhost:4242/metrics"
-        "#;
-        let cfg: MetricsConfig = toml::from_str(toml).unwrap();
+        "#,
+        );
+        cfg.validate().unwrap();
         assert_eq!(
-            cfg.server_metrics_url.as_deref(),
-            Some("http://localhost:4242/metrics")
+            cfg.parquet_output(),
+            Some(std::path::Path::new("run.parquet"))
         );
         assert_eq!(
-            cfg.resolved_server_output(),
-            std::path::PathBuf::from("run.server.parquet")
+            cfg.recording_path(),
+            Some(PathBuf::from("run.server.dendro"))
         );
     }
 
     #[test]
     fn explicit_server_output_overrides_default() {
-        let toml = r#"
+        let cfg = metrics(
+            r#"
             output = "run.parquet"
             server_metrics_url = "http://x/metrics"
-            server_metrics_output = "srv.parquet"
-        "#;
-        let cfg: MetricsConfig = toml::from_str(toml).unwrap();
+            server_metrics_output = "srv.dendro"
+        "#,
+        );
+        cfg.validate().unwrap();
+        assert_eq!(cfg.recording_path(), Some(PathBuf::from("srv.dendro")));
+    }
+
+    #[test]
+    fn a_parquet_output_without_a_server_records_no_archive() {
+        let cfg = metrics(r#"output = "run.parquet""#);
+        cfg.validate().unwrap();
+        assert_eq!(cfg.recording_path(), None);
+        assert!(cfg.parquet_output().is_some());
+    }
+
+    #[test]
+    fn a_dendro_output_is_the_archive_with_or_without_a_server() {
+        let alone = metrics(r#"output = "run.dendro""#);
+        alone.validate().unwrap();
+        assert_eq!(alone.recording_path(), Some(PathBuf::from("run.dendro")));
+        assert_eq!(alone.parquet_output(), None);
+
+        let with_server = metrics(
+            r#"
+            output = "run.dendro"
+            server_metrics_url = "http://x/metrics"
+        "#,
+        );
+        with_server.validate().unwrap();
         assert_eq!(
-            cfg.resolved_server_output(),
-            std::path::PathBuf::from("srv.parquet")
+            with_server.recording_path(),
+            Some(PathBuf::from("run.dendro"))
         );
     }
 
     #[test]
-    fn rezolus_bin_defaults_to_none_and_parses() {
-        let toml = r#"
-            output = "run.parquet"
+    fn a_dendro_output_refuses_a_second_server_archive() {
+        let cfg = metrics(
+            r#"
+            output = "run.dendro"
             server_metrics_url = "http://x/metrics"
-        "#;
-        let cfg: MetricsConfig = toml::from_str(toml).unwrap();
-        assert!(cfg.rezolus_bin.is_none());
+            server_metrics_output = "srv.dendro"
+        "#,
+        );
+        let err = cfg.validate().unwrap_err().to_string();
+        assert!(err.contains("remove server_metrics_output"), "{err}");
+    }
 
-        let toml2 = r#"
+    #[test]
+    fn a_parquet_server_output_is_refused() {
+        for out in ["srv.parquet", "srv.DENDRO", "srv"] {
+            let cfg = metrics(&format!(
+                r#"
+                output = "run.parquet"
+                server_metrics_url = "http://x/metrics"
+                server_metrics_output = "{out}"
+            "#
+            ));
+            let err = cfg.validate().unwrap_err().to_string();
+            assert!(err.contains("must end in .dendro"), "{out}: {err}");
+        }
+    }
+
+    #[test]
+    fn a_bad_interval_or_url_is_refused() {
+        for (toml, want) in [
+            (
+                r#"output = "r.dendro"
+                interval = "soon""#,
+                "interval",
+            ),
+            (
+                r#"output = "r.dendro"
+                interval = "0s""#,
+                "greater than zero",
+            ),
+            (
+                r#"output = "r.dendro"
+                server_metrics_url = "localhost:4242/metrics""#,
+                "server_metrics_url",
+            ),
+            (
+                r#"output = "r.dendro"
+                server_metrics_url = "not a url""#,
+                "server_metrics_url",
+            ),
+        ] {
+            let err = metrics(toml).validate().unwrap_err().to_string();
+            assert!(err.contains(want), "{toml}: {err}");
+        }
+    }
+
+    #[test]
+    fn rezolus_bin_still_parses() {
+        let cfg = metrics(
+            r#"
             output = "run.parquet"
             rezolus_bin = "/opt/rezolus"
-        "#;
-        let cfg2: MetricsConfig = toml::from_str(toml2).unwrap();
-        assert_eq!(cfg2.rezolus_bin.as_deref(), Some("/opt/rezolus"));
+        "#,
+        );
+        assert_eq!(cfg.rezolus_bin.as_deref(), Some("/opt/rezolus"));
+        cfg.validate().unwrap();
     }
 }

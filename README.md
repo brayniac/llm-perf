@@ -93,7 +93,8 @@ Automatically categorizes TTFT and ITL by input context size:
 ### Metrics Capture
 
 - **Periodic Snapshots**: Capture all metrics at regular intervals (e.g., secondly resolution)
-- **Parquet Output**: Columnar format optimized for analytics and data processing
+- **One archive per run**: `[metrics] output` ending in `.dendro` records llm-perf and the server under test into one dendro archive, in process (see [Recording a run](#recording-a-run))
+- **Parquet Output**: any other `output` is a parquet of llm-perf's metrics, written at exit
 - **Configurable Intervals**: From milliseconds to minutes
 - **Batch Control**: Configurable batch sizes for efficient parquet file generation
 
@@ -367,30 +368,6 @@ rezolus before 5.23.0 writes parquet to a path ending in `.dendro`.
 rezolus record --endpoint http://127.0.0.1:9090,source=llm-perf -o run.dendro
 ```
 
-With `[metrics] server_metrics_url` set and `server_metrics_output` ending in
-`.dendro`, llm-perf runs that `rezolus record` itself, with the server under
-test as a second endpoint, so one archive holds both:
-
-```toml
-[metrics]
-output = "run.parquet"
-server_metrics_url = "http://localhost:8080/metrics"
-server_metrics_output = "run.dendro"
-
-[admin]
-enabled = true
-```
-
-Before adding llm-perf's endpoint, llm-perf runs `<rezolus_bin> --version`.
-For a version that cannot record it (a 6.0 alpha before alpha.45, anything
-before 5.23.0, or output it cannot parse), or a `--version` that has not
-exited after 5 s, it logs a warning naming the
-version (or the timeout) and the reason, and the `.dendro` holds the server under test only.
-Without `[admin]`, the `.dendro` also holds the server under test only. With
-any other `server_metrics_output` extension (the match is exact: `.dendro`,
-not `.DENDRO`) the server is recorded alone, as before. If `rezolus record`
-exits non-zero, llm-perf logs an error with the exit status and repeats it as
-a warning in the console summary.
 
 At the default `[log] level = "info"`, llm-perf hides `warp::server` events,
 so the `server connection error: hyper::Error(IncompleteMessage)` that warp
@@ -400,6 +377,38 @@ and its accept errors, such as `accept error` when llm-perf runs out of file
 descriptors. `level = "debug"` shows them, as does
 `filter = ["warp::server=error"]`. A failure to bind the admin address still
 shows: warp panics with `failed to bind to address`.
+
+### Recording a run
+
+With `[metrics] output` ending in `.dendro`, llm-perf records the run into
+that archive itself, through metriken-recorder: its own metrics, and the
+server under test when `server_metrics_url` is set. Both are on one timeline,
+each as its own recording (`source=llm-perf`, and the server named from its
+host and port), and the archive is readable while the run goes and after a
+crash. No rezolus binary is needed.
+
+```toml
+[metrics]
+output = "run.dendro"
+interval = "1s"
+server_metrics_url = "http://localhost:8080/metrics"
+```
+
+llm-perf's histograms are recorded with their buckets. `server_metrics_url` is
+either a Prometheus `/metrics` URL, scraped each interval, or the base URL of
+a producer that serves `/metrics/stream` (a rezolus agent, cachecannon,
+another llm-perf), which is streamed; a base URL without a stream is scraped
+at `/metrics`. A server that does not answer at the start is recorded once it
+does. If it never answers, the console summary says so in a warning, and
+the archive holds llm-perf alone.
+
+With a parquet `output`, llm-perf still writes the parquet at exit, and with
+`server_metrics_url` set it also records the archive at
+`server_metrics_output`, by default `<output-stem>.server.dendro`. That
+archive holds llm-perf too. `server_metrics_output` must end in `.dendro`
+(exactly: not `.DENDRO`), and must not be set when `output` is the archive.
+The archive must not exist yet: llm-perf refuses to start rather than
+overwrite one. `rezolus_bin` is ignored and logs a warning.
 
 ### Input Format
 
@@ -578,6 +587,7 @@ llm-perf/
 │   ├── report.rs         # Report generation (console and JSON)
 │   ├── stats.rs          # Periodic windowed stats during runs
 │   ├── snapshot.rs       # Metrics snapshot to parquet pipeline
+│   ├── recording.rs      # The run's .dendro archive, recorded in process
 │   ├── admin.rs          # HTTP admin server (Prometheus/JSON/msgpack metrics, /metrics/stream)
 │   ├── distribution.rs   # Request arrival distributions (uniform, poisson)
 │   ├── tokenizer.rs      # Token counting via tiktoken
