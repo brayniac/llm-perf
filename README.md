@@ -351,8 +351,9 @@ level = "info"
 `/metrics/stream` takes `interval` (default `1s`) and `layout` (`wide`, the
 default, or `long`). It sends a handshake naming `source=llm-perf` and then one
 frame per interval, each carrying every metric recorded so far, histograms with their buckets,
-until the client disconnects. An interval below 10 ms, a zero or malformed
-interval, and an unknown layout are refused with 400 and the reason. The
+until the client disconnects. A zero or malformed interval and an unknown
+layout are refused with 400 and the reason; an interval below 10 ms is served
+at 10 ms, which `x-metriken-frame-interval` names. The
 response headers `x-metriken-frame-interval`, `x-metriken-update-floor` and
 `x-metriken-layout` state what is served.
 

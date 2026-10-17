@@ -18,8 +18,8 @@ use warp::reply::{Reply, Response};
 /// The namespace of the one group the stream carries: `llm-perf/main`.
 pub const STREAM_NAMESPACE: &str = "llm-perf";
 
-/// How long a built stream pass is reused, and the shortest interval a
-/// subscription may ask for. Well below the intervals a recorder asks for
+/// How long a built stream pass is reused, and the shortest interval
+/// served. Well below the intervals a recorder asks for
 /// (one second by default): at an interval equal to the floor, wake-time
 /// jitter can hand a subscriber the previous boundary's pass and that
 /// interval's frame is empty (`RegistryPasses::new`). rezolus and
@@ -108,10 +108,12 @@ fn binary_response(snapshotter: &Snapshotter) -> Response {
 /// they land in one windowless group, `llm-perf/main`.
 ///
 /// A malformed request (a zero or unparseable interval, an unknown layout, a
-/// parameter given twice) and an interval below [`UPDATE_FLOOR`] are refused
-/// with 400 and the reason as the body. Every pass inside the floor is
-/// shared, so such a subscription would send mostly empty frames as fast as
-/// it asks, on the host generating load.
+/// parameter given twice) is refused with 400 and the reason as the body.
+/// The request's interval is an offer: one below [`UPDATE_FLOOR`] is served
+/// at the floor, and the frame-interval header names the interval served,
+/// which a recorder takes as the stream's. Every pass inside the floor is
+/// shared, so a subscription faster than it would send mostly empty frames
+/// on the host generating load.
 fn metrics_stream_endpoint(
     passes: Arc<Passes>,
 ) -> impl Filter<Extract = (Response,), Error = warp::Rejection> + Clone {
@@ -122,20 +124,11 @@ fn metrics_stream_endpoint(
 }
 
 fn stream_response(passes: &Arc<Passes>, query: &str) -> Response {
-    let request = match StreamRequest::parse(query) {
+    let mut request = match StreamRequest::parse(query) {
         Ok(request) => request,
         Err(refusal) => return refusal_response(refusal),
     };
-    if request.interval < passes.floor() {
-        return refusal_response(Refusal {
-            status: 400,
-            message: format!(
-                "interval {:?} is below the {:?} update floor",
-                request.interval,
-                passes.floor()
-            ),
-        });
-    }
+    request.interval = request.interval.max(passes.floor());
     let layout = request.layout;
     let subscription =
         StreamSubscription::new(request, passes.floor(), stream_labels(), stream_metadata());
@@ -532,13 +525,20 @@ mod tests {
         assert!(body.contains("greater than zero"), "{body}");
     }
 
-    #[tokio::test]
-    async fn metrics_stream_refuses_an_interval_below_the_floor() {
+    /// An offer below the floor is served at the floor, and the
+    /// frame-interval header says so.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn metrics_stream_serves_an_interval_below_the_floor_at_the_floor() {
         let addr = start().await;
-        let response = get(addr, "/metrics/stream?interval=1ms").await;
-        assert_eq!(response.status(), 400);
-        let body = response.text().await.unwrap();
-        assert!(body.contains("update floor"), "{body}");
+        let mut response = get(addr, "/metrics/stream?interval=1ms").await;
+        assert_eq!(response.status(), 200);
+        assert_eq!(header(&response, "x-metriken-frame-interval"), Some("10ms"));
+        let frames = frames(&mut response, 1).await;
+        assert!(
+            matches!(frames[0], Frame::Handshake { .. }),
+            "{:?}",
+            frames[0]
+        );
     }
 
     /// An interval equal to the floor is accepted.
