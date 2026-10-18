@@ -16,6 +16,7 @@ pub mod saturation;
 pub mod snapshot;
 pub mod stats;
 pub mod synthetic;
+pub mod template;
 pub mod tokenizer;
 pub mod trace;
 

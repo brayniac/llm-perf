@@ -160,9 +160,18 @@ fn stream_labels() -> BTreeMap<String, String> {
 }
 
 /// The handshake's metadata. The version is here, not in the labels, so two
-/// builds recorded side by side are the same source kind.
+/// builds recorded side by side are the same source kind. `service_queries`
+/// is llm-perf's KPI template ([`crate::template`]), about 3 KB, which a
+/// recorder keeps in the source's metadata for the viewer.
 fn stream_metadata() -> BTreeMap<String, String> {
-    [("version".to_string(), env!("CARGO_PKG_VERSION").to_string())].into()
+    [
+        ("version".to_string(), env!("CARGO_PKG_VERSION").to_string()),
+        (
+            crate::template::KEY_SERVICE_QUERIES.to_string(),
+            crate::template::SERVICE_QUERIES.to_string(),
+        ),
+    ]
+    .into()
 }
 
 /// A refused stream request: its status and its message as a text body.
@@ -421,6 +430,14 @@ mod tests {
                 assert_eq!(
                     metadata.get("version").map(String::as_str),
                     Some(env!("CARGO_PKG_VERSION"))
+                );
+                // The KPI template, which a recorder keeps in the source's
+                // metadata for the viewer.
+                assert_eq!(
+                    metadata
+                        .get(crate::template::KEY_SERVICE_QUERIES)
+                        .map(String::as_str),
+                    Some(crate::template::SERVICE_QUERIES)
                 );
             }
             other => panic!("first frame is not a handshake: {other:?}"),

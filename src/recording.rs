@@ -168,7 +168,15 @@ impl RunRecorder {
                 ("source".to_string(), LLM_PERF_SOURCE.to_string()),
                 (ROLE.to_string(), ROLE_LOADGEN.to_string()),
             ]),
-            BTreeMap::from([("version".to_string(), env!("CARGO_PKG_VERSION").to_string())]),
+            // The KPI template travels in llm-perf's own source's metadata,
+            // as it does in the stream handshake.
+            BTreeMap::from([
+                ("version".to_string(), env!("CARGO_PKG_VERSION").to_string()),
+                (
+                    crate::template::KEY_SERVICE_QUERIES.to_string(),
+                    crate::template::SERVICE_QUERIES.to_string(),
+                ),
+            ]),
         );
         let (recorder, _ids, rx) = Recorder::start(
             cfg,
@@ -657,6 +665,16 @@ mod tests {
 
         let sources = sources(&path);
         assert_eq!(sources.keys().collect::<Vec<_>>(), [LLM_PERF_SOURCE]);
+
+        // llm-perf's source carries its KPI template for the viewer.
+        let catalog = DendroCatalog::open(&path).unwrap();
+        let ours = catalog.sources().unwrap().into_iter().next().unwrap();
+        assert_eq!(
+            ours.metadata
+                .get(crate::template::KEY_SERVICE_QUERIES)
+                .map(String::as_str),
+            Some(crate::template::SERVICE_QUERIES)
+        );
     }
 
     #[tokio::test(flavor = "multi_thread")]

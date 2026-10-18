@@ -349,7 +349,8 @@ level = "info"
 | `/metrics/stream` | dendro replication frames (`application/vnd.metriken.replication.v1+dendro`) |
 
 `/metrics/stream` takes `interval` (default `1s`) and `layout` (`wide`, the
-default, or `long`). It sends a handshake naming `source=llm-perf` and then one
+default, or `long`). It sends a handshake naming `source=llm-perf`, with the
+version and the [KPI template](#kpi-template) in its metadata, and then one
 frame per interval, each carrying every metric recorded so far, histograms with their buckets,
 until the client disconnects. A zero or malformed interval and an unknown
 layout are refused with 400 and the reason; an interval below 10 ms is served
@@ -439,6 +440,28 @@ To pick llm-perf's own recording out of the archive, select `role=loadgen`
 (for example `rezolus mcp query run.dendro ... --recording role=loadgen`):
 when the server under test is another llm-perf, `source=llm-perf` matches
 both.
+
+### KPI template
+
+llm-perf's KPI template is `templates/llm-perf.json`, a Rezolus
+`ServiceExtension`: the throughput, latency and error charts the Rezolus
+viewer shows as llm-perf's section. It travels in every recording llm-perf
+makes or serves, under the `service_queries` metadata key: in the
+`/metrics/stream` handshake, which `rezolus record` keeps in the source's
+metadata; in llm-perf's own source in the run's `.dendro`; and in the file
+metadata of the parquet written at exit. The viewer renders the template the
+recording carries, so a change to it ships with llm-perf. Rezolus's built-in
+copy is used only for recordings that carry none (made by an older llm-perf,
+or scraped from `/metrics`). A query may select only metrics llm-perf
+registers and a `unit_system` the viewer knows; tests in `src/template.rs`
+check both.
+
+llm-perf attaches no template to the server under test's recording. A
+streamed server sends its own; a scraped one (vLLM, SGLang) is named after
+its host and port, so the viewer's built-in vLLM and SGLang templates, which
+select `source="vllm"` and `source="sglang"`, do not match it. To get them,
+record the server with rezolus 6.0's `rezolus record --endpoint
+http://host:8000/metrics,source=vllm,template=vllm.json`.
 
 ### Input Format
 
