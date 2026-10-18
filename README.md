@@ -456,17 +456,18 @@ llm-perf, or scraped from `/metrics`). Every query selects
 `source="llm-perf"`, and a parquet's series carry no `source` label (the
 source is in the file metadata only), so the parquet's KPI charts are empty
 until rezolus attaches a single-source parquet's source to its series as a
-label. Tests in `src/template.rs` check that each query selects only metrics
-llm-perf registers, with label values its metrics carry, that each selector
-names `source="llm-perf"`, and that every `unit_system` is one the viewer
-knows.
+label. Tests in `src/template.rs` check that each query names metrics only
+through selectors, each naming `source="llm-perf"`, that those are metrics
+llm-perf registers, with label values its metrics carry, and that every
+`unit_system` is one the viewer knows.
 
 llm-perf attaches no template to the server under test's recording. A
 streamed server sends its own. A scraped one (vLLM, SGLang) is named after
 its host and port unless `[metrics] server_source` names it; the viewer's
 built-in vLLM and SGLang templates select `source="vllm"` and
 `source="sglang"`, so set `server_source = "vllm"` (or `"sglang"`) for them
-to apply:
+to apply. `server_source` needs `server_metrics_url`, and an empty value or
+`llm-perf` (in any case) is refused at startup:
 
 ```toml
 [metrics]

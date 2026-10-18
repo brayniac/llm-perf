@@ -97,9 +97,36 @@ mod tests {
         assert!(checked > 0, "no metric names found in the queries");
     }
 
-    /// Every selector names llm-perf's source: in a recording holding
-    /// llm-perf and the server under test, a selector without it would also
-    /// match the server's series.
+    /// The PromQL words a query may use outside a selector: functions,
+    /// aggregations and keywords. Anything else outside `name{…}` is a metric
+    /// named without a selector, which [`every_selector_names_llm_perfs_source`]
+    /// refuses.
+    const PROMQL_WORDS: [&str; 18] = [
+        "sum",
+        "avg",
+        "min",
+        "max",
+        "count",
+        "rate",
+        "irate",
+        "increase",
+        "delta",
+        "histogram_quantile",
+        "histogram_quantiles",
+        "clamp_min",
+        "clamp_max",
+        "abs",
+        "by",
+        "without",
+        "on",
+        "ignoring",
+    ];
+
+    /// Every metric is named through a selector, and every selector names
+    /// llm-perf's source: in a recording holding llm-perf and the server
+    /// under test, a series without it would also match the server's. A
+    /// metric named without `{…}` fails here, as it is unchecked by the
+    /// selector tests.
     #[test]
     fn every_selector_names_llm_perfs_source() {
         let wanted = format!("source=\"{}\"", crate::recording::LLM_PERF_SOURCE);
@@ -113,7 +140,55 @@ mod tests {
                     kpi["title"]
                 );
             }
+            for word in words_outside_selectors(query) {
+                assert!(
+                    PROMQL_WORDS.contains(&word),
+                    "KPI {}: {word} is outside any selector and is not a PromQL word",
+                    kpi["title"]
+                );
+            }
         }
+    }
+
+    /// The identifiers in `query` once each `name{…}` selector and each
+    /// `[…]` range is removed; numbers are not identifiers.
+    fn words_outside_selectors(query: &str) -> Vec<&str> {
+        let ident = |b: u8| b.is_ascii_alphanumeric() || b == b'_' || b == b':';
+        let bytes = query.as_bytes();
+        let mut out = Vec::new();
+        let mut i = 0;
+        while i < bytes.len() {
+            match bytes[i] {
+                b'{' | b'[' => {
+                    let close = if bytes[i] == b'{' { '}' } else { ']' };
+                    i += query[i..].find(close).map_or(query.len() - i, |e| e + 1);
+                }
+                b if ident(b) => {
+                    let start = i;
+                    while i < bytes.len() && ident(bytes[i]) {
+                        i += 1;
+                    }
+                    // A name directly followed by its selector is the
+                    // selector's.
+                    let selected = bytes.get(i) == Some(&b'{');
+                    if !selected && !bytes[start].is_ascii_digit() {
+                        out.push(&query[start..i]);
+                    }
+                }
+                _ => i += 1,
+            }
+        }
+        out
+    }
+
+    #[test]
+    fn words_outside_selectors_skip_selectors_and_ranges() {
+        assert_eq!(
+            words_outside_selectors(
+                "sum by (status) (irate(requests{source=\"x\"}[5s])) / requests_inflight * 2"
+            ),
+            ["sum", "by", "status", "irate", "requests_inflight"]
+        );
     }
 
     /// Every label a selector matches on, other than `source`, is one the

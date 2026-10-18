@@ -537,6 +537,23 @@ impl MetricsConfig {
                 anyhow::bail!("[metrics] server_metrics_url {url:?} must be an http or https URL");
             }
         }
+        if let Some(s) = &self.server_source {
+            if self.server_metrics_url.is_none() {
+                anyhow::bail!(
+                    "[metrics] server_source names the server under test; set \
+                     server_metrics_url or remove it"
+                );
+            }
+            if s.is_empty() {
+                anyhow::bail!("[metrics] server_source must not be empty");
+            }
+            if s.eq_ignore_ascii_case(crate::recording::LLM_PERF_SOURCE) {
+                anyhow::bail!(
+                    "[metrics] server_source {s:?} is llm-perf's own source; name the server \
+                     under test"
+                );
+            }
+        }
         // An unused server_metrics_output (no server_metrics_url) is left
         // alone, so an older config with a parquet one still loads.
         if let (Some(p), Some(_)) = (&self.server_metrics_output, &self.server_metrics_url) {
@@ -1274,8 +1291,37 @@ mod server_metrics_config_tests {
         "#,
         );
         assert_eq!(named.server_source.as_deref(), Some("vllm"));
+        named.validate().unwrap();
         let unnamed = metrics(r#"output = "run.dendro""#);
         assert_eq!(unnamed.server_source, None);
+        unnamed.validate().unwrap();
+    }
+
+    /// `server_source` is refused when empty, when it is llm-perf's own
+    /// source in any case, and without a server to name.
+    #[test]
+    fn server_source_is_validated() {
+        let refused = |toml: &str| metrics(toml).validate().unwrap_err().to_string();
+        let with_url = |source: &str| {
+            format!(
+                "output = \"run.dendro\"\nserver_metrics_url = \"http://x/metrics\"\n\
+                 server_source = {source:?}"
+            )
+        };
+        assert_eq!(
+            refused(&with_url("")),
+            "[metrics] server_source must not be empty"
+        );
+        assert_eq!(
+            refused(&with_url("LLM-Perf")),
+            "[metrics] server_source \"LLM-Perf\" is llm-perf's own source; name the server \
+             under test"
+        );
+        assert_eq!(
+            refused("output = \"run.dendro\"\nserver_source = \"vllm\""),
+            "[metrics] server_source names the server under test; set server_metrics_url or \
+             remove it"
+        );
     }
 
     #[test]
