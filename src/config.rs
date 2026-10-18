@@ -475,6 +475,12 @@ pub struct MetricsConfig {
     /// recorded.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub server_metrics_url: Option<String>,
+    /// The server under test's `source` label in the archive, e.g. `vllm`
+    /// or `sglang`, so the Rezolus viewer's built-in template for that
+    /// server matches it. None => the name its stream handshake gives, or
+    /// one made from its host and port.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub server_source: Option<String>,
     /// The archive for the server under test and llm-perf when `output` is a
     /// parquet. Must end in `.dendro`. Defaults to
     /// `<output-stem>.server.dendro`.
@@ -1256,6 +1262,20 @@ mod server_metrics_config_tests {
             cfg.recording_path(),
             Some(PathBuf::from("run.server.dendro"))
         );
+    }
+
+    #[test]
+    fn server_source_is_optional() {
+        let named = metrics(
+            r#"
+            output = "run.dendro"
+            server_metrics_url = "http://x/metrics"
+            server_source = "vllm"
+        "#,
+        );
+        assert_eq!(named.server_source.as_deref(), Some("vllm"));
+        let unnamed = metrics(r#"output = "run.dendro""#);
+        assert_eq!(unnamed.server_source, None);
     }
 
     #[test]

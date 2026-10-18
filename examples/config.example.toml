@@ -317,6 +317,11 @@ level = "info"
 # the base URL of a producer that serves /metrics/stream (streamed).
 # server_metrics_url = "http://localhost:4242/metrics"
 #
+# The server's source label in the archive, so the Rezolus viewer's built-in
+# template for it applies ("vllm", "sglang"). Default: its handshake's name,
+# or one made from its host and port.
+# server_source = "vllm"
+#
 # llm-perf's recording is labeled role=loadgen and the server's role=service.
 #
 # With a parquet output, the server under test and llm-perf are recorded into

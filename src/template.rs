@@ -30,8 +30,9 @@ mod tests {
 
     /// The unit systems the Rezolus viewer can scale: rezolus's
     /// `dashboard::plot::Unit` (`crates/dashboard/src/plot.rs`). The viewer
-    /// refuses a template with any other value, so one outside this list
-    /// would stop the KPI section rendering.
+    /// scales a KPI only by one of these; with any other value it warns and
+    /// renders the KPI as a plain count, and `rezolus recording annotate`
+    /// refuses the template.
     const UNIT_SYSTEMS: [&str; 9] = [
         "time",
         "bytes",
@@ -96,8 +97,74 @@ mod tests {
         assert!(checked > 0, "no metric names found in the queries");
     }
 
-    /// The identifiers in `query` that are directly followed by `{`.
-    fn selected_metrics(query: &str) -> Vec<&str> {
+    /// Every selector names llm-perf's source: in a recording holding
+    /// llm-perf and the server under test, a selector without it would also
+    /// match the server's series.
+    #[test]
+    fn every_selector_names_llm_perfs_source() {
+        let wanted = format!("source=\"{}\"", crate::recording::LLM_PERF_SOURCE);
+        let doc = template();
+        for kpi in doc["kpis"].as_array().unwrap() {
+            let query = kpi["query"].as_str().unwrap();
+            for (name, matchers) in selectors(query) {
+                assert!(
+                    matchers.split(',').any(|m| m.trim() == wanted),
+                    "KPI {}: {name}{{{matchers}}} does not select {wanted}",
+                    kpi["title"]
+                );
+            }
+        }
+    }
+
+    /// Every label a selector matches on, other than `source`, is one the
+    /// metric's slots carry after `Metrics::init`, with that value, so a
+    /// renamed status or direction fails here rather than leaving an empty
+    /// chart. A matcher on any metric not listed here fails too, so the list
+    /// grows with the template.
+    #[test]
+    fn selector_labels_are_ones_the_metrics_carry() {
+        use crate::metrics::{Metrics, REQUESTS, TOKENS};
+        Metrics::init();
+        let groups: [(&str, &metriken::CounterGroup); 2] =
+            [("requests", &REQUESTS), ("tokens", &TOKENS)];
+        let doc = template();
+        let mut checked = 0;
+        for kpi in doc["kpis"].as_array().unwrap() {
+            let query = kpi["query"].as_str().unwrap();
+            for (name, matchers) in selectors(query) {
+                for matcher in matchers.split(',').map(str::trim).filter(|m| !m.is_empty()) {
+                    let (key, value) = matcher
+                        .split_once('=')
+                        .unwrap_or_else(|| panic!("{matcher} is not key=\"value\""));
+                    assert!(
+                        !key.ends_with('!') && !value.starts_with('~'),
+                        "{matcher}: only equality matchers are checked"
+                    );
+                    if key == "source" {
+                        continue;
+                    }
+                    let value = value.trim_matches('"');
+                    let (_, group) = groups
+                        .iter()
+                        .find(|(n, _)| *n == name)
+                        .unwrap_or_else(|| panic!("{name}{{{matchers}}}: {name} is not checked"));
+                    assert!(
+                        (0..group.entries()).any(|idx| group
+                            .load_metadata(idx)
+                            .is_some_and(|m| m.get(key).map(String::as_str) == Some(value))),
+                        "KPI {}: no {name} slot carries {key}={value:?}",
+                        kpi["title"]
+                    );
+                    checked += 1;
+                }
+            }
+        }
+        assert!(checked > 0, "no label matchers found in the queries");
+    }
+
+    /// The selectors in `query`: each metric name directly followed by `{`,
+    /// with the text between the braces.
+    fn selectors(query: &str) -> Vec<(&str, &str)> {
         let bytes = query.as_bytes();
         let mut out = Vec::new();
         for (i, b) in bytes.iter().enumerate() {
@@ -108,11 +175,25 @@ mod tests {
                 .iter()
                 .rposition(|c| !(c.is_ascii_alphanumeric() || *c == b'_' || *c == b':'))
                 .map_or(0, |p| p + 1);
+            let end = query[i..].find('}').map_or(query.len(), |e| i + e);
             if start < i {
-                out.push(&query[start..i]);
+                out.push((&query[start..i], &query[i + 1..end]));
             }
         }
         out
+    }
+
+    /// The metric names in `query` that are directly followed by `{`.
+    fn selected_metrics(query: &str) -> Vec<&str> {
+        selectors(query).into_iter().map(|(name, _)| name).collect()
+    }
+
+    #[test]
+    fn selectors_read_names_and_matchers() {
+        assert_eq!(
+            selectors("sum(irate(tokens{direction=\"input\",source=\"x\"}[5s])) / up{}"),
+            [("tokens", "direction=\"input\",source=\"x\""), ("up", "")]
+        );
     }
 
     #[test]

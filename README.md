@@ -405,9 +405,9 @@ summary says so in a warning with the last reason, and the archive holds
 llm-perf alone.
 
 llm-perf's recording is labeled `source=llm-perf, role=loadgen`. The server's
-is labeled `role=service`, and its `source` is the name its stream's
-handshake gives (`rezolus`, `llm-perf`, ...) or, for a scraped server, one
-made from its host and port.
+is labeled `role=service`, and its `source` is `server_source` when set,
+otherwise the name its stream's handshake gives (`rezolus`, `llm-perf`, ...)
+or, for a scraped server, one made from its host and port.
 
 With a parquet `output`, llm-perf still writes the parquet at exit, and with
 `server_metrics_url` set it also records the archive at
@@ -449,19 +449,36 @@ viewer shows as llm-perf's section. It travels in every recording llm-perf
 makes or serves, under the `service_queries` metadata key: in the
 `/metrics/stream` handshake, which `rezolus record` keeps in the source's
 metadata; in llm-perf's own source in the run's `.dendro`; and in the file
-metadata of the parquet written at exit. The viewer renders the template the
-recording carries, so a change to it ships with llm-perf. Rezolus's built-in
-copy is used only for recordings that carry none (made by an older llm-perf,
-or scraped from `/metrics`). A query may select only metrics llm-perf
-registers and a `unit_system` the viewer knows; tests in `src/template.rs`
-check both.
+metadata of the parquet written at exit. The viewer renders the template a
+`.dendro` recording carries, so a change to it ships with llm-perf. Rezolus's
+built-in copy is used only for recordings that carry none (made by an older
+llm-perf, or scraped from `/metrics`). Every query selects
+`source="llm-perf"`, and a parquet's series carry no `source` label (the
+source is in the file metadata only), so the parquet's KPI charts are empty
+until rezolus attaches a single-source parquet's source to its series as a
+label. Tests in `src/template.rs` check that each query selects only metrics
+llm-perf registers, with label values its metrics carry, that each selector
+names `source="llm-perf"`, and that every `unit_system` is one the viewer
+knows.
 
 llm-perf attaches no template to the server under test's recording. A
-streamed server sends its own; a scraped one (vLLM, SGLang) is named after
-its host and port, so the viewer's built-in vLLM and SGLang templates, which
-select `source="vllm"` and `source="sglang"`, do not match it. To get them,
-record the server with rezolus 6.0's `rezolus record --endpoint
-http://host:8000/metrics,source=vllm,template=vllm.json`.
+streamed server sends its own. A scraped one (vLLM, SGLang) is named after
+its host and port unless `[metrics] server_source` names it; the viewer's
+built-in vLLM and SGLang templates select `source="vllm"` and
+`source="sglang"`, so set `server_source = "vllm"` (or `"sglang"`) for them
+to apply:
+
+```toml
+[metrics]
+output = "run.dendro"
+server_metrics_url = "http://localhost:8000/metrics"
+server_source = "vllm"
+```
+
+When `rezolus record` records the server instead, give it the same name:
+`rezolus record --endpoint http://host:8000/metrics,source=vllm -o
+server.dendro`; a recording whose source is `vllm` gets the viewer's built-in
+vLLM template.
 
 ### Input Format
 
