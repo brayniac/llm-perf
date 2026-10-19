@@ -127,7 +127,7 @@ impl RunRecorder {
                 .with_context(|| format!("[metrics] server_metrics_url {url:?}"))?;
             let mut spec = EndpointSpec::new(url).with_label(ROLE, ROLE_SERVICE);
             if let Some(source) = &mc.server_source {
-                spec = spec.with_label("source", source.clone());
+                spec = spec.with_label("source", source.trim());
             }
             specs.push(spec);
         }
@@ -689,7 +689,8 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("run.dendro");
         let mut mc = mc(&path, Some(format!("{}/metrics", server.url())));
-        mc.server_source = Some("vllm".to_string());
+        // Trimmed, as validation reads it.
+        mc.server_source = Some(" vllm ".to_string());
 
         assert_eq!(record_for(&mc, Duration::from_millis(600)).await, None);
 

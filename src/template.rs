@@ -140,6 +140,20 @@ mod tests {
                     kpi["title"]
                 );
             }
+            // A selector with no name names its metric in `__name__`: it must
+            // be a registered metric and select llm-perf's source too.
+            for (name, matchers) in nameless_selectors(query) {
+                assert!(
+                    metriken::metrics().iter().any(|m| m.name() == name),
+                    "KPI {}: {{{matchers}}} names no registered metric",
+                    kpi["title"]
+                );
+                assert!(
+                    matchers.split(',').any(|m| m.trim() == wanted),
+                    "KPI {}: {{{matchers}}} does not select {wanted}",
+                    kpi["title"]
+                );
+            }
             for word in words_outside_selectors(query) {
                 assert!(
                     PROMQL_WORDS.contains(&word),
@@ -150,8 +164,19 @@ mod tests {
         }
     }
 
-    /// The identifiers in `query` once each `name{…}` selector and each
-    /// `[…]` range is removed; numbers are not identifiers.
+    /// Keywords whose following `(…)` lists label names, not an expression.
+    const LABEL_LIST_KEYWORDS: [&str; 6] = [
+        "by",
+        "without",
+        "on",
+        "ignoring",
+        "group_left",
+        "group_right",
+    ];
+
+    /// The identifiers in `query` once each `{…}` selector, each `[…]`
+    /// range, each string literal and each label list after `by` and its
+    /// kin is removed; numbers are not identifiers.
     fn words_outside_selectors(query: &str) -> Vec<&str> {
         let ident = |b: u8| b.is_ascii_alphanumeric() || b == b'_' || b == b':';
         let bytes = query.as_bytes();
@@ -159,24 +184,67 @@ mod tests {
         let mut i = 0;
         while i < bytes.len() {
             match bytes[i] {
-                b'{' | b'[' => {
-                    let close = if bytes[i] == b'{' { '}' } else { ']' };
-                    i += query[i..].find(close).map_or(query.len() - i, |e| e + 1);
+                b'{' | b'[' | b'"' => {
+                    let close = match bytes[i] {
+                        b'{' => '}',
+                        b'[' => ']',
+                        _ => '"',
+                    };
+                    i += 1 + query[i + 1..]
+                        .find(close)
+                        .map_or(query.len() - i - 1, |e| e + 1);
                 }
                 b if ident(b) => {
                     let start = i;
                     while i < bytes.len() && ident(bytes[i]) {
                         i += 1;
                     }
+                    let word = &query[start..i];
                     // A name directly followed by its selector is the
                     // selector's.
                     let selected = bytes.get(i) == Some(&b'{');
                     if !selected && !bytes[start].is_ascii_digit() {
-                        out.push(&query[start..i]);
+                        out.push(word);
+                    }
+                    let next = query[i..].trim_start();
+                    if LABEL_LIST_KEYWORDS.contains(&word) && next.starts_with('(') {
+                        let open = query.len() - next.len();
+                        i = open
+                            + query[open..]
+                                .find(')')
+                                .map_or(query.len() - open, |e| e + 1);
                     }
                 }
                 _ => i += 1,
             }
+        }
+        out
+    }
+
+    /// The selectors in `query` with no name before them,
+    /// `{__name__="x",…}`: the `__name__` value (empty when there is none)
+    /// and the matchers.
+    fn nameless_selectors(query: &str) -> Vec<(&str, &str)> {
+        let bytes = query.as_bytes();
+        let mut out = Vec::new();
+        for (i, b) in bytes.iter().enumerate() {
+            let named = i > 0
+                && (bytes[i - 1].is_ascii_alphanumeric()
+                    || bytes[i - 1] == b'_'
+                    || bytes[i - 1] == b':');
+            if *b != b'{' || named {
+                continue;
+            }
+            let end = query[i..].find('}').map_or(query.len(), |e| i + e);
+            let matchers = &query[i + 1..end];
+            let name = matchers
+                .split(',')
+                .find_map(|m| {
+                    let (key, value) = m.trim().split_once('=')?;
+                    (key.trim() == "__name__").then(|| value.trim().trim_matches('"'))
+                })
+                .unwrap_or("");
+            out.push((name, matchers));
         }
         out
     }
@@ -187,7 +255,21 @@ mod tests {
             words_outside_selectors(
                 "sum by (status) (irate(requests{source=\"x\"}[5s])) / requests_inflight * 2"
             ),
-            ["sum", "by", "status", "irate", "requests_inflight"]
+            ["sum", "by", "irate", "requests_inflight"]
+        );
+        assert_eq!(
+            words_outside_selectors(
+                "label_replace(x{}, \"dst\", \"$1\", \"src\", \"(.*)\") > bool (bare)"
+            ),
+            ["label_replace", "bool", "bare"]
+        );
+    }
+
+    #[test]
+    fn nameless_selectors_read_name_and_matchers() {
+        assert_eq!(
+            nameless_selectors("sum(x{a=\"1\"}) + {__name__=\"y\", source=\"s\"} + {b=\"2\"}"),
+            [("y", "__name__=\"y\", source=\"s\""), ("", "b=\"2\"")]
         );
     }
 

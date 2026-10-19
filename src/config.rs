@@ -537,7 +537,7 @@ impl MetricsConfig {
                 anyhow::bail!("[metrics] server_metrics_url {url:?} must be an http or https URL");
             }
         }
-        if let Some(s) = &self.server_source {
+        if let Some(s) = self.server_source.as_deref().map(str::trim) {
             if self.server_metrics_url.is_none() {
                 anyhow::bail!(
                     "[metrics] server_source names the server under test; set \
@@ -1308,9 +1308,17 @@ mod server_metrics_config_tests {
                  server_source = {source:?}"
             )
         };
+        for empty in ["", "  "] {
+            assert_eq!(
+                refused(&with_url(empty)),
+                "[metrics] server_source must not be empty",
+                "{empty:?}"
+            );
+        }
         assert_eq!(
-            refused(&with_url("")),
-            "[metrics] server_source must not be empty"
+            refused(&with_url(" llm-perf ")),
+            "[metrics] server_source \"llm-perf\" is llm-perf's own source; name the server \
+             under test"
         );
         assert_eq!(
             refused(&with_url("LLM-Perf")),
