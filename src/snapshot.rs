@@ -79,15 +79,7 @@ pub async fn capture_snapshots(config: Config) -> Result<()> {
     // Convert msgpack to parquet
     log::info!("Converting msgpack to parquet...");
 
-    // Set up parquet options with standard histogram type
-    let mut opts = ParquetOptions::new().histogram_type(ParquetHistogramType::Standard);
-
-    if let Some(batch_size) = metrics_config.batch_size {
-        opts = opts.max_batch_size(batch_size);
-    }
-
-    // Convert msgpack to parquet
-    MsgpackToParquet::with_options(opts)
+    parquet_converter(metrics_config.batch_size)
         .convert_file_path(temp_file.path(), &metrics_config.output)?;
 
     log::info!(
@@ -96,4 +88,59 @@ pub async fn capture_snapshots(config: Config) -> Result<()> {
     );
 
     Ok(())
+}
+
+/// The msgpack-to-parquet converter for the file written at exit: standard
+/// histograms, `batch_size` rows per batch when given, and llm-perf's KPI
+/// template ([`crate::template`]) as the file's `service_queries` metadata,
+/// which the Rezolus viewer renders as llm-perf's KPI section.
+fn parquet_converter(batch_size: Option<usize>) -> MsgpackToParquet {
+    let mut opts = ParquetOptions::new().histogram_type(ParquetHistogramType::Standard);
+    if let Some(batch_size) = batch_size {
+        opts = opts.max_batch_size(batch_size);
+    }
+    MsgpackToParquet::with_options(opts).metadata(
+        crate::template::KEY_SERVICE_QUERIES.to_string(),
+        crate::template::SERVICE_QUERIES.to_string(),
+    )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The parquet written at exit carries the KPI template in its file
+    /// metadata.
+    #[test]
+    fn parquet_carries_the_kpi_template() {
+        let dir = tempfile::tempdir().unwrap();
+        let staged = dir.path().join("run.msgpack");
+        let parquet = dir.path().join("run.parquet");
+        let snapshotter = SnapshotterBuilder::new()
+            .metadata("source".to_string(), env!("CARGO_PKG_NAME").to_string())
+            .build();
+        let mut bytes = Vec::new();
+        for _ in 0..2 {
+            bytes.extend(Snapshot::to_msgpack(&snapshotter.snapshot()).unwrap());
+        }
+        std::fs::write(&staged, bytes).unwrap();
+
+        parquet_converter(None)
+            .convert_file_path(&staged, &parquet)
+            .unwrap();
+
+        let file = std::fs::File::open(&parquet).unwrap();
+        let reader =
+            parquet::file::reader::SerializedFileReader::new(file).expect("a parquet file");
+        let kv = parquet::file::reader::FileReader::metadata(&reader)
+            .file_metadata()
+            .key_value_metadata()
+            .cloned()
+            .unwrap_or_default();
+        let template = kv
+            .iter()
+            .find(|e| e.key == crate::template::KEY_SERVICE_QUERIES)
+            .and_then(|e| e.value.as_deref());
+        assert_eq!(template, Some(crate::template::SERVICE_QUERIES));
+    }
 }

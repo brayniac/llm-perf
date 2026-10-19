@@ -475,6 +475,12 @@ pub struct MetricsConfig {
     /// recorded.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub server_metrics_url: Option<String>,
+    /// The server under test's `source` label in the archive, e.g. `vllm`
+    /// or `sglang`, so the Rezolus viewer's built-in template for that
+    /// server matches it. None => the name its stream handshake gives, or
+    /// one made from its host and port.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub server_source: Option<String>,
     /// The archive for the server under test and llm-perf when `output` is a
     /// parquet. Must end in `.dendro`. Defaults to
     /// `<output-stem>.server.dendro`.
@@ -529,6 +535,23 @@ impl MetricsConfig {
                 .map_err(|e| anyhow::anyhow!("[metrics] server_metrics_url {url:?}: {e}"))?;
             if !matches!(parsed.scheme(), "http" | "https") {
                 anyhow::bail!("[metrics] server_metrics_url {url:?} must be an http or https URL");
+            }
+        }
+        if let Some(s) = self.server_source.as_deref().map(str::trim) {
+            if self.server_metrics_url.is_none() {
+                anyhow::bail!(
+                    "[metrics] server_source names the server under test; set \
+                     server_metrics_url or remove it"
+                );
+            }
+            if s.is_empty() {
+                anyhow::bail!("[metrics] server_source must not be empty");
+            }
+            if s.eq_ignore_ascii_case(crate::recording::LLM_PERF_SOURCE) {
+                anyhow::bail!(
+                    "[metrics] server_source {s:?} is llm-perf's own source; name the server \
+                     under test"
+                );
             }
         }
         // An unused server_metrics_output (no server_metrics_url) is left
@@ -1255,6 +1278,57 @@ mod server_metrics_config_tests {
         assert_eq!(
             cfg.recording_path(),
             Some(PathBuf::from("run.server.dendro"))
+        );
+    }
+
+    #[test]
+    fn server_source_is_optional() {
+        let named = metrics(
+            r#"
+            output = "run.dendro"
+            server_metrics_url = "http://x/metrics"
+            server_source = "vllm"
+        "#,
+        );
+        assert_eq!(named.server_source.as_deref(), Some("vllm"));
+        named.validate().unwrap();
+        let unnamed = metrics(r#"output = "run.dendro""#);
+        assert_eq!(unnamed.server_source, None);
+        unnamed.validate().unwrap();
+    }
+
+    /// `server_source` is refused when empty, when it is llm-perf's own
+    /// source in any case, and without a server to name.
+    #[test]
+    fn server_source_is_validated() {
+        let refused = |toml: &str| metrics(toml).validate().unwrap_err().to_string();
+        let with_url = |source: &str| {
+            format!(
+                "output = \"run.dendro\"\nserver_metrics_url = \"http://x/metrics\"\n\
+                 server_source = {source:?}"
+            )
+        };
+        for empty in ["", "  "] {
+            assert_eq!(
+                refused(&with_url(empty)),
+                "[metrics] server_source must not be empty",
+                "{empty:?}"
+            );
+        }
+        assert_eq!(
+            refused(&with_url(" llm-perf ")),
+            "[metrics] server_source \"llm-perf\" is llm-perf's own source; name the server \
+             under test"
+        );
+        assert_eq!(
+            refused(&with_url("LLM-Perf")),
+            "[metrics] server_source \"LLM-Perf\" is llm-perf's own source; name the server \
+             under test"
+        );
+        assert_eq!(
+            refused("output = \"run.dendro\"\nserver_source = \"vllm\""),
+            "[metrics] server_source names the server under test; set server_metrics_url or \
+             remove it"
         );
     }
 

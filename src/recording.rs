@@ -125,7 +125,11 @@ impl RunRecorder {
         if let Some(url) = &mc.server_metrics_url {
             let url = url::Url::parse(url)
                 .with_context(|| format!("[metrics] server_metrics_url {url:?}"))?;
-            specs.push(EndpointSpec::new(url).with_label(ROLE, ROLE_SERVICE));
+            let mut spec = EndpointSpec::new(url).with_label(ROLE, ROLE_SERVICE);
+            if let Some(source) = &mc.server_source {
+                spec = spec.with_label("source", source.trim());
+            }
+            specs.push(spec);
         }
         let detected = if specs.is_empty() {
             Vec::new()
@@ -168,7 +172,15 @@ impl RunRecorder {
                 ("source".to_string(), LLM_PERF_SOURCE.to_string()),
                 (ROLE.to_string(), ROLE_LOADGEN.to_string()),
             ]),
-            BTreeMap::from([("version".to_string(), env!("CARGO_PKG_VERSION").to_string())]),
+            // The KPI template travels in llm-perf's own source's metadata,
+            // as it does in the stream handshake.
+            BTreeMap::from([
+                ("version".to_string(), env!("CARGO_PKG_VERSION").to_string()),
+                (
+                    crate::template::KEY_SERVICE_QUERIES.to_string(),
+                    crate::template::SERVICE_QUERIES.to_string(),
+                ),
+            ]),
         );
         let (recorder, _ids, rx) = Recorder::start(
             cfg,
@@ -553,6 +565,7 @@ mod tests {
             interval: "100ms".to_string(),
             batch_size: None,
             server_metrics_url: url,
+            server_source: None,
             server_metrics_output: None,
             rezolus_bin: None,
         }
@@ -643,6 +656,49 @@ mod tests {
                     && l.get("source").map(String::as_str) != Some(LLM_PERF_SOURCE)),
             "{sets:?}"
         );
+        // llm-perf's template is llm-perf's: the server's recording does not
+        // carry it.
+        let catalog = DendroCatalog::open(&path).unwrap();
+        let server = catalog
+            .sources()
+            .unwrap()
+            .into_iter()
+            .find(|s| s.labels.get(ROLE).map(String::as_str) == Some(ROLE_SERVICE))
+            .unwrap();
+        assert!(
+            !server
+                .metadata
+                .contains_key(crate::template::KEY_SERVICE_QUERIES),
+            "{:?}",
+            server.metadata
+        );
+    }
+
+    /// `server_source` names the server under test's recording, so the
+    /// viewer's built-in template for that server (selecting
+    /// `source="vllm"`) matches it.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn server_source_names_the_servers_recording() {
+        let mut server = mockito::Server::new_async().await;
+        let _m = server
+            .mock("GET", "/metrics")
+            .with_header("content-type", "text/plain; version=0.0.4")
+            .with_body("# TYPE vllm_requests_total counter\nvllm_requests_total 5\n")
+            .create_async()
+            .await;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("run.dendro");
+        let mut mc = mc(&path, Some(format!("{}/metrics", server.url())));
+        // Trimmed, as validation reads it.
+        mc.server_source = Some(" vllm ".to_string());
+
+        assert_eq!(record_for(&mc, Duration::from_millis(600)).await, None);
+
+        let sets = label_sets(&path);
+        assert!(
+            sets.contains(&labels(&[("role", ROLE_SERVICE), ("source", "vllm")])),
+            "{sets:?}"
+        );
     }
 
     #[tokio::test(flavor = "multi_thread")]
@@ -657,6 +713,16 @@ mod tests {
 
         let sources = sources(&path);
         assert_eq!(sources.keys().collect::<Vec<_>>(), [LLM_PERF_SOURCE]);
+
+        // llm-perf's source carries its KPI template for the viewer.
+        let catalog = DendroCatalog::open(&path).unwrap();
+        let ours = catalog.sources().unwrap().into_iter().next().unwrap();
+        assert_eq!(
+            ours.metadata
+                .get(crate::template::KEY_SERVICE_QUERIES)
+                .map(String::as_str),
+            Some(crate::template::SERVICE_QUERIES)
+        );
     }
 
     #[tokio::test(flavor = "multi_thread")]

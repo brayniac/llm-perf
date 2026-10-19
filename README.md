@@ -349,7 +349,8 @@ level = "info"
 | `/metrics/stream` | dendro replication frames (`application/vnd.metriken.replication.v1+dendro`) |
 
 `/metrics/stream` takes `interval` (default `1s`) and `layout` (`wide`, the
-default, or `long`). It sends a handshake naming `source=llm-perf` and then one
+default, or `long`). It sends a handshake naming `source=llm-perf`, with the
+version and the [KPI template](#kpi-template) in its metadata, and then one
 frame per interval, each carrying every metric recorded so far, histograms with their buckets,
 until the client disconnects. A zero or malformed interval and an unknown
 layout are refused with 400 and the reason; an interval below 10 ms is served
@@ -404,9 +405,9 @@ summary says so in a warning with the last reason, and the archive holds
 llm-perf alone.
 
 llm-perf's recording is labeled `source=llm-perf, role=loadgen`. The server's
-is labeled `role=service`, and its `source` is the name its stream's
-handshake gives (`rezolus`, `llm-perf`, ...) or, for a scraped server, one
-made from its host and port.
+is labeled `role=service`, and its `source` is `server_source` when set,
+otherwise the name its stream's handshake gives (`rezolus`, `llm-perf`, ...)
+or, for a scraped server, one made from its host and port.
 
 With a parquet `output`, llm-perf still writes the parquet at exit, and with
 `server_metrics_url` set it also records the archive at
@@ -439,6 +440,46 @@ To pick llm-perf's own recording out of the archive, select `role=loadgen`
 (for example `rezolus mcp query run.dendro ... --recording role=loadgen`):
 when the server under test is another llm-perf, `source=llm-perf` matches
 both.
+
+### KPI template
+
+llm-perf's KPI template is `templates/llm-perf.json`, a Rezolus
+`ServiceExtension`: the throughput, latency and error charts the Rezolus
+viewer shows as llm-perf's section. It travels in every recording llm-perf
+makes or serves, under the `service_queries` metadata key: in the
+`/metrics/stream` handshake, which `rezolus record` keeps in the source's
+metadata; in llm-perf's own source in the run's `.dendro`; and in the file
+metadata of the parquet written at exit. The viewer renders the template a
+`.dendro` recording carries, so a change to it ships with llm-perf. Rezolus's
+built-in copy is used only for recordings that carry none (made by an older
+llm-perf, or scraped from `/metrics`). Every query selects
+`source="llm-perf"`, and a parquet's series carry no `source` label (the
+source is in the file metadata only), so the parquet's KPI charts are empty
+until rezolus attaches a single-source parquet's source to its series as a
+label. Tests in `src/template.rs` check that each query names metrics only
+through selectors, each naming `source="llm-perf"`, that those are metrics
+llm-perf registers, with label values its metrics carry, and that every
+`unit_system` is one the viewer knows.
+
+llm-perf attaches no template to the server under test's recording. A
+streamed server sends its own. A scraped one (vLLM, SGLang) is named after
+its host and port unless `[metrics] server_source` names it; the viewer's
+built-in vLLM and SGLang templates select `source="vllm"` and
+`source="sglang"`, so set `server_source = "vllm"` (or `"sglang"`) for them
+to apply. `server_source` needs `server_metrics_url`, and an empty value or
+`llm-perf` (in any case) is refused at startup:
+
+```toml
+[metrics]
+output = "run.dendro"
+server_metrics_url = "http://localhost:8000/metrics"
+server_source = "vllm"
+```
+
+When `rezolus record` records the server instead, give it the same name:
+`rezolus record --endpoint http://host:8000/metrics,source=vllm -o
+server.dendro`; a recording whose source is `vllm` gets the viewer's built-in
+vLLM template.
 
 ### Input Format
 
