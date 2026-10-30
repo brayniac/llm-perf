@@ -630,6 +630,35 @@ pub struct LogprobsConfig {
     pub top_logprobs: u8,
     /// Path to write logprobs JSONL output
     pub output: PathBuf,
+    /// How each prompt is sent: `"chat"` (the default) or `"raw"`.
+    #[serde(default)]
+    pub mode: LogprobsMode,
+}
+
+/// How the `logprobs` subcommand sends each prompt. Every record it writes
+/// carries the mode, and `kl-divergence` refuses to compare captures made in
+/// different modes.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum LogprobsMode {
+    /// The prompt is one user message to `/chat/completions`, so the server
+    /// applies the chat template and the capture is the first token of the
+    /// reply.
+    #[default]
+    Chat,
+    /// The prompt text is sent to `/completions` with no chat template, so the
+    /// capture is the token that follows it. Use this for base (non-instruct)
+    /// models.
+    Raw,
+}
+
+impl LogprobsMode {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            LogprobsMode::Chat => "chat",
+            LogprobsMode::Raw => "raw",
+        }
+    }
 }
 
 fn default_top_logprobs() -> u8 {

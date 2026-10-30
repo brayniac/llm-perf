@@ -3,6 +3,7 @@ use serde::Serialize;
 use std::collections::HashMap;
 use std::path::Path;
 
+use crate::config::LogprobsMode;
 use crate::logprobs::{LogprobRecord, load_logprob_file};
 
 /// Small epsilon for smoothing to avoid log(0)
@@ -27,6 +28,8 @@ pub struct PromptKl {
 /// Aggregate KL divergence statistics
 #[derive(Debug, Clone, Serialize)]
 pub struct KlReport {
+    /// The `[logprobs]` mode both captures were made in.
+    pub mode: LogprobsMode,
     pub num_prompts_compared: usize,
     pub num_positions_compared: usize,
     pub num_prompts_skipped: usize,
@@ -69,6 +72,7 @@ pub fn run_kl_divergence(
     if candidate.is_empty() {
         anyhow::bail!("Candidate file is empty: {}", candidate_path.display());
     }
+    check_same_mode(&baseline, baseline_path, &candidate, candidate_path)?;
 
     let include_per_prompt = format == "json";
     let report = compute_kl_report(&baseline, &candidate, include_per_prompt)?;
@@ -93,6 +97,46 @@ pub fn run_kl_divergence(
         }
     }
 
+    Ok(())
+}
+
+/// The mode every record in one capture was made in. Fails when the records
+/// disagree, as in two captures concatenated into one file.
+fn capture_mode(records: &[LogprobRecord], path: &Path) -> Result<LogprobsMode> {
+    let first = records.first().map(|r| r.mode).unwrap_or_default();
+    if let Some(other) = records.iter().find(|r| r.mode != first) {
+        anyhow::bail!(
+            "{} mixes {} and {} records (prompt_index {}); a capture must be made in one mode",
+            path.display(),
+            first.as_str(),
+            other.mode.as_str(),
+            other.prompt_index
+        );
+    }
+    Ok(first)
+}
+
+/// Refuse to compare a chat capture with a raw one. They measure different
+/// distributions: the first token of a chat reply, and the token that follows
+/// the untemplated prompt.
+fn check_same_mode(
+    baseline: &[LogprobRecord],
+    baseline_path: &Path,
+    candidate: &[LogprobRecord],
+    candidate_path: &Path,
+) -> Result<()> {
+    let b = capture_mode(baseline, baseline_path)?;
+    let c = capture_mode(candidate, candidate_path)?;
+    if b != c {
+        anyhow::bail!(
+            "baseline {} is a {} capture and candidate {} is a {} capture; \
+             capture both with the same [logprobs] mode",
+            baseline_path.display(),
+            b.as_str(),
+            candidate_path.display(),
+            c.as_str()
+        );
+    }
     Ok(())
 }
 
@@ -175,6 +219,8 @@ fn compute_kl_report(
     let aggregate = compute_aggregate_stats(&mut all_kl_values);
 
     Ok(KlReport {
+        // `run_kl_divergence` has checked that every record has this mode.
+        mode: baseline.first().map(|r| r.mode).unwrap_or_default(),
         num_prompts_compared: baseline.len() - skipped,
         num_positions_compared: all_kl_values.len(),
         num_prompts_skipped: skipped,
@@ -330,6 +376,7 @@ fn print_console_report(report: &KlReport, baseline_path: &Path, candidate_path:
     println!();
     println!("  Baseline:  {}", baseline_path.display());
     println!("  Candidate: {}", candidate_path.display());
+    println!("  Mode:      {}", report.mode.as_str());
     println!();
     println!("  Prompts compared: {}", report.num_prompts_compared);
     println!("  Prompts skipped:  {}", report.num_prompts_skipped);
@@ -483,11 +530,13 @@ mod tests {
             prompt_index: 0,
             prompt: String::new(),
             tokens: vec![tok(shared.clone()), tok(shared.clone())],
+            mode: LogprobsMode::Chat,
         }];
         let candidate = vec![LogprobRecord {
             prompt_index: 0,
             prompt: String::new(),
             tokens: vec![tok(shared.clone()), tok(elsewhere)],
+            mode: LogprobsMode::Chat,
         }];
         let rep = compute_kl_report(&baseline, &candidate, false).unwrap();
         assert_eq!(rep.num_positions_compared, 2);
@@ -514,6 +563,7 @@ mod tests {
                     make_top_logprob("hi", -2.0),
                 ],
             }],
+            mode: LogprobsMode::Chat,
         }];
         let candidate = vec![LogprobRecord {
             prompt_index: 0,
@@ -526,11 +576,103 @@ mod tests {
                     make_top_logprob("hi", -2.0),
                 ],
             }],
+            mode: LogprobsMode::Chat,
         }];
 
         let report = compute_kl_report(&baseline, &candidate, true).unwrap();
         assert_eq!(report.num_prompts_compared, 1);
         assert_eq!(report.num_prompts_skipped, 0);
         assert!(report.aggregate.mean < 1e-6);
+    }
+
+    fn record(prompt_index: usize, mode: LogprobsMode) -> LogprobRecord {
+        LogprobRecord {
+            prompt_index,
+            prompt: String::new(),
+            tokens: vec![TokenLogprob {
+                token: "a".into(),
+                logprob: -0.1,
+                top_logprobs: vec![make_top_logprob("a", -0.1)],
+            }],
+            mode,
+        }
+    }
+
+    fn write_capture(dir: &Path, name: &str, records: &[LogprobRecord]) -> std::path::PathBuf {
+        let path = dir.join(name);
+        let lines: Vec<String> = records
+            .iter()
+            .map(|r| serde_json::to_string(r).unwrap())
+            .collect();
+        std::fs::write(&path, lines.join("\n")).unwrap();
+        path
+    }
+
+    #[test]
+    fn chat_and_raw_captures_are_not_compared() {
+        let dir = tempfile::tempdir().unwrap();
+        let chat = write_capture(dir.path(), "chat.jsonl", &[record(0, LogprobsMode::Chat)]);
+        let raw = write_capture(dir.path(), "raw.jsonl", &[record(0, LogprobsMode::Raw)]);
+        let out = dir.path().join("report.json");
+        for (b, c) in [(&chat, &raw), (&raw, &chat)] {
+            let err = run_kl_divergence(b, c, "json", Some(&out))
+                .unwrap_err()
+                .to_string();
+            assert!(
+                err.contains("capture both with the same [logprobs] mode"),
+                "{err}"
+            );
+            assert!(!out.exists(), "no report is written");
+        }
+    }
+
+    #[test]
+    fn same_mode_captures_are_compared() {
+        let dir = tempfile::tempdir().unwrap();
+        for mode in [LogprobsMode::Chat, LogprobsMode::Raw] {
+            let b = write_capture(dir.path(), "b.jsonl", &[record(0, mode)]);
+            let c = write_capture(dir.path(), "c.jsonl", &[record(0, mode)]);
+            let out = dir.path().join("report.json");
+            run_kl_divergence(&b, &c, "json", Some(&out)).unwrap();
+            let report: serde_json::Value =
+                serde_json::from_str(&std::fs::read_to_string(&out).unwrap()).unwrap();
+            assert_eq!(report["mode"], mode.as_str());
+            std::fs::remove_file(&out).unwrap();
+        }
+    }
+
+    #[test]
+    fn capture_without_mode_counts_as_chat() {
+        // A file written before records carried `mode`.
+        let dir = tempfile::tempdir().unwrap();
+        let line = r#"{"prompt_index":0,"prompt":"","tokens":[{"token":"a","logprob":-0.1,"top_logprobs":[{"token":"a","logprob":-0.1}]}]}"#;
+        let old = dir.path().join("old.jsonl");
+        std::fs::write(&old, line).unwrap();
+        let chat = write_capture(dir.path(), "chat.jsonl", &[record(0, LogprobsMode::Chat)]);
+        let raw = write_capture(dir.path(), "raw.jsonl", &[record(0, LogprobsMode::Raw)]);
+        let out = dir.path().join("report.json");
+        run_kl_divergence(&old, &chat, "json", Some(&out)).unwrap();
+        let err = run_kl_divergence(&old, &raw, "json", None)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("is a chat capture"), "{err}");
+    }
+
+    #[test]
+    fn capture_with_mixed_modes_is_refused() {
+        let dir = tempfile::tempdir().unwrap();
+        let mixed = write_capture(
+            dir.path(),
+            "mixed.jsonl",
+            &[record(0, LogprobsMode::Raw), record(1, LogprobsMode::Chat)],
+        );
+        let raw = write_capture(dir.path(), "raw.jsonl", &[record(0, LogprobsMode::Raw)]);
+        let err = run_kl_divergence(&raw, &mixed, "json", None)
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("mixes raw and chat records (prompt_index 1)"),
+            "{err}"
+        );
     }
 }

@@ -103,6 +103,12 @@ pub struct CompletionRequest {
     pub stop: Option<Vec<String>>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub stream: Option<bool>,
+    /// Number of top tokens to return log probabilities for, as an integer
+    /// (the legacy OpenAI completions field). llama-server reads `logprobs` as
+    /// an alias of `n_probs`; `true` there means 1, and it ignores
+    /// `top_logprobs` on this endpoint.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub logprobs: Option<u8>,
 }
 
 /// Response body from `/completions`. Fields not declared here are ignored.
@@ -119,6 +125,10 @@ pub struct CompletionChoice {
     pub text: String,
     #[serde(default)]
     pub finish_reason: Option<String>,
+    /// Kept as JSON: servers return different shapes here, and
+    /// `logprobs::parse_completion_logprobs` reads the one it supports.
+    #[serde(default)]
+    pub logprobs: Option<serde_json::Value>,
 }
 
 /// llama-server `POST /tokenize` response (without `with_pieces`).
@@ -534,6 +544,11 @@ impl OpenAIClient {
     ) -> Result<ChatCompletionResponse> {
         let url = format!("{}/chat/completions", self.base_url);
         self.post_with_retry(&url, &request).await
+    }
+
+    /// The model name sent in each request.
+    pub fn model(&self) -> &str {
+        &self.model
     }
 
     /// Non-streaming request to the legacy `/completions` endpoint, which takes
@@ -1908,6 +1923,7 @@ mod tests {
             presence_penalty: None,
             stop: Some(vec!["Question:".to_string()]),
             stream: Some(false),
+            logprobs: None,
         };
         let body: serde_json::Value = serde_json::to_value(&req).unwrap();
         assert_eq!(body["prompt"], req.prompt.as_str());
@@ -1916,6 +1932,7 @@ mod tests {
         assert_eq!(body["stream"], false);
         assert!(body.get("messages").is_none());
         assert!(body.get("top_p").is_none());
+        assert!(body.get("logprobs").is_none());
     }
 
     #[test]

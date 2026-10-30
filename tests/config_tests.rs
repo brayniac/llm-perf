@@ -1,4 +1,4 @@
-use llm_perf::config::{Config, ReplayServer};
+use llm_perf::config::{Config, LogprobsMode, ReplayServer};
 use std::path::PathBuf;
 
 fn base_toml() -> &'static str {
@@ -337,4 +337,36 @@ fn pool_idle_timeout_defaults_to_two_seconds_and_can_be_set() {
     );
     let cfg = Config::from_toml(&toml).unwrap();
     assert_eq!(cfg.endpoint.pool_idle_timeout_ms, 60000);
+}
+
+#[test]
+fn logprobs_mode_defaults_to_chat() {
+    let toml = format!(
+        "{}\n[logprobs]\nenabled = true\noutput = \"l.jsonl\"\n",
+        base_toml()
+    );
+    let cfg = Config::from_toml(&toml).unwrap();
+    assert_eq!(cfg.logprobs.unwrap().mode, LogprobsMode::Chat);
+}
+
+#[test]
+fn logprobs_mode_parses() {
+    for (value, mode) in [("chat", LogprobsMode::Chat), ("raw", LogprobsMode::Raw)] {
+        let toml = format!(
+            "{}\n[logprobs]\nenabled = true\noutput = \"l.jsonl\"\nmode = \"{value}\"\n",
+            base_toml()
+        );
+        let cfg = Config::from_toml(&toml).unwrap();
+        assert_eq!(cfg.logprobs.unwrap().mode, mode, "{value}");
+    }
+}
+
+#[test]
+fn logprobs_mode_rejects_other_values() {
+    let toml = format!(
+        "{}\n[logprobs]\nenabled = true\noutput = \"l.jsonl\"\nmode = \"completion\"\n",
+        base_toml()
+    );
+    let err = format!("{:#}", Config::from_toml(&toml).unwrap_err());
+    assert!(err.contains("unknown variant `completion`"), "{err}");
 }

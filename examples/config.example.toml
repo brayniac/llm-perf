@@ -346,15 +346,37 @@ level = "info"
 # =============================================================================
 # Logprobs Configuration (Optional)
 # =============================================================================
-# Capture token-level log probabilities during benchmark runs.
-# Useful for comparing quantized models via KL divergence analysis.
-# Usage: Run benchmarks with logprobs enabled, then compare with:
+# Token-level log probabilities for each prompt in [input], for comparing
+# quantized models by KL divergence. Collect with `llm-perf logprobs <config>`,
+# which sends the prompts one at a time, then compare two captures with:
 #   llm-perf kl-divergence baseline.jsonl candidate.jsonl
+#
+# mode sets how each prompt is sent:
+#   "chat" (default): one user message to /chat/completions; the server applies
+#     the chat template, and the capture is the first token of the reply.
+#   "raw": the prompt text to /completions with no chat template, `logprobs` set
+#     to top_logprobs and greedy sampling. llama-server tokenizes it, adding BOS
+#     when the model uses one and reading special-token text such as
+#     <|endoftext|> as that token. The capture is the token that follows the
+#     prompt; max_tokens defaults to 1, and a larger max_tokens from [endpoint]
+#     or the prompt also captures the tokens generated after it. Use raw for
+#     base (non-instruct) models. It reads llama-server's response shape
+#     (logprobs.content). A raw run stops with an error on a response in the
+#     legacy OpenAI shape (token_logprobs, top_logprobs as maps), when it has
+#     no prompts to send, or when it cannot write the output, and exits
+#     non-zero when it captures no records.
+#     llama-server returns no logprobs when the next token ends inside a UTF-8
+#     character, such as one byte of an emoji; that prompt is skipped with a
+#     warning.
+# Every record carries `mode` ("chat" or "raw"). kl-divergence refuses to
+# compare captures made in different modes and reports the mode. Records
+# without `mode`, written before llm-perf added the field, count as chat.
 #
 # [logprobs]
 # enabled = true
 # top_logprobs = 5       # Number of top token probabilities to capture (1-20)
 # output = "logprobs.jsonl"  # Path to write JSONL output
+# mode = "chat"          # "chat" or "raw"
 
 # =============================================================================
 # Trace Replay Configuration (Optional)
