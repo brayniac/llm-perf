@@ -28,9 +28,13 @@ All notable changes to this project will be documented in this file.
 
 ### Security
 
-- Bump quinn-proto -> 0.11.19 (RUSTSEC-2026-0338 to -0342) (#191)
+- Bump quinn-proto 0.11.15 -> 0.11.19 (RUSTSEC-2026-0338 to -0342) (#191)
 - Bump rustls 0.23.45 -> 0.23.46 (RUSTSEC-2026-0346 to -0349) (#193)
-- Bump rustls-webpki 0.103.15 -> 0.103.16 (RUSTSEC-2026-0382), webpki-roots 1.0.6 -> 1.0.11 (RUSTSEC-2026-0381), webpki-root-certs 1.0.9 -> 1.0.11 (RUSTSEC-2026-0383) and zstd-sys 2.0.15 -> 2.1.2 (RUSTSEC-2026-0410). zstd 0.13.3 (RUSTSEC-2026-0391) and zstd-safe 7.2.4 (RUSTSEC-2026-0398, -0403) remain: their fixes are in semver-major releases.
+- Bump rustls-webpki 0.103.15 -> 0.103.16 (RUSTSEC-2026-0382) (#199)
+- Bump webpki-roots 1.0.6 -> 1.0.11 (RUSTSEC-2026-0381) (#199)
+- Bump webpki-root-certs 1.0.9 -> 1.0.11 (RUSTSEC-2026-0383) (#199)
+- Bump zstd-sys 2.0.15 -> 2.1.2 (RUSTSEC-2026-0410) (#199)
+- zstd 0.13.3 (RUSTSEC-2026-0391) and zstd-safe 7.2.4 (RUSTSEC-2026-0398, -0403) remain; their fixes are in semver-major releases (zstd 0.14.3, zstd-safe 8.2.0).
 
 ## [0.1.20] - 2026-10-07
 
