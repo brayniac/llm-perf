@@ -222,8 +222,10 @@ impl RunRecorder {
     }
 
     /// End the recording. After a run that `completed`: one more pass of
-    /// llm-perf and a scraped server, a wait of up to one interval plus the
-    /// timeout for a streamed server's next frame, then finalize. After a run
+    /// llm-perf and a scraped server, a wait for a streamed server's next
+    /// frame of up to the longer of one interval and the interval the server
+    /// serves, plus the recorder's timeout (twice the interval, 2 s to
+    /// 10 s), then finalize. After a run
     /// that failed, no wait, since the benchmark's workers may still be
     /// sending load. Returns what went wrong, for the benchmark summary; it
     /// is also logged.
@@ -241,8 +243,9 @@ impl RunRecorder {
         let stop = if completed {
             if self.shared.seen.lock().map(|s| s.streamed).unwrap_or(false) {
                 log::info!(
-                    "finalizing {:?}: waiting up to {:?} for the server under test's last \
-                     frame (Ctrl-C ends the wait; the report is still written)",
+                    "finalizing {:?}: waiting up to {:?}, or the server's served interval \
+                     plus the timeout if longer, for the server under test's last frame \
+                     (Ctrl-C ends the wait; the report is still written)",
                     self.shared.path,
                     self.bound
                 );

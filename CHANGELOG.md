@@ -4,9 +4,20 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+### Changes
+
+- metriken-recorder 0.3.1: with `server_metrics_url` set to a Prometheus `/metrics` URL, a label value containing `=` or `,` is recorded as written (it was dropped or cut short), a sample whose label value contains `}` is recorded (it was dropped), and an escaped value is stored unescaped. A sample line that does not parse (a label name with `.`, `-` or `:`, an unquoted value) is skipped, logged at `warn` the first time for each endpoint and at `debug` after; prometheus-parse kept some such lines under the labels it could split.
+- metriken-recorder 0.3.0: a streamed server is recorded at the interval it serves, and the wait for its last frame after a completed run is up to the longer of `[metrics] interval` and that interval, plus twice `[metrics] interval` (at least 2 s, at most 10 s).
+- metriken-exposition 0.23.2: `/metrics/stream` reuses a built pass for three quarters of the 10 ms floor (was the whole floor), so a subscriber at the floor that wakes up to 2.5 ms early is sent a new pass, where it was sent the previous one again as an empty frame.
+- `.dendro` archives are still dendro schema 4, which rezolus 5.21 to 5.28 read.
+
 ### Bug Fixes
 
 - Release packages: every Debian/Ubuntu job of an architecture built the same file name (`llm-perf_<version>_amd64.deb`), as did the Rocky and Amazon Linux jobs (`llm-perf-<version>-1.x86_64.rpm`), and the release job downloaded them into one directory, where concurrent downloads interleaved their bytes. 26 of the 42 `.deb` and `.rpm` assets of v0.1.15 to v0.1.21 are corrupt: `ar` reports a malformed archive, the payload fails to decompress, or `rpm -K` reports `DIGESTS NOT OK`. An intact asset is one distro's build, and its name does not say which. Release assets are now named `<distro>_<release>_<arch>_<file>`, each is checked with `ar`/`dpkg-deb` or `rpm -K` before upload, a `SHA256SUMS` is attached, and Ubuntu's `-dbgsym` `.ddeb` files are published. The workflow can be run by hand with a `tag` input to rebuild an existing release's packages.
+
+### Security
+
+- Bump metriken-exposition 0.22.1 -> 0.23.2, metriken-storage 0.2.3 -> 0.3.2, metriken-recorder 0.1.1 -> 0.3.1 and dendro 0.4.2 -> 0.5.1, which move parquet 58 -> 60: zstd 0.13.3 -> 0.14.3 (RUSTSEC-2026-0391), zstd-safe 7.2.4 -> 8.2.0 (RUSTSEC-2026-0398, -0403), lru 0.12.5 -> 0.18.5 (RUSTSEC-2026-0002, -0253)
 
 ## [0.1.21] - 2026-10-29
 

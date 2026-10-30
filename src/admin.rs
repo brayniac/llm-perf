@@ -18,12 +18,10 @@ use warp::reply::{Reply, Response};
 /// The namespace of the one group the stream carries: `llm-perf/main`.
 pub const STREAM_NAMESPACE: &str = "llm-perf";
 
-/// How long a built stream pass is reused, and the shortest interval
-/// served. Well below the intervals a recorder asks for
-/// (one second by default): at an interval equal to the floor, wake-time
-/// jitter can hand a subscriber the previous boundary's pass and that
-/// interval's frame is empty (`RegistryPasses::new`). rezolus and
-/// cachecannon use the same value.
+/// The shortest interval served, and the update floor a subscription
+/// reports. A built pass is reused for three quarters of it
+/// (`RegistryPasses::new`). Well below the intervals a recorder asks for
+/// (one second by default). rezolus and cachecannon use the same value.
 pub const UPDATE_FLOOR: Duration = Duration::from_millis(10);
 
 /// The passes every stream subscription on this server shares: one registry
