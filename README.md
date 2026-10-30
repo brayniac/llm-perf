@@ -154,6 +154,14 @@ llm-perf convert-trace date.2026-06-03.tar.gz --max-context 131072 \
     --from 2026-06-03T00:00:00Z --to 2026-06-04T00:00:00Z -o trace.jsonl
 ```
 
+`logprobs` reads the `[logprobs]` section (`enabled`, `top_logprobs`, `output`,
+`mode`). `mode = "chat"`, the default, sends each prompt as one user message to
+`/chat/completions`. `mode = "raw"` sends the prompt text to `/completions`
+with no chat template and captures the token that follows it, which is the
+distribution to measure for a base model; it reads llama-server's response
+shape. Each record in the output carries `mode`, and `kl-divergence` refuses to
+compare a chat capture with a raw one. See `examples/config.example.toml`.
+
 `convert-trace` writes one JSON object per session, sorted by start. A session
 carries `session_id`, `start` (RFC 3339), `start_ms` (milliseconds from the
 earliest `start` in the output), `models` (distinct labels) and `calls`. Each

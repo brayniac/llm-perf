@@ -881,6 +881,7 @@ pub async fn run_evaluation(
                             presence_penalty: Some(presence_penalty),
                             stop,
                             stream: Some(false),
+                            logprobs: None,
                         };
                         let outcome = client.completion(request).await.map(|r| {
                             let text = r

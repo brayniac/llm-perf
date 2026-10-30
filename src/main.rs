@@ -206,6 +206,7 @@ fn run_logprobs_mode(config_path: &std::path::Path) -> Result<()> {
         println!("LLM Logprobs Collection");
         println!("   Config: {}", config_path.display());
         println!("   Target: {}", config.endpoint.base_url);
+        println!("   Mode: {}", lp_config.mode.as_str());
         println!("   Top logprobs: {}", lp_config.top_logprobs);
         println!("   Output: {}", lp_config.output.display());
         println!();
@@ -367,7 +368,8 @@ async fn run_logprobs_collection(
     lp_config: llm_perf::config::LogprobsConfig,
 ) -> Result<()> {
     use llm_perf::benchmark::Prompt;
-    use llm_perf::logprobs::{LogprobRecord, LogprobWriter};
+    use llm_perf::config::LogprobsMode;
+    use llm_perf::logprobs::{Capture, LogprobWriter, capture_prompt};
     use tokio::io::AsyncBufReadExt;
 
     // Wait for server readiness if configured
@@ -438,47 +440,62 @@ async fn run_logprobs_collection(
 
     info!("Loaded {} prompts", prompts.len());
 
+    // Checked before the writer creates (and truncates) the output file. The
+    // chat mode keeps its exit status of 0 with no prompts.
+    if lp_config.mode == LogprobsMode::Raw && prompts.is_empty() {
+        let cause = match input.sample_size {
+            Some(0) => " (sample_size = 0)",
+            _ => "",
+        };
+        anyhow::bail!("no prompts to send from {}{cause}", input.file.display());
+    }
+
     // Set up writer channel
     let (tx, writer) = LogprobWriter::new(lp_config.output.clone(), 256);
     let writer_handle = tokio::spawn(async move {
-        if let Err(e) = writer.run().await {
+        let result = writer.run().await;
+        if let Err(e) = &result {
             log::error!("Logprob writer error: {}", e);
         }
+        result
     });
 
     // Process prompts sequentially
     let total = prompts.len();
+    let mut written = 0usize;
+    let mut fatal = None;
     for (idx, prompt) in prompts.iter().enumerate() {
         debug!("Processing prompt {}/{}", idx + 1, total);
 
-        let request = client.create_request(
+        let max_tokens =
+            llm_perf::config::resolve_max_tokens(config.endpoint.max_tokens, prompt.max_tokens);
+        let capture = capture_prompt(
+            &client,
+            lp_config.mode,
+            idx,
             &prompt.prompt,
-            llm_perf::config::resolve_max_tokens(config.endpoint.max_tokens, prompt.max_tokens),
-            Some(true),
-            Some(lp_config.top_logprobs),
-        );
-
-        match client.chat_completion_stream(request).await {
-            Ok(mut stream) => {
-                // Consume the stream
-                while let Some(_chunk) = stream.next_chunk().await? {}
-
-                let collected = stream.logprobs();
-                if !collected.is_empty() {
-                    let record = LogprobRecord {
-                        prompt_index: idx,
-                        prompt: prompt.prompt.clone(),
-                        tokens: collected.to_vec(),
-                    };
-                    if let Err(e) = tx.send(record).await {
-                        warn!("Failed to send logprob record: {}", e);
+            max_tokens,
+            lp_config.top_logprobs,
+        )
+        .await;
+        match capture {
+            Ok(Capture::Record(record)) => {
+                if let Err(e) = tx.send(record).await {
+                    warn!("Failed to send logprob record: {}", e);
+                    // The send fails only after the writer task has ended;
+                    // its error is reported after the loop.
+                    if lp_config.mode == LogprobsMode::Raw {
+                        break;
                     }
                 } else {
-                    warn!("No logprobs returned for prompt {}", idx);
+                    written += 1;
                 }
             }
+            Ok(Capture::Empty) => warn!("No logprobs returned for prompt {}", idx),
+            Ok(Capture::Failed(e)) => warn!("Request failed for prompt {}: {}", idx, e),
             Err(e) => {
-                warn!("Request failed for prompt {}: {}", idx, e);
+                fatal = Some(e);
+                break;
             }
         }
 
@@ -489,12 +506,29 @@ async fn run_logprobs_collection(
 
     // Close sender to signal writer to finish
     drop(tx);
-    let _ = writer_handle.await;
+    let written_ok = writer_handle.await;
+    if let Some(e) = fatal {
+        return Err(e);
+    }
+    // An empty raw capture would only fail later, in kl-divergence, and an
+    // incomplete one would be compared on fewer prompts. The chat mode keeps
+    // its exit status of 0 in these cases.
+    if lp_config.mode == LogprobsMode::Raw {
+        written_ok
+            .context("logprobs writer task")?
+            .with_context(|| format!("writing {}", lp_config.output.display()))?;
+        if written == 0 {
+            anyhow::bail!(
+                "no logprobs were captured for any of {total} prompts; see the warnings above"
+            );
+        }
+    }
 
     if !config.output.quiet {
         println!();
         println!("Logprobs collection complete");
         println!("   Prompts processed: {}", total);
+        println!("   Records written: {}", written);
         println!("   Output: {}", lp_config.output.display());
     }
 
