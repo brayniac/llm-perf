@@ -1,6 +1,6 @@
 [package]
 name = "llm-perf"
-version = "0.1.22-alpha.1"
+version = "0.1.22-alpha.2"
 edition = "2024"
 authors = ["Brian Martin <brayniac@gmail.com>"]
 description = "A benchmarking tool for OpenAI-compatible LLM servers"
@@ -26,12 +26,12 @@ log = "0.4"
 metriken = "0.11.3"
 # `stream-tokio`: the `/metrics/stream` route and its body as a tokio stream
 # (src/admin.rs).
-metriken-exposition = { version = "0.22.0", features = ["json", "msgpack", "stream", "stream-tokio"] }
+metriken-exposition = { version = "0.23.2", features = ["json", "msgpack", "stream", "stream-tokio"] }
 # The msgpack-to-parquet conversion behind `[metrics] output` (src/snapshot.rs).
-metriken-storage = { version = "0.2.0", default-features = false, features = ["convert"] }
+metriken-storage = { version = "0.3.2", default-features = false, features = ["convert"] }
 # Records the run into a `.dendro` in process (src/recording.rs): the server
 # under test over HTTP (`http`, default) and llm-perf's registry (`registry`).
-metriken-recorder = { version = "0.1.1", features = ["registry"] }
+metriken-recorder = { version = "0.3.1", features = ["registry"] }
 libc = "0.2"
 num_cpus = "1.16"
 parquet = { version = "56", default-features = false, features = ["arrow"] }
@@ -72,10 +72,10 @@ tar = "0.4.46"
 # Decode `/metrics/stream` in the admin tests: dendro's frame reader, and the
 # group row payload the frames carry. Both are already in the graph through
 # metriken-exposition's `stream` feature.
-dendro = { version = "0.4", default-features = false }
+dendro = { version = "0.5.1", default-features = false }
 metriken-model = "0.1.1"
 # Open the run's archive in the recording tests (`DendroCatalog`).
-metriken-storage = { version = "0.2.3", default-features = false, features = ["archive"] }
+metriken-storage = { version = "0.3.2", default-features = false, features = ["archive"] }
 mockito = "1.2"
 pretty_assertions = "1.4"
 
