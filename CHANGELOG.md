@@ -4,6 +4,10 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+### Bug Fixes
+
+- Release packages: every Debian/Ubuntu job of an architecture built the same file name (`llm-perf_<version>_amd64.deb`), as did the Rocky and Amazon Linux jobs (`llm-perf-<version>-1.x86_64.rpm`), and the release job downloaded them into one directory, where concurrent downloads interleaved their bytes. 26 of the 42 `.deb` and `.rpm` assets of v0.1.15 to v0.1.21 are corrupt: `ar` reports a malformed archive, the payload fails to decompress, or `rpm -K` reports `DIGESTS NOT OK`. An intact asset is one distro's build, and its name does not say which. Release assets are now named `<distro>_<release>_<arch>_<file>`, each is checked with `ar`/`dpkg-deb` or `rpm -K` before upload, a `SHA256SUMS` is attached, and Ubuntu's `-dbgsym` `.ddeb` files are published. The workflow can be run by hand with a `tag` input to rebuild an existing release's packages.
+
 ## [0.1.21] - 2026-10-29
 
 ### Features

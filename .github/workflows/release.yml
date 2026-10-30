@@ -4,12 +4,23 @@ on:
   push:
     tags:
       - 'v*'
+  # Rebuild an existing tag and upload its packages to that tag's release.
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: 'Existing tag to rebuild, e.g. v0.1.21'
+        required: true
+        type: string
 
 env:
   CARGO_TERM_COLOR: always
+  TAG: ${{ inputs.tag || github.ref_name }}
 
 permissions:
   contents: write
+
+concurrency:
+  group: release-${{ inputs.tag || github.ref_name }}
 
 jobs:
   build-deb:
@@ -35,6 +46,8 @@ jobs:
       DEB_BUILD_OPTS: nocheck
     steps:
       - uses: actions/checkout@v7
+        with:
+          ref: ${{ env.TAG }}
 
       - name: run packaging script
         run: |
@@ -50,6 +63,7 @@ jobs:
 
       - uses: actions/upload-artifact@v7
         with:
+          if-no-files-found: error
           path: target/debian/*
           name: deb_${{ matrix.distro }}_${{ matrix.release }}_${{ matrix.arch }}
 
@@ -73,6 +87,8 @@ jobs:
           yum install -y tar gzip
 
       - uses: actions/checkout@v7
+        with:
+          ref: ${{ env.TAG }}
 
       - name: install rust
         run: |
@@ -173,6 +189,7 @@ jobs:
 
       - uses: actions/upload-artifact@v7
         with:
+          if-no-files-found: error
           path: target/generate-rpm/*
           name: rpm_${{ matrix.distro }}_${{ matrix.version }}_${{ matrix.arch }}
 
@@ -180,34 +197,78 @@ jobs:
     name: Publish GitHub Release
     needs: [build-deb, build-rpm]
     runs-on: ubuntu-latest
+    env:
+      GH_TOKEN: ${{ github.token }}
+      GH_REPO: ${{ github.repository }}
     steps:
-      - uses: actions/checkout@v7
-
+      # Several matrix entries build files with the same name, so each
+      # artifact must land in its own directory, named after the artifact.
+      # download-artifact skips that directory when a pattern matches one
+      # artifact; the next step fails if that happens.
       - name: Download .deb artifacts
         uses: actions/download-artifact@v7
         with:
-          path: debs/
+          path: target/artifacts/
           pattern: deb_*
-          merge-multiple: true
 
       - name: Download .rpm artifacts
         uses: actions/download-artifact@v7
         with:
-          path: rpms/
+          path: target/artifacts/
           pattern: rpm_*
-          merge-multiple: true
 
-      - name: List downloaded artifacts
+      - name: Prefix file names with distro, release and arch
         run: |
-          echo "=== DEBs ==="
-          ls -la debs/
-          echo "=== RPMs ==="
-          ls -la rpms/
+          set -euo pipefail
+          mkdir -p target/release
+          if [ -n "$(find target/artifacts -maxdepth 1 -type f)" ]; then
+            echo "::error::files outside an artifact directory; a pattern matched one artifact"
+            exit 1
+          fi
+          for artifact in target/artifacts/*/*; do
+            # directory format: <deb|rpm>_<distro>_<release>_<arch>
+            directory="$(basename "$(dirname "$artifact")")"
+            case "$directory" in
+              deb_*|rpm_*) ;;
+              *) echo "::error::unexpected directory $directory"; exit 1 ;;
+            esac
+            dest="target/release/${directory#*_}_$(basename "$artifact")"
+            if [ -e "$dest" ]; then
+              echo "::error::two artifacts map to $(basename "$dest")"
+              exit 1
+            fi
+            cp "$artifact" "$dest"
+          done
+          ls -la target/release
 
-      - name: Create GitHub Release
-        uses: softprops/action-gh-release@v3
-        with:
-          files: |
-            debs/*.deb
-            rpms/*.rpm
-          generate_release_notes: true
+      - name: Verify packages
+        run: |
+          set -euo pipefail
+          sudo apt-get -q update
+          sudo apt-get -q install -y rpm
+          shopt -s nullglob
+          cd target/release
+          # `ar t` exits 1 on bytes after the last member; the tar listing
+          # decompresses the whole payload. `rpm -K` checks the header and
+          # payload digests.
+          for f in *.deb *.ddeb; do
+            echo "checking $f"
+            ar t "$f" >/dev/null
+            dpkg-deb --info "$f" >/dev/null
+            dpkg-deb --fsys-tarfile "$f" | tar -t >/dev/null
+          done
+          for f in *.rpm; do
+            rpm -K --nosignature "$f"
+          done
+          sha256sum -- *.deb *.ddeb *.rpm > SHA256SUMS
+          cat SHA256SUMS
+
+      - name: Publish GitHub Release
+        run: |
+          set -euo pipefail
+          # A rebuild only replaces assets on a release that already exists.
+          if [ "$GITHUB_EVENT_NAME" = workflow_dispatch ] || gh release view "$TAG" >/dev/null 2>&1; then
+            gh release upload "$TAG" target/release/* --clobber
+          else
+            gh release create "$TAG" --verify-tag --generate-notes target/release/*
+          fi
